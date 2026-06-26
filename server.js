@@ -205,14 +205,78 @@ async function translateToJapanese(text) {
   }
   return { ok:false, error:'all translation providers failed', errors };
 }
+
+function tokenizeWords(text){
+  return normalizeText(text).replace(/[.!?]+$/,'').toLowerCase().match(/[a-z]+(?:'[a-z]+)?/g) || [];
+}
+const SUBJECT_PRONOUNS = new Set(['i','you','he','she','it','we','they']);
+const CLAUSE_CONNECTORS = new Set(['and','but','or','because','when','while','if','that','which','who','whom','whose','where','although','though','so','before','after','since','until']);
+const FRONTED_OK_STARTERS = new Set([
+  'today','tomorrow','yesterday','now','then','here','there','sometimes','often','always','usually','also','well','maybe','perhaps',
+  'in','on','at','to','from','for','with','by','before','after','during','because','when','while','if','although','though'
+]);
+const BE_WORDS = new Set(['am','is','are','was','were','be','been','being']);
+const MODALS = new Set(['can','could','will','would','shall','should','may','might','must']);
+const HAVE_WORDS = new Set(['have','has','had']);
+const DO_WORDS = new Set(['do','does','did']);
+const COMMON_ADJECTIVES = new Set(['new','big','small','happy','sad','kind','busy','hungry','tall','short','nice','good','bad','interesting','important','beautiful','old','young','hot','cold','easy','hard']);
+const COMMON_NOUNS = new Set(['apple','apples','book','books','bed','beds','school','soccer','music','home','morning','night','time','world','dinner','tennis','english']);
+function looksFiniteVerb(tok){
+  if (!tok) return false;
+  if (BE_WORDS.has(tok) || MODALS.has(tok) || HAVE_WORDS.has(tok) || DO_WORDS.has(tok)) return true;
+  // Link Grammar can parse gerunds/fragments; sentence mode only needs a conservative finite marker.
+  if (/^[a-z]+s$/.test(tok) && !COMMON_NOUNS.has(tok)) return true;
+  if (/^[a-z]+ed$/.test(tok)) return true;
+  return false;
+}
+function validateIndependentSentence(text){
+  const words = tokenizeWords(text);
+  if (words.length < 2) return { ok:false, reason:'too short for sentence mode' };
+
+  // Sentence mode: reject NP + subject + verb fragments such as "apples they see" / "books I read".
+  // These are often relative-clause fragments ("apples that they see"), not standalone sentences.
+  for (let i=1; i<words.length-1; i++) {
+    if (SUBJECT_PRONOUNS.has(words[i]) && !CLAUSE_CONNECTORS.has(words[i-1])) {
+      const prefix = words.slice(0,i);
+      const first = prefix[0];
+      const hasConnector = prefix.some(w => CLAUSE_CONNECTORS.has(w));
+      const frontedIsAllowedAdverbial = FRONTED_OK_STARTERS.has(first);
+      const next = words[i+1];
+      const hasPredicateAfterSubject = looksFiniteVerb(next) || /^[a-z]+$/.test(next);
+      if (!hasConnector && !frontedIsAllowedAdverbial && hasPredicateAfterSubject) {
+        return { ok:false, reason:'sentence mode rejected noun-phrase / relative-clause fragment before subject' };
+      }
+    }
+  }
+
+  // Reject run-ons like "I am happy today can see": two finite predicates without a connector.
+  let finiteCount = 0;
+  for (let i=0; i<words.length; i++) {
+    const w = words[i];
+    if (CLAUSE_CONNECTORS.has(w)) { finiteCount = 0; continue; }
+    if (BE_WORDS.has(w) || MODALS.has(w)) {
+      finiteCount++;
+      if (finiteCount >= 2) return { ok:false, reason:'unconnected finite verbs / clause run-on' };
+    }
+  }
+
+  // Be + adjective + bare noun after personal subject is normally not a basic standalone sentence:
+  // "I am new books" / "I am new bed".  This is category-based, not word-specific.
+  if (SUBJECT_PRONOUNS.has(words[0]) && BE_WORDS.has(words[1]) && COMMON_ADJECTIVES.has(words[2]) && words[3] && COMMON_NOUNS.has(words[3])) {
+    return { ok:false, reason:'be-complement is an adjective+noun phrase without determiner; not a valid basic sentence' };
+  }
+  return { ok:true, reason:'' };
+}
+
 async function checkPipeline(rawText, withTranslation=false){
   const original = normalizeText(rawText);
   const normalized = await normalizeByLanguageTool(original);
   const text = normalized.text;
   const parsed = await runLinkParser(text);
   const proof = normalized.proof || {ok:true, skipped:true};
-  const ok = !!(text && parsed.ok && proof.ok);
-  const reason = !text ? 'empty text' : (!parsed.ok ? 'link grammar parse failed' : (!proof.ok ? 'LanguageTool grammar check failed' : ''));
+  const sentenceMode = validateIndependentSentence(text);
+  const ok = !!(text && parsed.ok && proof.ok && sentenceMode.ok);
+  const reason = !text ? 'empty text' : (!parsed.ok ? 'link grammar parse failed' : (!proof.ok ? 'LanguageTool grammar check failed' : (!sentenceMode.ok ? sentenceMode.reason : '')));
   let translation = null;
   if(ok && withTranslation){
     try { translation = await translateToJapanese(text); }
@@ -229,6 +293,7 @@ async function checkPipeline(rawText, withTranslation=false){
     sentenceType: ok ? 'API_VERIFIED' : null,
     reason,
     proof,
+    sentenceMode,
     ja: translation?.ja || '',
     translation
   };
