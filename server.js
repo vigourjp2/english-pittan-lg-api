@@ -19,7 +19,45 @@ const POS = {
   school:['noun'], home:['noun','advPlace'], bed:['noun'], soccer:['noun'], tennis:['noun'], baseball:['noun'], english:['noun','adj'], japanese:['noun','adj'], apples:['noun'], music:['noun'], books:['noun'], tv:['noun'], breakfast:['noun'], lunch:['noun'], dinner:['noun'], morning:['noun'], afternoon:['noun'], evening:['noun'], night:['noun'], friend:['noun'], friends:['noun'], family:['noun'], japan:['noun','place'], tokyo:['noun','place'], game:['noun'], games:['noun'], water:['noun'], food:['noun'], care:['noun'], front:['noun'], lot:['noun'], example:['noun'], time:['noun'], people:['noun'], world:['noun'], work:['noun','verb'],
   very:['adv'], well:['adv','noun'], often:['advTime'], always:['advTime'], sometimes:['advTime'], now:['advTime'], today:['advTime'], everyday:['advTime'], tomorrow:['advTime'], yesterday:['advTime']
 };
-function pos(w){ return POS[String(w||'').toLowerCase()] || []; }
+const VERB_3SG_TO_BASE = {
+  likes:'like', plays:'play', studies:'study', reads:'read', goes:'go', comes:'come', eats:'eat', drinks:'drink', has:'have', watches:'watch', listens:'listen', speaks:'speak', writes:'write', makes:'make', takes:'take', looks:'look', gets:'get', wants:'want', tries:'try', needs:'need', helps:'help', sees:'see', swims:'swim', visits:'visit', learns:'learn', enjoys:'enjoy', does:'do'
+};
+function baseVerb(w){ return VERB_3SG_TO_BASE[String(w||'').toLowerCase()] || String(w||'').toLowerCase(); }
+function isThirdPersonSingularSubject(w){
+  w=String(w||'').toLowerCase();
+  if(['he','she','it'].includes(w)) return true;
+  if(['i','you','we','they','me'].includes(w)) return false;
+  const ps=pos(w);
+  if(!ps.includes('noun')) return false;
+  if(w==='people') return false;
+  if(w.endsWith('s') && w!=='tennis') return false;
+  return true;
+}
+function present3sg(v){
+  v=String(v||'').toLowerCase();
+  const irregular={have:'has',do:'does'};
+  if(irregular[v]) return irregular[v];
+  if(/[^aeiou]y$/.test(v)) return v.slice(0,-1)+'ies';
+  if(/(s|x|z|ch|sh|o)$/.test(v)) return v+'es';
+  return v+'s';
+}
+function is3sgVerbForm(w){ return Object.prototype.hasOwnProperty.call(VERB_3SG_TO_BASE, String(w||'').toLowerCase()); }
+function applySubjectVerbAgreementText(text){
+  const parts=normalizeText(text).replace(/[.!?]+$/,'').split(/\s+/).filter(Boolean);
+  if(parts.length>=2){
+    const s=parts[0].toLowerCase(), v=parts[1].toLowerCase();
+    if(isThirdPersonSingularSubject(s) && pos(v).includes('verb') && !is3sgVerbForm(v)){
+      parts[1]=present3sg(v);
+    }
+  }
+  return parts.join(' ');
+}
+function pos(w){
+  w=String(w||'').toLowerCase();
+  if(POS[w]) return POS[w];
+  if(VERB_3SG_TO_BASE[w]) return ['verb','verb3sg'];
+  return [];
+}
 function hasPos(w,p){ return pos(w).includes(p); }
 function wordsOf(text){ return normalizeText(text).replace(/[.!?]+$/,'').split(/\s+/).filter(Boolean).map(w=>w.toLowerCase()); }
 function isNounLike(ws){
@@ -52,9 +90,13 @@ function gameValidate(text){
     if(comp.length===2 && hasPos(comp[0],'not') && hasPos(comp[1],'adj')) return {ok:true, sentenceType:'SVC_NEG'};
   }
 
-  // S + V + object. The object must be noun-like. This is the generic fix for "I like big".
+  // S + V + object. The object must be noun-like. Also enforce/accept 3rd-person singular -s.
   if(w.length>=3 && hasPos(w[0],'subj') && hasPos(w[1],'verb')){
-    const v=w[1];
+    const subj3=isThirdPersonSingularSubject(w[0]);
+    const verb3=is3sgVerbForm(w[1]);
+    if(subj3 && !verb3) return {ok:false, reason:'third-person singular present verb needs -s'};
+    if(!subj3 && verb3) return {ok:false, reason:'verb has third-person -s but subject is not third-person singular'};
+    const v=baseVerb(w[1]);
     if(['go','come','listen','look'].includes(v)) return {ok:true, sentenceType:'SV/VP'};
     const obj=w.slice(2);
     if(obj.length===1 && hasPos(obj[0],'adj') && !hasPos(obj[0],'noun')) return {ok:false, reason:'transitive verb object is adjective-only'};
@@ -67,7 +109,7 @@ function gameValidate(text){
     if(w.length===3) return {ok:true, sentenceType:'S_MODAL_V'};
     const obj=w.slice(3);
     if(obj.length===1 && hasPos(obj[0],'adj') && !hasPos(obj[0],'noun')) return {ok:false, reason:'modal verb object is adjective-only'};
-    if(!isNounLike(obj) && !['go','come','listen','look'].includes(w[2])) return {ok:false, reason:'modal verb requires valid complement'};
+    if(!isNounLike(obj) && !['go','come','listen','look'].includes(baseVerb(w[2]))) return {ok:false, reason:'modal verb requires valid complement'};
     return {ok:true, sentenceType:'S_MODAL_VO'};
   }
 
@@ -151,14 +193,16 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === '/health') return send(res, 200, { ok: true, service: 'link-grammar-api' });
   try {
     if (url.pathname === '/translate') {
-      const text = await getTextFromReq(req, url);
+      const rawText = await getTextFromReq(req, url);
+      const text = applySubjectVerbAgreementText(rawText);
       if (!text) return send(res, 400, { ok:false, error:'empty text' });
       const tr = await translateToJapanese(text);
       return send(res, 200, { text, ...tr });
     }
     if (url.pathname === '/check' || url.pathname === '/check-and-translate') {
-      const text = await getTextFromReq(req, url);
-      if (!text) return send(res, 400, { ok: false, error: 'empty text' });
+      const rawText = await getTextFromReq(req, url);
+      if (!rawText) return send(res, 400, { ok: false, error: 'empty text' });
+      const text = applySubjectVerbAgreementText(rawText);
       const parsed = await runLinkParser(text);
       const gv = parsed.ok ? gameValidate(text) : {ok:false, reason:'link grammar parse failed'};
       const ok = !!(parsed.ok && gv.ok);
