@@ -6,7 +6,11 @@ const ALLOW_ORIGIN = process.env.ALLOW_ORIGIN || '*';
 const MAX_CHARS = 180;
 const TIMEOUT_MS = 3500;
 const MYMEMORY_EMAIL = process.env.MYMEMORY_EMAIL || '';
+const LANGUAGETOOL_URL = process.env.LANGUAGETOOL_URL || 'https://api.languagetool.org/v2/check';
+const LANGUAGETOOL_ENABLED = process.env.LANGUAGETOOL_ENABLED !== '0';
+const LANGUAGETOOL_TIMEOUT_MS = Number(process.env.LANGUAGETOOL_TIMEOUT_MS || 3500);
 const translateCache = new Map();
+const proofCache = new Map();
 
 const POS = {
   i:['subj','pron'], you:['subj','pron'], he:['subj','pron'], she:['subj','pron'], we:['subj','pron'], they:['subj','pron'], it:['subj','pron'], me:['noun','pronObj'],
@@ -51,6 +55,80 @@ function applySubjectVerbAgreementText(text){
     }
   }
   return parts.join(' ');
+}
+
+function isLanguageToolBlockingMatch(m){
+  const ruleId = String(m?.rule?.id || '');
+  const cat = String(m?.rule?.category?.id || '').toUpperCase();
+  const issue = String(m?.rule?.issueType || '').toLowerCase();
+  const msg = String(m?.message || '');
+  // ゲームでは小文字カードを許す。大文字・句点・空白など表示揺れはブロックしない。
+  const ignoreRuleIds = new Set([
+    'UPPERCASE_SENTENCE_START', 'MORFOLOGIK_RULE_EN_US', 'WHITESPACE_RULE',
+    'COMMA_PARENTHESIS_WHITESPACE', 'EN_QUOTES', 'SENTENCE_WHITESPACE',
+    'PUNCTUATION_PARAGRAPH_END', 'PERIOD_OF_TIME'
+  ]);
+  if (ignoreRuleIds.has(ruleId)) return false;
+  if (cat === 'CASING' || cat === 'TYPOGRAPHY' || cat === 'PUNCTUATION') return false;
+  if (issue === 'typographical' || issue === 'misspelling') return false;
+  // LanguageTool側の文法・意味・一貫性指摘は成立判定で止める。
+  return cat === 'GRAMMAR' || cat === 'CONFUSED_WORDS' || cat === 'COLLOCATIONS' || /grammar|agreement|verb|auxiliary|fragment|sentence/i.test(msg);
+}
+async function checkLanguageTool(text){
+  text = normalizeText(text).replace(/[.!?]+$/,'');
+  if (!LANGUAGETOOL_ENABLED) return { ok:true, disabled:true, blockingMatches:[], matches:[] };
+  if (!text) return { ok:false, error:'empty text', blockingMatches:[], matches:[] };
+  const key = text.toLowerCase();
+  if (proofCache.has(key)) return proofCache.get(key);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), LANGUAGETOOL_TIMEOUT_MS);
+  try {
+    const body = new URLSearchParams({ text, language:'en-US', enabledOnly:'false' });
+    const r = await fetch(LANGUAGETOOL_URL, {
+      method:'POST',
+      headers:{ 'content-type':'application/x-www-form-urlencoded', 'accept':'application/json' },
+      body,
+      signal: controller.signal
+    });
+    if (!r.ok) throw new Error('LanguageTool HTTP '+r.status);
+    const j = await r.json();
+    const matches = Array.isArray(j?.matches) ? j.matches : [];
+    const blockingMatches = matches.filter(isLanguageToolBlockingMatch).slice(0, 8).map(m => ({
+      message:m.message,
+      shortMessage:m.shortMessage,
+      offset:m.offset,
+      length:m.length,
+      ruleId:m?.rule?.id,
+      category:m?.rule?.category?.id,
+      issueType:m?.rule?.issueType,
+      replacements:(m.replacements||[]).slice(0,5).map(x=>x.value)
+    }));
+    const out = { ok:blockingMatches.length===0, source:'LanguageTool', matchesCount:matches.length, blockingMatches };
+    proofCache.set(key, out);
+    if (proofCache.size > 500) proofCache.delete(proofCache.keys().next().value);
+    return out;
+  } finally { clearTimeout(timer); }
+}
+function obviousClauseRunOnGuard(text){
+  // APIサービスが見逃した時の最小限の安全装置。個別文ではなく、無接続の述語連結を落とす。
+  const w = wordsOf(text);
+  const connectors = new Set(['and','but','because','when','if','that','who','which','to']);
+  let finite = 0;
+  let lastFinite = -10;
+  for (let i=0;i<w.length;i++){
+    const x=w[i];
+    const isFinite = hasPos(x,'be') || hasPos(x,'modal') || is3sgVerbForm(x) || (hasPos(x,'verb') && i>0 && hasPos(w[i-1],'subj'));
+    if (!isFinite) continue;
+    if (finite>0) {
+      const between = w.slice(lastFinite+1, i);
+      if (!between.some(t=>connectors.has(t))) {
+        return { ok:false, reason:'unconnected finite verbs / clause run-on' };
+      }
+    }
+    finite++;
+    lastFinite=i;
+  }
+  return { ok:true };
 }
 function pos(w){
   w=String(w||'').toLowerCase();
@@ -199,18 +277,32 @@ const server = http.createServer(async (req, res) => {
       const tr = await translateToJapanese(text);
       return send(res, 200, { text, ...tr });
     }
+    if (url.pathname === '/proof') {
+      const rawText = await getTextFromReq(req, url);
+      const text = applySubjectVerbAgreementText(rawText);
+      if (!text) return send(res, 400, { ok:false, error:'empty text' });
+      let proof;
+      try { proof = await checkLanguageTool(text); } catch(e) { proof = { ok:false, source:'LanguageTool', error:String(e.message||e), blockingMatches:[] }; }
+      return send(res, 200, { text, ...proof });
+    }
     if (url.pathname === '/check' || url.pathname === '/check-and-translate') {
       const rawText = await getTextFromReq(req, url);
       if (!rawText) return send(res, 400, { ok: false, error: 'empty text' });
       const text = applySubjectVerbAgreementText(rawText);
       const parsed = await runLinkParser(text);
       const gv = parsed.ok ? gameValidate(text) : {ok:false, reason:'link grammar parse failed'};
-      const ok = !!(parsed.ok && gv.ok);
+      const runOn = parsed.ok && gv.ok ? obviousClauseRunOnGuard(text) : {ok:true};
+      let proof = { ok:true, skipped:!parsed.ok || !gv.ok || !runOn.ok };
+      if (parsed.ok && gv.ok && runOn.ok) {
+        try { proof = await checkLanguageTool(text); } catch(e) { proof = { ok:true, source:'LanguageTool', warning:String(e.message||e), blockingMatches:[] }; }
+      }
+      const ok = !!(parsed.ok && gv.ok && runOn.ok && proof.ok);
+      const reason = !parsed.ok ? 'link grammar parse failed' : (!gv.ok ? gv.reason : (!runOn.ok ? runOn.reason : (!proof.ok ? 'LanguageTool grammar check failed' : '')));
       let tr = null;
       if (ok && url.pathname === '/check-and-translate') {
         try { tr = await translateToJapanese(text); } catch(e) { tr = {ok:false, error:String(e.message||e)}; }
       }
-      return send(res, 200, { text, ...parsed, ok, gameOk:gv.ok, sentenceType:gv.sentenceType || null, reason:gv.ok ? '' : gv.reason, ja:tr?.ja || '', translation:tr });
+      return send(res, 200, { text, ...parsed, ok, gameOk:gv.ok, sentenceType:gv.sentenceType || null, reason, proof, ja:tr?.ja || '', translation:tr });
     }
     return send(res, 404, { ok: false, error: 'not found' });
   } catch (e) {
