@@ -1,0 +1,863 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover" />
+<title>English Word Pittan Online</title>
+<!-- fix: grammar-engine generated pattern evaluator 2026-06-26-2110 -->
+<style>
+  :root{
+    --bg1:#07101d;--bg2:#102a52;--panel:rgba(15,23,42,.82);--line:rgba(255,255,255,.18);
+    --p1:#38bdf8;--p2:#f472b6;--p3:#a3e635;--p4:#facc15;--empty:rgba(255,255,255,.08);
+    --good:#86efac;--bad:#fca5a5;--info:#bfdbfe;--gold:#fde68a;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;width:100%;min-height:100%;background:radial-gradient(circle at 20% 0%,#1e3a8a 0,#07101d 42%,#030712 100%);font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#fff;touch-action:manipulation;user-select:none;-webkit-user-select:none;overflow-x:hidden}
+  body:before{content:"";position:fixed;inset:0;pointer-events:none;background:linear-gradient(135deg,rgba(56,189,248,.16),transparent 35%,rgba(244,114,182,.14));mix-blend-mode:screen}
+  #app{width:min(1180px,100%);margin:0 auto;padding:10px 10px calc(14px + env(safe-area-inset-bottom));position:relative;z-index:1}
+  .top{display:grid;grid-template-columns:1.05fr .95fr;gap:10px;align-items:stretch}.panel{background:var(--panel);border:1px solid var(--line);border-radius:18px;box-shadow:0 18px 50px rgba(0,0,0,.28);backdrop-filter:blur(10px)}
+  .hero{padding:13px 14px}.hero h1{font-size:22px;margin:0 0 4px;letter-spacing:.02em}.hero p{margin:3px 0;font-size:12px;color:#dbeafe;line-height:1.4}.badge{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:900;padding:4px 8px;border-radius:999px;background:rgba(250,204,21,.16);border:1px solid rgba(250,204,21,.34);color:#fde68a;margin-right:4px}.statusGrid{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:9px}.status{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.13);border-radius:12px;padding:7px;text-align:center}.status b{display:block;font-size:16px;color:#fff}.status span{font-size:10px;color:#cbd5e1}
+  .controls{padding:11px;display:grid;grid-template-columns:1fr 1fr;gap:7px;align-content:start}.controls input,.controls select{width:100%;border:1px solid rgba(255,255,255,.18);background:rgba(2,6,23,.6);color:#fff;border-radius:12px;padding:10px;font-size:13px;outline:none}.controls input::placeholder{color:#94a3b8}.btn{border:0;border-radius:12px;padding:10px 11px;font-weight:900;color:#fff;background:#334155;box-shadow:0 8px 18px rgba(0,0,0,.18);touch-action:manipulation}.btn:active{transform:scale(.98)}.btn.good{background:#16a34a}.btn.blue{background:#2563eb}.btn.pink{background:#db2777}.btn.warn{background:#ca8a04}.btn.bad{background:#dc2626}.btn.full{grid-column:1/-1}.mini{font-size:11px;color:#bfdbfe;line-height:1.35;grid-column:1/-1}.mpLine{font-size:12px;color:#dbeafe;grid-column:1/-1}.mpLine b.good{color:var(--good)}.mpLine b.bad{color:var(--bad)}.mpLine b.info{color:var(--info)}
+  .main{display:grid;grid-template-columns:minmax(0,1fr) 330px;gap:10px;margin-top:10px}.boardPanel{padding:10px}.boardTop{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}.turn{font-size:13px;color:#e5e7eb}.turn b{color:#fde68a}.msg{font-size:12px;color:#bfdbfe;min-height:18px;text-align:right}.boardWrap{width:100%;display:flex;justify-content:center}.board{display:grid;grid-template-columns:repeat(7,minmax(38px,72px));gap:5px;width:min(100%,550px);aspect-ratio:1/1;background:rgba(2,6,23,.44);border:1px solid rgba(255,255,255,.14);border-radius:18px;padding:7px}.cell{position:relative;border:1px solid rgba(255,255,255,.13);background:var(--empty);border-radius:12px;display:flex;align-items:center;justify-content:center;text-align:center;padding:3px;min-width:0;overflow:hidden;box-shadow:inset 0 0 16px rgba(255,255,255,.03)}.cell.empty{border-style:dashed}.cell.selectable{outline:2px solid rgba(250,204,21,.7);background:rgba(250,204,21,.12)}.cell.recent{animation:pulse .8s ease-out 1}.cell.rainbow{animation:rainbowAura 1.8s linear infinite}.cell.unused{box-shadow:inset 0 0 16px rgba(255,255,255,.03),0 0 0 2px rgba(248,113,113,.22)}.word{font-weight:1000;font-size:clamp(10px,2vw,17px);line-height:1.02;word-break:break-word;text-shadow:0 1px 5px rgba(0,0,0,.45)}.owner{position:absolute;left:4px;top:4px;width:10px;height:10px;border-radius:50%;box-shadow:0 0 8px rgba(255,255,255,.35)}.pts{position:absolute;right:4px;bottom:3px;font-size:9px;color:rgba(255,255,255,.78);font-weight:900}.useCount{position:absolute;left:4px;bottom:3px;font-size:9px;color:#fff;font-weight:1000;text-shadow:0 1px 5px #000}.unusedMark{position:absolute;right:4px;top:3px;font-size:8px;color:#fecaca;font-weight:1000;text-shadow:0 1px 5px #000}
+  @keyframes pulse{0%{transform:scale(.88);filter:brightness(1.8)}100%{transform:scale(1);filter:brightness(1)}}
+  .handPanel{margin-top:10px;padding:10px}.handTitle{display:flex;justify-content:space-between;align-items:center;font-size:13px;color:#e5e7eb;margin-bottom:7px}.hand{display:grid;grid-template-columns:repeat(6,1fr);gap:7px}.tile{min-height:54px;border:2px solid rgba(255,255,255,.15);border-radius:14px;background:linear-gradient(180deg,rgba(255,255,255,.15),rgba(255,255,255,.06));color:#fff;font-weight:1000;font-size:14px;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:5px;box-shadow:0 10px 22px rgba(0,0,0,.18)}.tile small{font-size:9px;color:#cbd5e1;font-weight:800}.tile.on{border-color:#facc15;box-shadow:0 0 20px rgba(250,204,21,.35);background:rgba(250,204,21,.18)}.tile.used{opacity:.35;filter:grayscale(1)}.tile.cat-subj{border-color:rgba(56,189,248,.62);background:linear-gradient(180deg,rgba(56,189,248,.30),rgba(255,255,255,.06))}.tile.cat-be,.tile.cat-modal{border-color:rgba(167,139,250,.62);background:linear-gradient(180deg,rgba(167,139,250,.28),rgba(255,255,255,.06))}.tile.cat-verb,.tile.cat-ving,.tile.cat-to{border-color:rgba(74,222,128,.62);background:linear-gradient(180deg,rgba(74,222,128,.25),rgba(255,255,255,.06))}.tile.cat-adj,.tile.cat-adv{border-color:rgba(250,204,21,.66);background:linear-gradient(180deg,rgba(250,204,21,.24),rgba(255,255,255,.06))}.tile.cat-noun{border-color:rgba(251,146,60,.66);background:linear-gradient(180deg,rgba(251,146,60,.24),rgba(255,255,255,.06))}.tile.cat-etc{border-color:rgba(148,163,184,.55)}
+  .side{display:flex;flex-direction:column;gap:10px}.scorePanel{padding:10px}.scorePanel h2,.logPanel h2,.dictPanel h2{font-size:15px;margin:0 0 8px}.players{display:grid;gap:7px}.player{display:grid;grid-template-columns:18px 1fr auto;gap:7px;align-items:center;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.12);border-radius:12px;padding:7px}.dot{width:14px;height:14px;border-radius:50%}.pname{font-size:12px;font-weight:900;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.pscore{font-size:13px;font-weight:1000;color:#fde68a}.current{outline:2px solid rgba(250,204,21,.55)}
+  .dictPanel{padding:10px}.rules{font-size:12px;line-height:1.45;color:#dbeafe}.rules b{color:#fde68a}.targetList{display:flex;gap:5px;flex-wrap:wrap;margin-top:8px}.chip{font-size:11px;padding:4px 7px;border-radius:999px;background:rgba(59,130,246,.18);border:1px solid rgba(147,197,253,.25);color:#dbeafe}.logPanel{padding:10px;min-height:140px}.log{display:flex;flex-direction:column;gap:6px;max-height:220px;overflow:auto;padding-right:3px}.logItem{font-size:12px;line-height:1.35;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);border-radius:10px;padding:7px}.logItem b{color:#fde68a}.goodText{color:var(--good)}.badText{color:var(--bad)}
+  #start{position:fixed;inset:0;z-index:50;background:linear-gradient(180deg,rgba(3,7,18,.92),rgba(15,23,42,.82));display:flex;align-items:center;justify-content:center;padding:18px}.startCard{width:min(560px,94vw);background:rgba(15,23,42,.92);border:1px solid rgba(255,255,255,.2);border-radius:24px;padding:20px;box-shadow:0 25px 80px rgba(0,0,0,.45);backdrop-filter:blur(12px)}.startCard h1{margin:0 0 7px;font-size:28px}.startCard p{font-size:14px;color:#dbeafe;line-height:1.55}.startCard ul{font-size:13px;color:#e5e7eb;line-height:1.55;padding-left:20px}.startCard .btn{font-size:17px;width:100%;margin-top:10px;padding:13px}
+
+  .fxBanner{position:fixed;left:50%;top:18%;transform:translateX(-50%) scale(.9);z-index:70;pointer-events:none;opacity:0;min-width:min(520px,92vw);text-align:center;padding:18px 16px;border-radius:24px;background:linear-gradient(135deg,rgba(22,163,74,.92),rgba(37,99,235,.9));border:2px solid rgba(255,255,255,.38);box-shadow:0 24px 80px rgba(0,0,0,.5),0 0 40px rgba(134,239,172,.35)}
+  .fxBanner.show{animation:bannerBoom 2.4s ease both}.fxBanner.combo{background:linear-gradient(135deg,rgba(245,158,11,.94),rgba(219,39,119,.92),rgba(37,99,235,.9));box-shadow:0 24px 80px rgba(0,0,0,.5),0 0 50px rgba(250,204,21,.52)}.fxBig{font-size:30px;font-weight:1000;letter-spacing:.02em;text-shadow:0 3px 12px rgba(0,0,0,.35)}.fxEn{font-size:21px;font-weight:1000;margin-top:4px}.fxJa{font-size:16px;color:#fef3c7;margin-top:2px}.fxPts{font-size:18px;color:#bbf7d0;font-weight:1000;margin-top:4px}
+  .comboPanel{position:fixed;left:50%;top:33%;transform:translateX(-50%);z-index:69;width:min(620px,94vw);max-height:48vh;overflow:auto;background:rgba(15,23,42,.96);border:2px solid rgba(250,204,21,.55);border-radius:20px;padding:12px;box-shadow:0 24px 80px rgba(0,0,0,.55),0 0 35px rgba(250,204,21,.25);display:none;pointer-events:auto}.comboPanel.show{display:block;animation:comboHold .25s ease both}.comboPanel h3{margin:0 0 8px;font-size:17px;color:#fde68a}.comboItem{border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.07);border-radius:13px;padding:8px;margin-top:7px}.comboItem.active{outline:2px solid rgba(56,189,248,.75);background:rgba(56,189,248,.13)}.comboItem b{color:#fff;font-size:15px}.comboJa{color:#fef3c7;font-size:12px;margin-top:2px}.comboRoute{font-size:11px;color:#bfdbfe;margin-top:4px;line-height:1.35}.comboCards{display:flex;gap:4px;flex-wrap:wrap;margin-top:6px}.routeChip{font-size:10px;font-weight:900;border-radius:999px;background:rgba(56,189,248,.18);border:1px solid rgba(125,211,252,.35);padding:3px 6px;color:#dbeafe}.cell.routeHit{outline:3px solid rgba(250,204,21,.95);box-shadow:0 0 18px rgba(250,204,21,.75), inset 0 0 14px rgba(250,204,21,.2);transform:scale(1.04)}.routeStep{position:absolute;right:4px;top:4px;min-width:16px;height:16px;border-radius:999px;background:#facc15;color:#111827;font-size:10px;font-weight:1000;display:flex;align-items:center;justify-content:center;box-shadow:0 2px 8px rgba(0,0,0,.35)}@keyframes comboHold{from{opacity:0;transform:translateX(-50%) translateY(8px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}
+  @keyframes bannerBoom{0%{opacity:0;transform:translateX(-50%) scale(.72) rotate(-2deg);filter:brightness(2)}12%{opacity:1;transform:translateX(-50%) scale(1.08) rotate(1deg)}25%{transform:translateX(-50%) scale(1) rotate(0)}78%{opacity:1}100%{opacity:0;transform:translateX(-50%) scale(.96) translateY(-18px)}}
+  .scorePop{position:fixed;z-index:80;pointer-events:none;font-weight:1000;font-size:26px;color:#fde68a;text-shadow:0 3px 12px rgba(0,0,0,.7);animation:scoreFly 1.2s ease-out both}.scorePop small{display:block;font-size:13px;color:#bbf7d0}.spark{position:fixed;z-index:79;width:8px;height:8px;border-radius:50%;pointer-events:none;background:#fde68a;box-shadow:0 0 14px #fde68a;animation:sparkFly .8s ease-out both}
+  @keyframes scoreFly{0%{opacity:0;transform:translate(-50%,0) scale(.7)}15%{opacity:1;transform:translate(-50%,-10px) scale(1.15)}100%{opacity:0;transform:translate(-50%,-78px) scale(.9)}}
+  @keyframes rainbowAura{0%{filter:hue-rotate(0deg) saturate(1.35)}100%{filter:hue-rotate(360deg) saturate(1.35)}}
+  @keyframes sparkFly{0%{opacity:1;transform:translate(0,0) scale(1)}100%{opacity:0;transform:translate(var(--dx),var(--dy)) scale(.2)}}
+  .cell.hit{animation:hitGlow 1s ease both}.cell.badShake{animation:badShake .22s linear 2}@keyframes hitGlow{0%{box-shadow:0 0 0 rgba(134,239,172,0);filter:brightness(1)}18%{box-shadow:0 0 28px rgba(134,239,172,.95);filter:brightness(1.9)}100%{box-shadow:inset 0 0 16px rgba(255,255,255,.03);filter:brightness(1)}}@keyframes badShake{0%,100%{transform:translateX(0)}25%{transform:translateX(-3px)}75%{transform:translateX(3px)}}
+  .voiceNote{font-size:11px;color:#dbeafe;line-height:1.35;grid-column:1/-1;background:rgba(59,130,246,.12);border:1px solid rgba(147,197,253,.16);border-radius:12px;padding:8px}.soloBadge{background:rgba(134,239,172,.16);border-color:rgba(134,239,172,.3);color:#bbf7d0}
+
+  @media(max-width:920px){#app{padding:8px}.top{grid-template-columns:1fr}.main{grid-template-columns:1fr}.side{grid-template-columns:1fr}.controls{grid-template-columns:1fr 1fr}.board{gap:4px;padding:5px}.cell{border-radius:10px}.hand{grid-template-columns:repeat(6,1fr);gap:5px}.tile{min-height:48px;font-size:12px;border-radius:12px}.statusGrid{grid-template-columns:repeat(4,1fr)}}
+  @media(max-width:520px){.hero h1{font-size:19px}.status b{font-size:14px}.controls{grid-template-columns:1fr}.board{grid-template-columns:repeat(7,1fr);border-radius:14px}.word{font-size:clamp(8px,3.1vw,13px)}.hand{grid-template-columns:repeat(3,1fr)}.tile{font-size:11px;min-height:45px;padding:3px}.tile small{display:block;font-size:8px}.msg{text-align:left}.boardTop{align-items:flex-start;flex-direction:column}.startCard h1{font-size:23px}}
+</style>
+</head>
+<body>
+<div id="start">
+  <div class="startCard">
+    <span class="badge soloBadge">SOLO</span><span class="badge">ONLINE</span><span class="badge">VOICE</span><span class="badge">Link Grammar対応</span>
+    <h1>English Word Pittan Online</h1>
+    <p>英単語タイルを置いて、英文・フレーズ・文法パターンを作るパズル。1人練習も、オンライン複数人対戦も対応。成立した英文は英語で読み上げて、続けて日本語訳も読み上げます。</p>
+    <ul>
+      <li>左→右・上→下を守る。横/縦一直線＋右/下の隣接ルート判定</li>
+      <li>成立した単語列のマスを自分色にする</li>
+      <li>相手のマスを使って文を作ると奪える</li>
+      <li>1人練習モードあり</li>
+      <li>成立時に演出・得点ポップ・英語読み上げ・日本語訳読み上げ</li>
+      <li>オフラインでも同じ端末で交互対戦OK</li>
+    </ul>
+    <button class="btn good" id="startBtn">はじめる</button>
+  </div>
+</div>
+<div id="fxBanner" class="fxBanner"><div class="fxBig">GOOD!</div><div class="fxEn" id="fxEn"></div><div class="fxJa" id="fxJa"></div><div class="fxPts" id="fxPts"></div></div>
+<div id="comboPanel" class="comboPanel"><h3 id="comboTitle">成立詳細</h3><div id="comboList"></div></div>
+<div id="app">
+  <div class="top">
+    <section class="panel hero">
+      <span class="badge">英語版もじぴったん風</span><span class="badge">2〜4人</span>
+      <h1>English Word Pittan Online</h1>
+      <p>単語を1マスに置く。横/縦一直線に加えて、右・下に隣接する英文ルートも判定。成立したら演出＋読み上げ＋陣地化。1人練習からオンライン対戦まで対応。</p>
+      <div class="statusGrid">
+        <div class="status"><b id="turnNo">1</b><span>TURN</span></div>
+        <div class="status"><b id="wordsMade">0</b><span>WORDS</span></div>
+        <div class="status"><b id="filledNo">0</b><span>FILLED</span></div>
+        <div class="status"><b id="roomNo">main</b><span>ROOM</span></div>
+      </div>
+    </section>
+    <section class="panel controls">
+      <input id="nameInput" maxlength="18" placeholder="名前 例: player" />
+      <select id="playerCount"><option value="1" selected>1人練習</option><option value="2">2人対戦</option><option value="3">3人対戦</option><option value="4">4人対戦</option></select>
+      <button class="btn blue" id="connectBtn">ONLINE接続</button>
+      <button class="btn good" id="newGameBtn">新規ゲーム</button>
+      <button class="btn warn" id="passBtn">パス</button>
+      <button class="btn pink" id="drawBtn">手札入替</button>
+      <button class="btn bad full" id="resetBtn">盤面リセット送信</button>
+      <div class="mpLine">通信: <b id="mp" class="bad">LOCAL</b> / 受信 <span id="rx">0</span> / 自分ID <span id="myId">-</span></div>
+      <div class="voiceNote">🔊 成立した英文は <b>英語</b> → <b>日本語訳</b> の順に読み上げ。スマホは最初に「はじめる」を押した後から音声が出やすい。</div><div class="mini">同じ Worker URL の `/room/english` を使う。1人練習は接続なしで遊べる。</div>
+    </section>
+  </div>
+
+  <main class="main">
+    <section>
+      <div class="panel boardPanel">
+        <div class="boardTop"><div class="turn">現在: <b id="turnPlayer">Player 1</b></div><div class="msg" id="msg">単語タイルを選んで空きマスに置く</div></div>
+        <div class="boardWrap"><div class="board" id="board"></div></div>
+      </div>
+      <div class="panel handPanel">
+        <div class="handTitle"><span>手札（種類別に常備）</span><span id="selectedInfo">未選択</span></div>
+        <div class="hand" id="hand"></div>
+      </div>
+    </section>
+    <aside class="side">
+      <section class="panel scorePanel"><h2>スコア / 陣地</h2><div class="players" id="players"></div></section>
+      <section class="panel dictPanel"><h2>成立ルール</h2><div class="rules">全ルート照合 + Link Grammar Parser API + フレーズバンク + 品詞テンプレ。<br><b>文</b>: You go to school / Music is fun<br><b>句</b>: listen to music / be good at<br><b>型</b>: 主語+動詞+目的語、be+形容詞+前置詞</div><div class="targetList" id="targetList"></div></section>
+      <section class="panel logPanel"><h2>ログ</h2><div class="log" id="log"></div></section>
+    </aside>
+  </main>
+</div>
+<script>
+(() => {
+'use strict';
+const $ = id => document.getElementById(id);
+const WS_URL = 'wss://mine-server-git2.vigourjp2.workers.dev/room/english';
+const N = 7;
+const COLORS = ['#38bdf8','#f472b6','#a3e635','#facc15'];
+const clientId = (crypto && crypto.randomUUID) ? crypto.randomUUID().slice(0,8) : ('c'+Math.floor(Math.random()*999999));
+let socket=null,retryTimer=null,heartbeat=null,rx=0;
+let selectedHandIndex=-1;
+let recentCells=[];
+let suppressBroadcast=false;
+const WORDS = [
+  // 主語・代名詞
+  {w:'I',pos:['subj','pron'],lv:1},{w:'you',pos:['subj','pron'],lv:1},{w:'he',pos:['subj','pron'],lv:1},{w:'she',pos:['subj','pron'],lv:1},{w:'we',pos:['subj','pron'],lv:1},{w:'they',pos:['subj','pron'],lv:1},{w:'it',pos:['subj','pron'],lv:1},{w:'me',pos:['noun','pronObj'],lv:1},
+  // be / 助動詞 / 否定
+  {w:'am',pos:['be'],lv:1},{w:'are',pos:['be'],lv:1},{w:'is',pos:['be'],lv:1},{w:'was',pos:['bePast'],lv:2},{w:'were',pos:['bePast'],lv:2},{w:'not',pos:['not'],lv:1},
+  {w:'can',pos:['modal'],lv:2},{w:'must',pos:['modal'],lv:2},{w:'will',pos:['modal'],lv:2},{w:'should',pos:['modal'],lv:3},
+  // 形容詞
+  {w:'happy',pos:['adj'],lv:1},{w:'sad',pos:['adj'],lv:1},{w:'kind',pos:['adj'],lv:1},{w:'tall',pos:['adj'],lv:1},{w:'busy',pos:['adj'],lv:1},{w:'hungry',pos:['adj'],lv:1},{w:'fun',pos:['adj','noun'],lv:1},{w:'good',pos:['adj'],lv:1},{w:'bad',pos:['adj'],lv:1},{w:'nice',pos:['adj'],lv:1},{w:'big',pos:['adj'],lv:1},{w:'small',pos:['adj'],lv:1},{w:'new',pos:['adj'],lv:1},{w:'old',pos:['adj'],lv:1},{w:'interesting',pos:['adj','ving'],lv:2},{w:'important',pos:['adj'],lv:2},{w:'famous',pos:['adj'],lv:2},{w:'free',pos:['adj'],lv:2},{w:'right',pos:['adj','noun'],lv:2},
+  // 一般動詞
+  {w:'like',pos:['verb'],lv:1},{w:'play',pos:['verb'],lv:1},{w:'study',pos:['verb'],lv:1},{w:'read',pos:['verb'],lv:1},{w:'go',pos:['verb'],lv:1},{w:'come',pos:['verb'],lv:1},{w:'eat',pos:['verb'],lv:1},{w:'drink',pos:['verb'],lv:1},{w:'have',pos:['verb'],lv:1},{w:'watch',pos:['verb'],lv:1},{w:'listen',pos:['verb'],lv:1},{w:'speak',pos:['verb'],lv:1},{w:'write',pos:['verb'],lv:1},{w:'make',pos:['verb'],lv:2},{w:'take',pos:['verb'],lv:2},{w:'look',pos:['verb'],lv:2},{w:'get',pos:['verb'],lv:2},{w:'want',pos:['verbWant','verb'],lv:2},{w:'try',pos:['verb'],lv:2},{w:'need',pos:['verb'],lv:2},{w:'help',pos:['verb','noun'],lv:2},{w:'see',pos:['verb'],lv:1},{w:'swim',pos:['verb'],lv:1},{w:'visit',pos:['verb'],lv:2},{w:'learn',pos:['verb'],lv:2},{w:'enjoy',pos:['verb'],lv:2},
+  // ing
+  {w:'playing',pos:['ving'],lv:2},{w:'studying',pos:['ving'],lv:2},{w:'reading',pos:['ving'],lv:2},{w:'going',pos:['ving'],lv:2},{w:'listening',pos:['ving'],lv:2},{w:'watching',pos:['ving'],lv:2},{w:'eating',pos:['ving'],lv:2},{w:'writing',pos:['ving'],lv:2},{w:'speaking',pos:['ving'],lv:2},{w:'learning',pos:['ving'],lv:2},
+  // 機能語
+  {w:'to',pos:['to','prep'],lv:1},{w:'in',pos:['prep'],lv:1},{w:'on',pos:['prep'],lv:1},{w:'at',pos:['prep'],lv:1},{w:'for',pos:['prep'],lv:1},{w:'from',pos:['prep'],lv:2},{w:'with',pos:['prep'],lv:2},{w:'of',pos:['prep'],lv:2},{w:'about',pos:['prep'],lv:2},{w:'after',pos:['prep'],lv:2},{w:'before',pos:['prep'],lv:2},{w:'because',pos:['conj'],lv:2},{w:'and',pos:['conj'],lv:1},{w:'the',pos:['article'],lv:1},{w:'a',pos:['article'],lv:1},{w:'an',pos:['article'],lv:1},
+  // 名詞
+  {w:'school',pos:['noun'],lv:1},{w:'home',pos:['noun','advPlace'],lv:1},{w:'bed',pos:['noun'],lv:1},{w:'soccer',pos:['noun'],lv:1},{w:'tennis',pos:['noun'],lv:1},{w:'baseball',pos:['noun'],lv:1},{w:'English',pos:['noun','adj'],lv:1},{w:'Japanese',pos:['noun','adj'],lv:1},{w:'apples',pos:['noun'],lv:1},{w:'music',pos:['noun'],lv:1},{w:'books',pos:['noun'],lv:1},{w:'TV',pos:['noun'],lv:1},{w:'breakfast',pos:['noun'],lv:1},{w:'lunch',pos:['noun'],lv:1},{w:'dinner',pos:['noun'],lv:1},{w:'morning',pos:['noun'],lv:1},{w:'afternoon',pos:['noun'],lv:1},{w:'evening',pos:['noun'],lv:1},{w:'night',pos:['noun'],lv:1},{w:'friend',pos:['noun'],lv:1},{w:'friends',pos:['noun'],lv:1},{w:'family',pos:['noun'],lv:1},{w:'Japan',pos:['noun','place'],lv:1},{w:'Tokyo',pos:['noun','place'],lv:1},{w:'game',pos:['noun'],lv:1},{w:'games',pos:['noun'],lv:1},{w:'water',pos:['noun'],lv:1},{w:'food',pos:['noun'],lv:1},{w:'care',pos:['noun'],lv:2},{w:'front',pos:['noun'],lv:2},{w:'lot',pos:['noun'],lv:2},{w:'example',pos:['noun'],lv:2},{w:'time',pos:['noun'],lv:2},{w:'people',pos:['noun'],lv:2},{w:'world',pos:['noun'],lv:2},{w:'work',pos:['noun','verb'],lv:2},
+  // 副詞・時
+  {w:'very',pos:['adv'],lv:1},{w:'well',pos:['adv','noun'],lv:1},{w:'often',pos:['advTime'],lv:2},{w:'always',pos:['advTime'],lv:2},{w:'sometimes',pos:['advTime'],lv:2},{w:'now',pos:['advTime'],lv:1},{w:'today',pos:['advTime'],lv:1},{w:'everyday',pos:['advTime'],lv:2},{w:'tomorrow',pos:['advTime'],lv:2},{w:'yesterday',pos:['advTime'],lv:2}
+];
+const POS = Object.fromEntries(WORDS.map(x=>[x.w.toLowerCase(),x.pos]));
+
+// 自作フレーズバンク: 市販教材の丸写しではなく、中学・高校基礎で頻出の表現をオリジナル辞書化。
+// Harperは完全英文の校正補助、フレーズ・熟語・連語はこのバンクで即判定する。
+const PHRASE_BANK = [
+  ['go to school','学校へ行く','通学フレーズ',22,'JHS1'],['go home','家に帰る','生活フレーズ',18,'JHS1'],['come home','家に帰ってくる','生活フレーズ',18,'JHS1'],['go to bed','寝る','生活フレーズ',22,'JHS1'],['get up','起きる','生活フレーズ',18,'JHS1'],
+  ['have breakfast','朝食を食べる','生活フレーズ',18,'JHS1'],['have lunch','昼食を食べる','生活フレーズ',18,'JHS1'],['have dinner','夕食を食べる','生活フレーズ',18,'JHS1'],['eat breakfast','朝食を食べる','生活フレーズ',18,'JHS1'],['drink water','水を飲む','生活フレーズ',16,'JHS1'],
+  ['play soccer','サッカーをする','連語',16,'JHS1'],['play tennis','テニスをする','連語',16,'JHS1'],['play baseball','野球をする','連語',16,'JHS1'],['play games','ゲームをする','連語',16,'JHS1'],['watch TV','テレビを見る','連語',16,'JHS1'],
+  ['read books','本を読む','連語',16,'JHS1'],['study English','英語を勉強する','連語',16,'JHS1'],['speak English','英語を話す','連語',18,'JHS1'],['write English','英語を書く','連語',18,'JHS1'],['listen to music','音楽を聴く','連語',24,'JHS1'],
+  ['look at','〜を見る','句動詞',18,'JHS1'],['look at me','私を見る','句動詞',24,'JHS1'],['look for','〜を探す','句動詞',18,'JHS2'],['look for books','本を探す','句動詞',24,'JHS2'],['take care of','〜の世話をする','熟語',28,'JHS2'],
+  ['take care of family','家族の世話をする','熟語',34,'JHS2'],['be good at','〜が得意である','熟語',28,'JHS2'],['good at soccer','サッカーが得意である','熟語',24,'JHS2'],['good at English','英語が得意である','熟語',24,'JHS2'],['be interested in','〜に興味がある','熟語',30,'JHS3'],
+  ['interested in music','音楽に興味がある','熟語',26,'JHS3'],['be famous for','〜で有名である','熟語',30,'JHS3'],['famous for music','音楽で有名である','熟語',26,'JHS3'],['be from','〜出身である','基本表現',18,'JHS1'],['from Japan','日本出身である','前置詞句',16,'JHS1'],
+  ['in the morning','朝に','前置詞句',20,'JHS1'],['in the afternoon','午後に','前置詞句',20,'JHS1'],['in the evening','夕方に','前置詞句',20,'JHS1'],['at night','夜に','前置詞句',16,'JHS1'],['after school','放課後に','前置詞句',18,'JHS1'],
+  ['before breakfast','朝食前に','前置詞句',18,'JHS2'],['in front of','〜の前に','熟語',28,'JHS2'],['a lot of','たくさんの','熟語',24,'JHS2'],['of course','もちろん','熟語',18,'JHS1'],['for example','例えば','熟語',18,'JHS2'],
+  ['want to play','遊びたい','不定詞句',24,'JHS2'],['want to read','読みたい','不定詞句',24,'JHS2'],['want to study','勉強したい','不定詞句',24,'JHS2'],['want to go','行きたい','不定詞句',24,'JHS2'],['try to study','勉強しようとする','不定詞句',26,'JHS3'],
+  ['need to study','勉強する必要がある','不定詞句',26,'JHS3'],['have to study','勉強しなければならない','助動詞相当',28,'JHS2'],['be going to','〜するつもりである','未来表現',30,'JHS2'],['going to school','学校へ行っている/行くところ','進行・未来句',22,'JHS2'],
+  ['not happy','幸せではない','否定フレーズ',12,'JHS1'],['not busy','忙しくない','否定フレーズ',12,'JHS1'],['very happy','とても幸せ','副詞句',14,'JHS1'],['very kind','とても親切','副詞句',14,'JHS1'],['very interesting','とても面白い','副詞句',14,'JHS2'],
+  ['music is fun','音楽は楽しい','完全な文',34,'JHS1'],['soccer is fun','サッカーは楽しい','完全な文',34,'JHS1'],['English is interesting','英語は面白い','完全な文',36,'JHS2'],['apples are good','りんごは良い/おいしい','完全な文',34,'JHS1'],['books are interesting','本は面白い','完全な文',36,'JHS2']
+];
+const PHRASE_MAP = new Map(PHRASE_BANK.map(([text,ja,kind,pts,level])=>[text.toLowerCase(),{text,ja,kind,pts,level,source:'phraseBank',exact:true}]));
+
+// Link Grammar Parser API連携。Cloudflare PagesだけではCライブラリを実行できないため、
+// 無料コンテナ等に置いたAPI URLを ?lgapi=https://... または localStorage で指定する。
+const LINK_GRAMMAR_CACHE_KEY='englishPittan.linkGrammarCache.v1';
+const LINK_GRAMMAR_API_KEY='englishPittan.linkGrammarApi';
+let linkGrammarApi=(new URL(location.href).searchParams.get('lgapi') || localStorage.getItem(LINK_GRAMMAR_API_KEY) || '').trim();
+let linkGrammarStatus=linkGrammarApi ? 'READY' : 'OFF';
+let linkGrammarCache={};
+try{linkGrammarCache=JSON.parse(localStorage.getItem(LINK_GRAMMAR_CACHE_KEY)||'{}')||{};}catch(e){linkGrammarCache={};}
+async function linkGrammarEvaluate(words){
+  const w=lowerWords(words);
+  const key=norm(w);
+  if(!linkGrammarApi) return null;
+  if(!isLikelyCompleteSentenceWords(w) || hasOrphanTail(w)) return null;
+  if(linkGrammarCache[key]!==undefined){
+    return linkGrammarCache[key] ? {kind:'LinkGrammar構文解析',pts:48+Math.min(24,w.length*5),text:capSentence(w).replace(/[.]$/,''),source:'linkGrammar',parser:'cache'} : null;
+  }
+  try{
+    linkGrammarStatus='CHECK'; renderSafe();
+    const res=await fetch(linkGrammarApi.replace(/\/$/,'')+'/check',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({text:capSentence(w),words:w})});
+    if(!res.ok) throw new Error('HTTP '+res.status);
+    const data=await res.json();
+    const pass=!!(data && data.ok && data.fullParse !== false && Number(data.nullCount||0)===0);
+    linkGrammarCache[key]=pass; try{localStorage.setItem(LINK_GRAMMAR_CACHE_KEY,JSON.stringify(linkGrammarCache));}catch(e){}
+    linkGrammarStatus='ON'; renderSafe();
+    return pass ? {kind:'LinkGrammar構文解析',pts:48+Math.min(24,w.length*5),text:capSentence(w).replace(/[.]$/,''),source:'linkGrammar',parser:data} : null;
+  }catch(e){console.warn('Link Grammar API failed',e); linkGrammarStatus='ERR'; renderSafe(); return null;}
+}
+function setLinkGrammarApi(url){
+  linkGrammarApi=String(url||'').trim();
+  if(linkGrammarApi) localStorage.setItem(LINK_GRAMMAR_API_KEY,linkGrammarApi); else localStorage.removeItem(LINK_GRAMMAR_API_KEY);
+  linkGrammarStatus=linkGrammarApi?'READY':'OFF'; renderSafe();
+}
+window.setLinkGrammarApi=setLinkGrammarApi;
+const HARPER_CACHE_KEY='englishPittan.harperCache.v1';
+let harperLinter=null, harperStatus='OFF', harperLoading=false;
+let harperCache={};
+try{harperCache=JSON.parse(localStorage.getItem(HARPER_CACHE_KEY)||'{}')||{};}catch(e){harperCache={};}
+async function initHarper(){
+  if(harperLinter||harperLoading) return !!harperLinter;
+  harperLoading=true; harperStatus='LOADING'; renderSafe();
+  try{
+    const mod=await import('https://unpkg.com/harper.js@1.12.0/dist/harper.js');
+    harperLinter=new mod.WorkerLinter({binary: mod.binaryInlined});
+    await harperLinter.setup();
+    harperStatus='ON'; renderSafe(); return true;
+  }catch(e){
+    console.warn('Harper load failed', e); harperStatus='OFF'; renderSafe(); return false;
+  }finally{harperLoading=false;}
+}
+function renderSafe(){try{ if(typeof render==='function') render(); }catch(e){}}
+function capSentence(words){
+  let t=(Array.isArray(words)?words.join(' '):String(words||'')).trim();
+  t=t.replace(/\bi\b/g,'I').replace(/\benglish\b/ig,'English').replace(/\bjapanese\b/ig,'Japanese').replace(/\btv\b/ig,'TV');
+  return t.charAt(0).toUpperCase()+t.slice(1)+(/[.!?]$/.test(t)?'':'.');
+}
+function isLikelyCompleteSentenceWords(words){
+  const w=lowerWords(words); if(w.length<3) return false;
+  return isSubjWord(w[0]) || isNounLike(w[0]);
+}
+function hasPosWord(word,pos){ return wordPos(String(word||'').toLowerCase()).includes(pos); }
+function hasOrphanTail(words){
+  const w=lowerWords(words); if(w.length<3) return true;
+  const last=w[w.length-1];
+  // 文末が主語・代名詞・前置詞・冠詞・助動詞などで終わる候補は、Harperが見逃してもゲーム上は不成立。
+  if(hasPosWord(last,'subj')||hasPosWord(last,'pron')||hasPosWord(last,'pronObj')||hasPosWord(last,'article')||hasPosWord(last,'prep')||hasPosWord(last,'to')||hasPosWord(last,'be')||hasPosWord(last,'modal')||hasPosWord(last,'not')||hasPosWord(last,'conj')) return true;
+  // I like apples they のような「主語が文末に余る」候補を禁止。
+  for(let i=2;i<w.length;i++){
+    if(isSubjWord(w[i]) && !['and','because'].includes(w[i-1])) return true;
+  }
+  // 前置詞やtoの直後で文が切れている/不自然に主語が来る候補を禁止。
+  for(let i=0;i<w.length-1;i++){
+    if((hasPosWord(w[i],'prep')||hasPosWord(w[i],'to')) && (hasPosWord(w[i+1],'subj')||hasPosWord(w[i+1],'be')||hasPosWord(w[i+1],'modal'))) return true;
+  }
+  return false;
+}
+function isHarperCandidateWords(words){
+  const w=lowerWords(words);
+  if(!isLikelyCompleteSentenceWords(w)) return false;
+  if(hasOrphanTail(w)) return false;
+  // Harperは「候補文の最終確認」に限定。最低限、主語/名詞 + be/一般動詞/助動詞 があるものだけ投げる。
+  const hasFinite = (w.length>=3 && (hasPosWord(w[1],'be') || hasPosWord(w[1],'verb') || hasPosWord(w[1],'verbWant') || hasPosWord(w[1],'modal')));
+  return hasFinite;
+}
+async function harperEvaluate(words){
+  const key=norm(words);
+  if(!isHarperCandidateWords(words)) return null;
+  if(harperCache[key]!==undefined) return harperCache[key] ? {kind:'Harper確認文',pts:32+Math.min(20, words.length*4),text:capSentence(words).replace(/[.]$/,''),source:'harper'} : null;
+  const ok=await initHarper();
+  if(!ok || !harperLinter) return null;
+  try{
+    const text=capSentence(words);
+    const lints=await harperLinter.lint(text);
+    const serious=(lints||[]).filter(l=>{
+      const msg=String((typeof l.message==='function'?l.message():l.message)||'').toLowerCase();
+      return !/capital|punctuation|sentence start|proper noun/.test(msg);
+    });
+    const pass=serious.length===0;
+    harperCache[key]=pass; try{localStorage.setItem(HARPER_CACHE_KEY,JSON.stringify(harperCache));}catch(e){}
+    return pass ? {kind:'Harper確認文',pts:32+Math.min(20, words.length*4),text:text.replace(/[.]$/,''),source:'harper'} : null;
+  }catch(e){console.warn('Harper check failed',e); return null;}
+}
+const EXACT = new Map([
+  ['i am happy',{kind:'完全な文',pts:30}],['i am sad',{kind:'完全な文',pts:30}],['you are kind',{kind:'完全な文',pts:30}],['he is tall',{kind:'完全な文',pts:30}],['she is busy',{kind:'完全な文',pts:30}],['we are hungry',{kind:'完全な文',pts:30}],['i am english',{kind:'be動詞の文',pts:32}],['you are english',{kind:'be動詞の文',pts:32}],
+  ['i like apples',{kind:'完全な文',pts:35}],['i like music',{kind:'完全な文',pts:35}],['you play soccer',{kind:'完全な文',pts:35}],['we study english',{kind:'完全な文',pts:35}],['i read books',{kind:'完全な文',pts:35}],['i go to school',{kind:'一般動詞+toの文',pts:42}],['you go to school',{kind:'一般動詞+toの文',pts:42}],['we go to school',{kind:'一般動詞+toの文',pts:42}],['they go to school',{kind:'一般動詞+toの文',pts:42}],
+  ['i am playing soccer',{kind:'進行形の文',pts:50}],['she is reading books',{kind:'進行形の文',pts:50}],['we are studying english',{kind:'進行形の文',pts:50}],['i am going to school',{kind:'進行形の文',pts:55}],
+  ['i want to play',{kind:'不定詞の文',pts:55}],['i want to read',{kind:'不定詞の文',pts:55}],['you want to study',{kind:'不定詞の文',pts:55}],['i can swim',{kind:'助動詞の文',pts:45}],['you must study',{kind:'助動詞の文',pts:45}],
+  ['play soccer',{kind:'フレーズ',pts:16}],['study english',{kind:'フレーズ',pts:16}],['read books',{kind:'フレーズ',pts:16}],['go to school',{kind:'フレーズ',pts:22}],['very happy',{kind:'フレーズ',pts:14}],['very kind',{kind:'フレーズ',pts:14}],['in the morning',{kind:'フレーズ',pts:20}],['not happy',{kind:'否定フレーズ',pts:12}],['not busy',{kind:'否定フレーズ',pts:12}]
+]);
+
+const JA = {
+  'i':'私は','you':'あなたは','he':'彼は','she':'彼女は','we':'私たちは','they':'彼らは','am':'です','are':'です','is':'です','not':'〜ではありません',
+  'happy':'幸せ','sad':'悲しい','kind':'親切','tall':'背が高い','busy':'忙しい','hungry':'お腹がすいている',
+  'like':'好きです','play':'する','study':'勉強する','read':'読む','go':'行く','want':'したい','can':'できます','must':'しなければなりません',
+  'playing':'しています','studying':'勉強しています','reading':'読んでいます','going':'行っています','to':'へ','school':'学校','soccer':'サッカー','tennis':'テニス','english':'英語','apples':'りんご','music':'音楽','books':'本','very':'とても','now':'今','today':'今日','everyday':'毎日','in':'〜に','the':'その','morning':'朝'
+};
+const EXACT_JA = new Map([
+  ['i am happy','私は幸せです'],['i am sad','私は悲しいです'],['you are kind','あなたは親切です'],['he is tall','彼は背が高いです'],['she is busy','彼女は忙しいです'],['we are hungry','私たちはお腹がすいています'],['i am english','私はイングランド人です'],['you are english','あなたはイングランド人です'],
+  ['i like apples','私はりんごが好きです'],['i like music','私は音楽が好きです'],['you play soccer','あなたはサッカーをします'],['we study english','私たちは英語を勉強します'],['i read books','私は本を読みます'],['i go to school','私は学校へ行きます'],['you go to school','あなたは学校へ行きます'],['we go to school','私たちは学校へ行きます'],['they go to school','彼らは学校へ行きます'],
+  ['i am playing soccer','私はサッカーをしています'],['she is reading books','彼女は本を読んでいます'],['we are studying english','私たちは英語を勉強しています'],['i am going to school','私は学校へ行っています'],
+  ['i want to play','私は遊びたいです'],['i want to read','私は読みたいです'],['you want to study','あなたは勉強したいです'],['i can swim','私は泳げます'],['you must study','あなたは勉強しなければなりません'],
+  ['play soccer','サッカーをする'],['study english','英語を勉強する'],['read books','本を読む'],['go to school','学校へ行く'],['very happy','とても幸せ'],['very kind','とても親切'],['in the morning','朝に'],['not happy','幸せではない'],['not busy','忙しくない']
+]);
+
+const HAND_ORDER = [
+  ['subj','主語',10],['pron','主語',10],
+  ['be','be動詞',20],['modal','助動詞',22],['not','否定',24],
+  ['verbWant','動詞',30],['verb','動詞',32],['ving','〜ing',34],['to','to',36],
+  ['prep','前置詞',38],['article','冠詞',40],
+  ['adv','副詞',48],['adj','形容詞',50],
+  ['noun','名詞',60],['advTime','時',70]
+];
+function handInfo(w){
+  const ps=wordPos(w);
+  let best={key:'etc',label:'その他',rank:99};
+  for(const [key,label,rank] of HAND_ORDER){
+    if(ps.includes(key) && rank<best.rank) best={key,label,rank};
+  }
+  return best;
+}
+function sortHand(hand){
+  return (hand||[]).slice().sort((a,b)=>{
+    const ia=handInfo(a), ib=handInfo(b);
+    return (ia.rank-ib.rank) || String(a).localeCompare(String(b),'en',{sensitivity:'base'});
+  });
+}
+const HAND_SLOTS = [
+  {key:'subj', label:'主語', poses:['subj']},
+  {key:'be', label:'be/助', poses:['be','modal']},
+  {key:'verb', label:'動詞', poses:['verb','verbWant']},
+  {key:'comp', label:'形/ing', poses:['adj','ving']},
+  {key:'noun', label:'名詞', poses:['noun']},
+  {key:'extra', label:'追加', poses:['advTime','adv','to','prep','article','not']}
+];
+function wordsForSlot(slotIndex){
+  const slot=HAND_SLOTS[slotIndex]||HAND_SLOTS[HAND_SLOTS.length-1];
+  return WORDS.filter(x=>(x.pos||[]).some(p=>slot.poses.includes(p)));
+}
+function drawOneForSlot(slotIndex){
+  const bag=wordsForSlot(slotIndex);
+  return (bag[Math.floor(Math.random()*bag.length)]||WORDS[0]).w;
+}
+function slotInfo(i,w){
+  const slot=HAND_SLOTS[i];
+  if(slot) return {key:slot.key, label:slot.label, rank:i};
+  return handInfo(w);
+}
+const targets = Array.from(EXACT.keys()).slice(0,24);
+let state = freshState(2);
+function freshState(playerCount=2){
+  return {version:1,gameId:'eng-'+Date.now().toString(36),turn:0,turnNo:1,playerCount,wordsMade:0,board:Array.from({length:N*N},()=>null),players:Array.from({length:playerCount},(_,i)=>({name:'Player '+(i+1),score:0,tiles:0,color:COLORS[i],hand:drawHand(i)})),log:[{t:Date.now(),text:'新規ゲーム開始',good:true}]};
+}
+function drawHand(seed=0){
+  // 詰み対策：種類ごとの固定スロットで、常に「主語 / be・助 / 動詞 / 形容詞・ing / 名詞 / 追加」を1枚ずつ持つ。
+  if(seed===0) return ['I','am','like','happy','apples','today'];
+  if(seed===1) return ['you','are','play','kind','soccer','now'];
+  if(seed===2) return ['we','can','study','busy','English','very'];
+  if(seed===3) return ['she','is','read','reading','books','in'];
+  return HAND_SLOTS.map((_,i)=>drawOneForSlot(i));
+}
+function safeName(){return ($('nameInput').value||localStorage.englishName||('P-'+clientId)).trim().slice(0,18)}
+function setMsg(text,cls='info'){const el=$('msg');el.textContent=text;el.className='msg '+cls;}
+function addLog(text,good=true){state.log.unshift({t:Date.now(),text,good});state.log=state.log.slice(0,40);}
+function idx(x,y){return y*N+x}
+function xy(i){return {x:i%N,y:Math.floor(i/N)}}
+function currentPlayer(){return state.players[state.turn%state.playerCount]}
+function wordPos(w){return POS[String(w||'').toLowerCase()]||[]}
+function hasPos(w,p){return wordPos(w).includes(p)}
+function norm(arr){return arr.map(w=>String(w).trim()).join(' ').toLowerCase().replace(/\s+/g,' ')}
+const UNUSED_PENALTY = 8;
+function useCountOf(c){return Math.max(0, Number(c?.useCount||0));}
+function useColor(count, ownerColor){
+  if(count<=0) return {bg:'rgba(248,113,113,.16)', border:'rgba(248,113,113,.55)', text:'#fecaca', rainbow:false};
+  const hue = [198,142,68,34,322,265,0][Math.min(count-1,6)];
+  const bg = `hsla(${hue}, 92%, ${count>=4?56:48}%, .32)`;
+  const border = `hsla(${hue}, 96%, 68%, .86)`;
+  return {bg,border,text:'#fff',rainbow:count>=7};
+}
+function lowerWords(words){return (words||[]).map(x=>String(x||'').trim()).filter(Boolean).map(x=>x.toLowerCase());}
+function isSubjWord(w){return ['i','you','he','she','we','they'].includes(w);}
+function beForSubject(w){
+  w=String(w||'').toLowerCase();
+  if(w==='i') return 'am';
+  if(['you','we','they'].includes(w)) return 'are';
+  if(['he','she','it'].includes(w)) return 'is';
+  if(['apples','books'].includes(w)) return 'are';
+  return 'is';
+}
+function beMatches(subj,be){return beForSubject(subj)===String(be||'').toLowerCase();}
+function canUseBaseVerb(subj){return !['he','she','it'].includes(String(subj||'').toLowerCase());}
+function isNounLike(w){return wordPos(w).includes('noun');}
+function isAdjLike(w){return wordPos(w).includes('adj');}
+function isTimeWord(w){return wordPos(w).includes('advTime');}
+function isVerbObjectOK(v,o){
+  v=String(v||'').toLowerCase(); o=String(o||'').toLowerCase();
+  const anyNoun=isNounLike(o);
+  if(v==='like'||v==='enjoy') return anyNoun;
+  if(v==='play') return ['soccer','tennis','baseball','games','music'].includes(o);
+  if(v==='study'||v==='learn') return ['english','japanese','music','books','game','games'].includes(o);
+  if(v==='read') return ['books','english','japanese'].includes(o);
+  if(v==='speak'||v==='write') return ['english','japanese'].includes(o);
+  if(v==='watch') return ['tv','game','games','soccer','tennis','baseball'].includes(o);
+  if(v==='listen') return ['music'].includes(o);
+  if(v==='eat'||v==='have') return ['breakfast','lunch','dinner','apples','food'].includes(o);
+  if(v==='drink') return ['water'].includes(o);
+  if(v==='visit') return ['japan','tokyo','school'].includes(o);
+  if(v==='help') return ['people','friends','family'].includes(o);
+  if(v==='make') return ['friends','food','games'].includes(o);
+  if(v==='take') return ['care'].includes(o);
+  if(v==='look'||v==='go'||v==='come'||v==='get') return false;
+  return anyNoun;
+}
+function isBareVerbPhraseOK(v,o){return isVerbObjectOK(v,o);}
+function evalCorePattern(w){
+  const n=w.length;
+  const hp=(i,pos)=>wordPos(w[i]).includes(pos);
+  const text=w.join(' ');
+  const cap=text.split(' ').map((x,i)=> x==='i'?'I': (x==='english'?'English':x)).join(' ');
+  // short phrases
+  if(n===2 && hp(0,'adv') && hp(1,'adj')) return {kind:'副詞+形容詞',pts:12,text:cap};
+  if(n===2 && hp(0,'not') && hp(1,'adj')) return {kind:'否定フレーズ',pts:12,text:cap};
+  if(n===2 && hp(0,'verb') && isBareVerbPhraseOK(w[0],w[1])) return {kind:'動詞+名詞フレーズ',pts:14,text:cap};
+  if(n===3 && w[0]==='go' && hp(1,'to') && hp(2,'noun')) return {kind:'go to フレーズ',pts:22,text:cap};
+  if(n===3 && hp(0,'prep') && hp(1,'article') && hp(2,'noun')) return {kind:'前置詞句',pts:18,text:cap};
+  if(n===3 && hp(0,'adv') && hp(1,'adj') && hp(2,'noun')) return {kind:'形容詞句',pts:18,text:cap};
+
+  // be sentences: pronoun/noun + correct be + complement
+  if(n===3 && (hp(0,'subj')||hp(0,'noun')) && hp(1,'be') && beMatches(w[0],w[1]) && (hp(2,'adj')||hp(2,'ving'))) {
+    return {kind:hp(2,'ving')?'進行形の文':'be動詞の文',pts:hp(2,'ving')?40:30,text:cap};
+  }
+  if(n===4 && (hp(0,'subj')||hp(0,'noun')) && hp(1,'be') && beMatches(w[0],w[1]) && hp(2,'adv') && hp(3,'adj')) {
+    return {kind:'be動詞+副詞の文',pts:38,text:cap};
+  }
+  if(n===4 && (hp(0,'subj')||hp(0,'noun')) && hp(1,'be') && beMatches(w[0],w[1]) && hp(2,'not') && hp(3,'adj')) {
+    return {kind:'be動詞の否定文',pts:42,text:cap};
+  }
+  if(n===4 && (hp(0,'subj')||hp(0,'noun')) && hp(1,'be') && beMatches(w[0],w[1]) && hp(2,'ving') && hp(3,'noun') && isVerbObjectOK(w[2].replace(/ing$/,''),w[3])) {
+    return {kind:'進行形の文',pts:50,text:cap};
+  }
+  if(n===5 && (hp(0,'subj')||hp(0,'noun')) && hp(1,'be') && beMatches(w[0],w[1]) && hp(2,'not') && hp(3,'adv') && hp(4,'adj')) {
+    return {kind:'be動詞の否定+副詞の文',pts:52,text:cap};
+  }
+
+  // general verb sentences: base verb is safe for I/you/we/they in this deck
+  if(n===3 && hp(0,'subj') && hp(1,'verb') && canUseBaseVerb(w[0]) && isVerbObjectOK(w[1],w[2])) {
+    return {kind:'一般動詞の文',pts:34,text:cap};
+  }
+  if(n===4 && hp(0,'subj') && w[1]==='go' && hp(2,'to') && hp(3,'noun') && canUseBaseVerb(w[0])) {
+    return {kind:'go to の文',pts:42,text:cap};
+  }
+  if(n===4 && hp(0,'subj') && hp(1,'verbWant') && hp(2,'to') && hp(3,'verb') && canUseBaseVerb(w[0])) {
+    return {kind:'want to 文',pts:52,text:cap};
+  }
+  if(n===5 && hp(0,'subj') && hp(1,'verbWant') && hp(2,'to') && hp(3,'verb') && isVerbObjectOK(w[3],w[4]) && canUseBaseVerb(w[0])) {
+    return {kind:'want to+目的語の文',pts:62,text:cap};
+  }
+  if(n===3 && hp(0,'subj') && hp(1,'modal') && hp(2,'verb')) {
+    return {kind:'助動詞の文',pts:42,text:cap};
+  }
+  if(n===4 && hp(0,'subj') && hp(1,'modal') && hp(2,'verb') && isVerbObjectOK(w[2],w[3])) {
+    return {kind:'助動詞+目的語の文',pts:52,text:cap};
+  }
+  if(n===3 && hp(0,'verb') && hp(1,'prep') && hp(2,'noun')) {
+    return {kind:'動詞+前置詞フレーズ',pts:24,text:cap};
+  }
+  if(n===4 && hp(0,'subj') && hp(1,'verb') && hp(2,'prep') && hp(3,'noun') && canUseBaseVerb(w[0])) {
+    return {kind:'一般動詞+前置詞の文',pts:46,text:cap};
+  }
+  if(n===4 && (hp(0,'subj')||hp(0,'noun')) && hp(1,'be') && beMatches(w[0],w[1]) && hp(2,'adj') && hp(3,'prep')) {
+    return {kind:'be+形容詞+前置詞',pts:44,text:cap};
+  }
+  if(n===5 && (hp(0,'subj')||hp(0,'noun')) && hp(1,'be') && beMatches(w[0],w[1]) && hp(2,'adj') && hp(3,'prep') && hp(4,'noun')) {
+    return {kind:'be+形容詞+前置詞句の文',pts:58,text:cap};
+  }
+  if(n===4 && hp(0,'subj') && hp(1,'verb') && hp(2,'article') && hp(3,'noun') && canUseBaseVerb(w[0])) {
+    return {kind:'一般動詞+冠詞+名詞の文',pts:42,text:cap};
+  }
+  if(n===4 && hp(0,'verb') && hp(1,'prep') && hp(2,'article') && hp(3,'noun')) {
+    return {kind:'動詞+前置詞+冠詞句',pts:28,text:cap};
+  }
+  if(n===5 && hp(0,'subj') && hp(1,'be') && beMatches(w[0],w[1]) && hp(2,'ving') && hp(3,'prep') && hp(4,'noun')) {
+    return {kind:'進行形+前置詞句',pts:60,text:cap};
+  }
+  return null;
+}
+function grammarEvaluate(words){
+  const w=lowerWords(words);
+  if(w.length<2) return null;
+  // exact entries still override for curated Japanese/score.
+  const exactKey=w.join(' ');
+  if(EXACT.has(exactKey)) return {...EXACT.get(exactKey),text:words.join(' '),exact:true,source:'exact'};
+  // 教材系のフレーズ・熟語・連語はフレーズバンクで即成立。
+  if(PHRASE_MAP.has(exactKey)){ const e=PHRASE_MAP.get(exactKey); return {...e,text:e.text,exact:true,source:'phraseBank'}; }
+  // Optional final time expression. This turns many base patterns into valid expanded sentences.
+  let time=null, core=w;
+  if(w.length>=3 && isTimeWord(w[w.length-1])){time=w[w.length-1]; core=w.slice(0,-1);}
+  let ev=evalCorePattern(core);
+  if(ev){
+    if(time){ ev={...ev,kind:ev.kind+'+時',pts:ev.pts+10,text:(ev.text+' '+(time==='english'?'English':time)).trim()}; }
+    ev.source='grammar';
+    return ev;
+  }
+  return null;
+}
+function evaluateSequence(words){
+  return grammarEvaluate(words);
+}
+async function evaluateSequenceAsync(words){
+  const ev=grammarEvaluate(words);
+  if(ev) return ev;
+  const lg=await linkGrammarEvaluate(words);
+  if(lg) return lg;
+  // Harperは成立判定の主役にしない。Link Grammar API未設定時の最後の補助だけ。
+  return await harperEvaluate(words);
+}
+
+function translateSequence(words,ev){
+  const key=norm(words);
+  if(EXACT_JA.has(key)) return EXACT_JA.get(key);
+  if(PHRASE_MAP.has(key)) return PHRASE_MAP.get(key).ja;
+  const w=lowerWords(words);
+  const ja=x=>JA[String(x).toLowerCase()]||x;
+  const hp=(i,pos)=>wordPos(w[i]).includes(pos);
+  let time='';
+  let core=w;
+  if(w.length>=3 && isTimeWord(w[w.length-1])){time=ja(w[w.length-1]); core=w.slice(0,-1);}
+  const c=core;
+  const ch=(i,pos)=>wordPos(c[i]).includes(pos);
+  if(c.length===2 && ch(0,'adv') && ch(1,'adj')) return `${ja(c[0])}${ja(c[1])}${time?`（${time}）`:''}`;
+  if(c.length===2 && ch(0,'not') && ch(1,'adj')) return `${ja(c[1])}ではない${time?`（${time}）`:''}`;
+  if(c.length===2 && ch(0,'verb') && isBareVerbPhraseOK(c[0],c[1])) return `${ja(c[1])}を${ja(c[0])}${time?`（${time}）`:''}`;
+  if(c.length===3 && c[0]==='go' && ch(1,'to') && ch(2,'noun')) return `${ja(c[2])}へ行く${time?`（${time}）`:''}`;
+  if(c.length===3 && ch(0,'prep') && ch(1,'article') && ch(2,'noun')) return `${ja(c[2])}に${time?`（${time}）`:''}`;
+  if(c.length===3 && (ch(0,'subj')||ch(0,'noun')) && ch(1,'be') && beMatches(c[0],c[1]) && ch(2,'adj')){
+    if(c[2]==='english' && ch(0,'subj')) return `${ja(c[0])}イングランド人です${time?`（${time}）`:''}`;
+    return `${ja(c[0])}${time}${ja(c[2])}です`;
+  }
+  if(c.length===3 && (ch(0,'subj')||ch(0,'noun')) && ch(1,'be') && beMatches(c[0],c[1]) && ch(2,'ving')) return `${ja(c[0])}${time}${ja(c[2])}`;
+  if(c.length===4 && (ch(0,'subj')||ch(0,'noun')) && ch(1,'be') && beMatches(c[0],c[1]) && ch(2,'adv') && ch(3,'adj')) return `${ja(c[0])}${time}${ja(c[2])}${ja(c[3])}です`;
+  if(c.length===4 && (ch(0,'subj')||ch(0,'noun')) && ch(1,'be') && beMatches(c[0],c[1]) && ch(2,'not') && ch(3,'adj')) return `${ja(c[0])}${time}${ja(c[3])}ではありません`;
+  if(c.length===4 && (ch(0,'subj')||ch(0,'noun')) && ch(1,'be') && beMatches(c[0],c[1]) && ch(2,'ving') && ch(3,'noun')) return `${ja(c[0])}${time}${ja(c[3])}を${ja(c[2])}`;
+  if(c.length===3 && ch(0,'subj') && ch(1,'verb') && isVerbObjectOK(c[1],c[2])) return `${ja(c[0])}${time}${ja(c[2])}を${ja(c[1])}`;
+  if(c.length===4 && ch(0,'subj') && c[1]==='go' && ch(2,'to') && ch(3,'noun')) return `${ja(c[0])}${time}${ja(c[3])}へ行きます`;
+  if(c.length===4 && ch(0,'subj') && ch(1,'verbWant') && ch(2,'to') && ch(3,'verb')) return `${ja(c[0])}${time}${ja(c[3])}したいです`;
+  if(c.length===5 && ch(0,'subj') && ch(1,'verbWant') && ch(2,'to') && ch(3,'verb') && isVerbObjectOK(c[3],c[4])) return `${ja(c[0])}${time}${ja(c[4])}を${ja(c[3])}したいです`;
+  if(c.length===3 && ch(0,'subj') && ch(1,'modal') && ch(2,'verb')) return `${ja(c[0])}${time}${ja(c[2])}${c[1]==='can'?'ことができます':'しなければなりません'}`;
+  if(c.length===4 && ch(0,'subj') && ch(1,'modal') && ch(2,'verb') && isVerbObjectOK(c[2],c[3])) return `${ja(c[0])}${time}${ja(c[3])}を${ja(c[2])}${c[1]==='can'?'ことができます':'しなければなりません'}`;
+  if(c.length===5 && ch(0,'subj') && ch(1,'modal') && c[2]==='go' && ch(3,'to') && ch(4,'noun')) return `${ja(c[0])}${time}${ja(c[4])}へ行く${c[1]==='can'?'ことができます':'必要があります'}`;
+  return words.map(ja).join(' / ');
+}
+function unlockSpeech(){
+  if(!('speechSynthesis' in window)) return;
+  try{const u=new SpeechSynthesisUtterance('');u.volume=0;window.speechSynthesis.speak(u);setTimeout(()=>window.speechSynthesis.cancel(),30);}catch(e){}
+}
+function pickVoice(lang){
+  if(!('speechSynthesis' in window)) return null;
+  const voices=window.speechSynthesis.getVoices()||[];
+  return voices.find(v=>v.lang===lang) || voices.find(v=>String(v.lang||'').toLowerCase().startsWith(lang.slice(0,2).toLowerCase())) || null;
+}
+function speakOne(enText,jaText,onEnd){
+  if(!('speechSynthesis' in window)){ if(onEnd) onEnd(); return; }
+  try{
+    const en=new SpeechSynthesisUtterance(enText);
+    en.lang='en-US';en.rate=.82;en.pitch=1;en.volume=1;
+    const ev=pickVoice('en-US'); if(ev) en.voice=ev;
+    const ja=new SpeechSynthesisUtterance(jaText);
+    ja.lang='ja-JP';ja.rate=.95;ja.pitch=1;ja.volume=1;
+    const jv=pickVoice('ja-JP'); if(jv) ja.voice=jv;
+    ja.onend=()=>{ if(onEnd) onEnd(); };
+    en.onend=()=>setTimeout(()=>window.speechSynthesis.speak(ja),180);
+    window.speechSynthesis.speak(en);
+  }catch(e){ if(onEnd) onEnd(); }
+}
+function speakResult(m){
+  if(!m) return;
+  const enText=m.text;
+  const jaText=m.ja||translateSequence(enText.split(' '),m);
+  try{ if('speechSynthesis' in window) window.speechSynthesis.cancel(); }catch(e){}
+  speakOne(enText,jaText);
+}
+function speakResultsSequential(matches){
+  if(!matches||!matches.length) return;
+  const unique=[]; const seen=new Set();
+  for(const m of matches){const k=norm(m.text.split(' ')); if(seen.has(k)) continue; seen.add(k); unique.push(m);}
+  if(!unique.length) return;
+  try{ if('speechSynthesis' in window) window.speechSynthesis.cancel(); }catch(e){}
+  let i=0;
+  const next=()=>{
+    const m=unique[i++];
+    if(!m) return;
+    highlightRoute(m, i-1, 1850);
+    const prefix=unique.length>1 ? `Combo ${i}. ` : '';
+    speakOne(prefix + m.text, m.ja||translateSequence(m.text.split(' '),m), ()=>setTimeout(next,260));
+  };
+  next();
+}
+function playChime(ok=true){
+  try{
+    const C=window.AudioContext||window.webkitAudioContext;if(!C)return;
+    const ctx=new C();
+    const now=ctx.currentTime;
+    const notes=ok?[523,659,784,1046]:[160,120];
+    notes.forEach((f,i)=>{const o=ctx.createOscillator();const g=ctx.createGain();o.type=ok?'triangle':'sawtooth';o.frequency.value=f;g.gain.setValueAtTime(0.0001,now+i*.08);g.gain.exponentialRampToValueAtTime(ok?.16:.08,now+i*.08+.02);g.gain.exponentialRampToValueAtTime(0.0001,now+i*.08+.16);o.connect(g);g.connect(ctx.destination);o.start(now+i*.08);o.stop(now+i*.08+.18);});
+    setTimeout(()=>ctx.close(),700);
+  }catch(e){}
+}
+function showFx(made,gained,cellIndex,comboInfo=null){
+  const top=made[0]; if(!top)return;
+  const comboN=comboInfo?.count||1;
+  const fx=$('fxBanner');
+  fx.classList.toggle('combo', comboN>1);
+  fx.querySelector('.fxBig').textContent = comboN>1 ? `COMBO ×${comboN}!` : 'GOOD!';
+  $('fxEn').textContent=comboN>1 ? (comboInfo?.mode==='multi' ? `${comboN} SENTENCE COMBO!` : `${top.text}  ${comboN} ROUTES!`) : top.text;
+  $('fxJa').textContent=comboN>1 && comboInfo?.mode==='multi' ? comboInfo.text : (top.ja||'');
+  $('fxPts').textContent=(comboN>1?`${comboInfo?.mode==='multi'?'文コンボ':'経路コンボ'} +${comboInfo.bonus||0} / `:'')+'+'+gained+' POINTS';
+  fx.classList.remove('show');void fx.offsetWidth;fx.classList.add('show');
+  const cell=document.querySelectorAll('.cell')[cellIndex];
+  let x=innerWidth/2,y=innerHeight/2;
+  if(cell){const r=cell.getBoundingClientRect();x=r.left+r.width/2;y=r.top+r.height/2;}
+  const pop=document.createElement('div');pop.className='scorePop';pop.style.left=x+'px';pop.style.top=y+'px';pop.innerHTML=`+${gained}<small>${comboN>1?'COMBO ×'+comboN:esc(top.kind)}</small>`;document.body.appendChild(pop);setTimeout(()=>pop.remove(),1300);
+  const sparkCount=comboN>1?38:22;
+  for(let i=0;i<sparkCount;i++){const sp=document.createElement('i');sp.className='spark';sp.style.left=x+'px';sp.style.top=y+'px';const a=Math.random()*Math.PI*2,d=30+Math.random()*(comboN>1?130:90);sp.style.setProperty('--dx',Math.cos(a)*d+'px');sp.style.setProperty('--dy',Math.sin(a)*d+'px');document.body.appendChild(sp);setTimeout(()=>sp.remove(),900);}
+}
+
+async function scanFromCell(placeIndex){
+  const found=[];
+  const candidates=[];
+  const maxLen=8;
+  const maxTurns=2;
+  const starts=[];
+  // 置いた単語を含む全候補ルートを列挙する。
+  // 横・縦・右下へ曲がるルートを総当たりし、内部ルール→フレーズバンク→Harperの順で照合。
+  for(let y=0;y<N;y++){
+    for(let x=0;x<N;x++){
+      const c=state.board[idx(x,y)];
+      if(c) starts.push({x,y,i:idx(x,y),w:c.w});
+    }
+  }
+  function pushPath(path,label){
+    if(path.length<2 || !path.some(s=>s.i===placeIndex)) return;
+    candidates.push({path:path.slice(),label});
+  }
+  function dfs(x,y,path,lastMove,turns){
+    pushPath(path, turns===0 ? (lastMove==='D'?'縦':'横') : `隣接ルート${turns}曲がり`);
+    if(path.length>=maxLen) return;
+    for(const mv of [{dx:1,dy:0,k:'R'},{dx:0,dy:1,k:'D'}]){
+      const nx=x+mv.dx, ny=y+mv.dy;
+      if(nx<0||ny<0||nx>=N||ny>=N) continue;
+      const ni=idx(nx,ny);
+      const cell=state.board[ni];
+      if(!cell) continue;
+      if(path.some(s=>s.i===ni)) continue;
+      const nt = lastMove && lastMove!==mv.k ? turns+1 : turns;
+      if(nt>maxTurns) continue;
+      dfs(nx,ny,path.concat({i:ni,w:cell.w}),mv.k,nt);
+    }
+  }
+  for(const st of starts){ dfs(st.x,st.y,[{i:st.i,w:st.w}],null,0); }
+
+  // まず内部・フレーズバンクを同期評価。未知の完全英文だけHarperへ回す。
+  const seenCand=new Set();
+  const uniq=[];
+  for(const c of candidates){
+    const words=c.path.map(s=>s.w);
+    const k=c.path.map(s=>s.i).join(',')+'|'+norm(words);
+    if(seenCand.has(k)) continue;
+    seenCand.add(k); uniq.push(c);
+  }
+  for(const c of uniq){
+    const words=c.path.map(s=>s.w);
+    let ev=evaluateSequence(words);
+    if(!ev && isLikelyCompleteSentenceWords(words)) ev=await evaluateSequenceAsync(words);
+    if(ev){
+      ev.ja=translateSequence(words,ev);
+      found.push({...ev,cells:c.path.map(s=>s.i),dir:c.label});
+    }
+  }
+  found.sort((a,b)=>(b.cells.length-a.cells.length)||(b.pts-a.pts));
+  const seen=new Set();
+  return found.filter(f=>{const k=f.cells.join(',')+'|'+norm(f.text.split(' ')); if(seen.has(k)) return false; seen.add(k); return true;}).slice(0,24);
+}
+function selectScoringMatches(matches){
+  // 長い英文を優先。ただし「go to school」のような登録済みの3語以上フレーズは、
+  // 長い文の一部でも学習上意味があるのでコンボとして残す。
+  // 一方で「like apples」のような自動生成2語フレーズは、I like apples と二重加算しない。
+  const sorted=[...matches].sort((a,b)=>(b.cells.length-a.cells.length)||(b.pts-a.pts));
+  const picked=[];
+  function isSubset(a,b){
+    const bs=new Set(b.cells);
+    return a.cells.every(i=>bs.has(i));
+  }
+  function keepSubsetCombo(m){
+    return !!m.exact && m.cells.length>=3 && /フレーズ|前置詞句|否定/.test(m.kind||'');
+  }
+  for(const m of sorted){
+    const subsetOfPicked=picked.some(big=>isSubset(m,big));
+    if(subsetOfPicked && !keepSubsetCombo(m)) continue;
+    picked.push(m);
+  }
+  // 同じセル列・同じ英文は重複させない。
+  const seen=new Set();
+  const out=[];
+  for(const m of picked){
+    const k=(m.cells||[]).join(',')+'|'+norm(m.text.split(' '));
+    if(seen.has(k)) continue;
+    seen.add(k); out.push(m);
+  }
+  return out.sort((a,b)=>(a.cells[0]-b.cells[0])||(b.cells.length-a.cells.length));
+}
+function summarizeScoring(scoring){
+  const groups=new Map();
+  for(const m of scoring){
+    const key=norm(m.text.split(' '));
+    if(!groups.has(key)) groups.set(key,{text:m.text,ja:m.ja,kind:m.kind,count:0,pts:0,routes:[]});
+    const g=groups.get(key);
+    g.count++;
+    g.pts += m.pts;
+    g.routes.push(m);
+  }
+  const list=[...groups.values()];
+  let comboInfo=null;
+  const totalRoutes=scoring.length;
+  if(totalRoutes>1){
+    const sentenceCount=list.length;
+    const routeBonus=(totalRoutes-1)*18;
+    comboInfo={count:totalRoutes, sentenceCount, routeCount:totalRoutes, text:list.map(g=>g.text+(g.count>1?` ×${g.count}`:'')).join(' / '), ja:'成立詳細を表示中', bonus:routeBonus, mode:sentenceCount>1?'multi':'route', groups:list, matches:scoring};
+  }
+  return {groups:list, comboInfo};
+}
+function coord(i){const p=xy(i);return String.fromCharCode(65+p.x)+(p.y+1);}
+function routeText(m){return (m.cells||[]).map((i,n)=>`${n+1}.${coord(i)} ${state.board[i]?.w||''}`).join(' → ');}
+let routeFocusCells=[];
+let routeFocusTimer=null;
+function highlightRoute(m,seq=0,duration=1600){
+  routeFocusCells=(m?.cells||[]).slice();
+  render();
+  clearTimeout(routeFocusTimer);
+  routeFocusTimer=setTimeout(()=>{routeFocusCells=[];render();},duration);
+  const items=document.querySelectorAll('.comboItem');
+  items.forEach((el,i)=>el.classList.toggle('active',i===seq));
+}
+function showComboDetails(scoring,comboInfo){
+  const panel=$('comboPanel'), listEl=$('comboList'), title=$('comboTitle');
+  if(!panel||!listEl) return;
+  if(!comboInfo || scoring.length<=1){panel.classList.remove('show');return;}
+  title.textContent=`COMBO ×${comboInfo.count}：${comboInfo.sentenceCount||comboInfo.count}文 / ${comboInfo.routeCount||comboInfo.count}経路`;
+  listEl.innerHTML=scoring.map((m,i)=>{
+    const ja=m.ja||translateSequence(m.text.split(' '),m);
+    const chips=(m.cells||[]).map((c,n)=>`<span class="routeChip">${n+1} ${coord(c)} ${esc(state.board[c]?.w||'')}</span>`).join('');
+    return `<div class="comboItem" data-route="${i}"><b>${i+1}. ${esc(m.text)}</b><div class="comboJa">${esc(ja)} / ${esc(m.kind||'')}</div><div class="comboRoute">${esc(m.dir||'経路')}：${esc(routeText(m))}</div><div class="comboCards">${chips}</div></div>`;
+  }).join('');
+  panel.classList.add('show');
+  panel.querySelectorAll('.comboItem').forEach((el,i)=>{el.onclick=()=>highlightRoute(scoring[i],i,2600);});
+  clearTimeout(panel._hideTimer);
+  panel._hideTimer=setTimeout(()=>panel.classList.remove('show'),14000);
+  highlightRoute(scoring[0],0,2200);
+}
+async function placeTile(cellIndex){
+  if(selectedHandIndex<0){setMsg('先に手札を選んで！','bad');return;}
+  if(state.board[cellIndex]){setMsg('そこは埋まってる','bad');return;}
+  const p=currentPlayer();
+  const word=p.hand[selectedHandIndex];
+  if(!word){setMsg('その手札は空','bad');return;}
+  state.board[cellIndex]={w:word,owner:state.turn%state.playerCount,baseOwner:state.turn%state.playerCount,at:Date.now(),useCount:0,unusedPenaltyApplied:false};
+  p.hand[selectedHandIndex]=drawOneForSlot(selectedHandIndex);
+  // 種類別固定スロットなのでソートしない。各枠を維持する。
+  setMsg('成立候補を全照合中…','info');
+  const made=await scanFromCell(cellIndex);
+  recentCells=[cellIndex]; routeFocusCells=[];
+  let gained=1;
+  if(made.length){
+    const scoring=selectScoringMatches(made);
+    const {groups,comboInfo}=summarizeScoring(scoring);
+    const useDelta=new Map();
+    for(const m of scoring){
+      gained += m.pts;
+      state.wordsMade++;
+      m.cells.forEach(i=>{
+        useDelta.set(i,(useDelta.get(i)||0)+1);
+        if(!recentCells.includes(i)) recentCells.push(i);
+      });
+    }
+    if(comboInfo){
+      gained += comboInfo.bonus;
+    }
+    for(const g of groups){
+      const suffix=g.count>1?` COMBO×${g.count}（${g.count}経路）`:'';
+      addLog(`${p.name}: ${g.text}${suffix} / ${g.ja}（${g.kind}） +${g.pts}${g.count>1?` +コンボ${(g.count-1)*18}`:''}`,true);
+      g.routes.forEach((r,ri)=>addLog(`　経路${ri+1}: ${r.dir||'経路'} ${routeText(r)}`,true));
+    }
+    useDelta.forEach((delta,i)=>{
+      const cell=state.board[i];
+      if(cell){
+        cell.owner=state.turn%state.playerCount;
+        cell.useCount=useCountOf(cell)+delta;
+        cell.unusedPenaltyApplied=false;
+      }
+    });
+    if(comboInfo){
+      const label = comboInfo.mode==='multi' ? `${comboInfo.count}文コンボ` : `COMBO×${comboInfo.count}`;
+      setMsg(`${label}！ ${comboInfo.text} +${gained}`,'good');
+    }else{
+      setMsg(`${scoring[0].text} 成立！ ${scoring[0].ja} +${gained}`,'good');
+    }
+    playChime(true);
+    showFx(scoring,gained,cellIndex,comboInfo);
+    showComboDetails(scoring,comboInfo);
+    speakResultsSequential(scoring);
+  }else{
+    gained = -UNUSED_PENALTY;
+    const cell=state.board[cellIndex];
+    if(cell) cell.unusedPenaltyApplied=true;
+    addLog(`${p.name}: ${word} を配置。でも英文に未使用 -${UNUSED_PENALTY}`,false);
+    setMsg(`成立なし。未使用カード減点 -${UNUSED_PENALTY}。つなげ方を狙え！`,'bad');
+    playChime(false);
+    const cp=$('comboPanel'); if(cp) cp.classList.remove('show');
+  }
+  p.score+=gained;
+  recalcTiles();
+  nextTurn();
+  selectedHandIndex=-1;
+  broadcast({type:'englishPlace',gameId:state.gameId,state:lightState(),cellIndex,by:clientId});
+  render();
+}
+function drawOne(){return WORDS[Math.floor(Math.random()*WORDS.length)].w}
+function nextTurn(){state.turn=(state.turn+1)%state.playerCount;state.turnNo++;}
+function recalcTiles(){state.players.forEach(p=>p.tiles=0);state.board.forEach(c=>{if(c&&state.players[c.owner])state.players[c.owner].tiles++;});}
+function lightState(){return JSON.parse(JSON.stringify(state));}
+function applyState(s,why='同期'){
+  if(!s||!Array.isArray(s.board)||!Array.isArray(s.players))return;
+  state=s;selectedHandIndex=-1;recentCells=[];recalcTiles();setMsg(why,'good');render();
+}
+function passTurn(){const p=currentPlayer();addLog(`${p.name}: パス`,false);nextTurn();broadcast({type:'englishState',gameId:state.gameId,state:lightState(),reason:'pass'});render();}
+function swapHand(){const p=currentPlayer();p.hand=drawHand(99);p.score=Math.max(0,p.score-5);addLog(`${p.name}: 手札入替 -5`,false);nextTurn();broadcast({type:'englishState',gameId:state.gameId,state:lightState(),reason:'swap'});render();}
+function newGame(broadcastIt=true){const pc=Number($('playerCount').value)||2;state=freshState(pc);const name=safeName();state.players[0].name=name;localStorage.englishName=name;selectedHandIndex=-1;recentCells=[];if(broadcastIt)broadcast({type:'englishNewGame',gameId:state.gameId,state:lightState()});render();setMsg(state.playerCount===1?'1人練習開始。手札は種類別に常備。英文を作ると英語→日本語で読み上げる':'新規ゲーム開始。手札は種類別に常備。','good');}
+function render(){
+  $('turnNo').textContent=state.turnNo;$('wordsMade').textContent=state.wordsMade;$('filledNo').textContent=state.board.filter(Boolean).length;$('roomNo').textContent='english';$('myId').textContent=clientId;
+  const tp=currentPlayer();$('turnPlayer').textContent=tp?tp.name:'-';$('turnPlayer').style.color=tp?tp.color:'#fff';
+  const b=$('board');b.innerHTML='';state.board.forEach((c,i)=>{const d=document.createElement('button');d.className='cell '+(!c?'empty ':'')+(recentCells.includes(i)?'recent hit ':'');d.type='button';const routeNo=routeFocusCells.indexOf(i);if(routeNo>=0)d.classList.add('routeHit');if(!c&&selectedHandIndex>=0)d.classList.add('selectable');if(c){const ownerColor=state.players[c.owner]?.color||'#fff';const cnt=useCountOf(c);const uc=useColor(cnt, ownerColor);if(uc.rainbow)d.classList.add('rainbow');if(cnt<=0)d.classList.add('unused');const usedLabel=cnt>0?`×${cnt}`:'未';d.innerHTML=`<span class="owner" style="background:${ownerColor}"></span>${routeNo>=0?`<span class="routeStep">${routeNo+1}</span>`:''}<span class="word">${esc(c.w)}</span><span class="useCount">${usedLabel}</span>${cnt<=0?'<span class="unusedMark">未使用</span>':''}<span class="pts">P${(c.owner||0)+1}</span>`;d.style.background=`linear-gradient(180deg, ${uc.bg}, ${hexAlpha(ownerColor,.13)}, rgba(255,255,255,.05))`;d.style.borderColor=uc.border;d.style.color=uc.text;} d.onclick=()=>placeTile(i);b.appendChild(d);});
+  const h=$('hand');h.innerHTML='';(tp?.hand||[]).forEach((w,i)=>{const info=slotInfo(i,w);const pos=handInfo(w);const t=document.createElement('button');t.type='button';t.className='tile cat-'+pos.key+' '+(i===selectedHandIndex?'on':'');t.innerHTML=`<span>${esc(w)}</span><small>${esc(info.label)}</small>`;t.onclick=()=>{selectedHandIndex=i;render();};h.appendChild(t);});
+  $('selectedInfo').textContent=selectedHandIndex>=0?`選択: ${(tp.hand||[])[selectedHandIndex]}`:'未選択';
+  const ps=$('players');ps.innerHTML='';state.players.forEach((p,i)=>{const row=document.createElement('div');row.className='player '+(i===state.turn?'current':'');row.innerHTML=`<span class="dot" style="background:${p.color}"></span><span class="pname">${esc(p.name)} <small>陣地${p.tiles||0}</small></span><span class="pscore">${p.score}</span>`;ps.appendChild(row);});
+  const log=$('log');log.innerHTML='';state.log.forEach(x=>{const div=document.createElement('div');div.className='logItem';div.innerHTML=`<span class="${x.good?'goodText':'badText'}">●</span> ${esc(x.text)}`;log.appendChild(div);});
+  $('targetList').innerHTML=`<span class="chip">LinkGrammar:${esc(linkGrammarStatus)}</span><span class="chip">Harper:${esc(harperStatus)}</span><span class="chip">PhraseBank:${PHRASE_BANK.length}</span><span class="chip">全ルート最大8語/2曲がり</span>`+targets.slice(0,10).map(t=>`<span class="chip">${esc(t)}</span>`).join('');
+}
+function esc(s){return String(s).replace(/[&<>"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m]));}
+function hexAlpha(hex,a){const h=hex.replace('#','');const r=parseInt(h.slice(0,2),16),g=parseInt(h.slice(2,4),16),b=parseInt(h.slice(4,6),16);return `rgba(${r},${g},${b},${a})`;}
+function setMp(text,cls){$('mp').textContent=text;$('mp').className=cls;}
+function broadcast(obj){
+  if(suppressBroadcast) return false;
+  if(!socket||socket.readyState!==WebSocket.OPEN) return false;
+  try{obj.clientId=clientId;obj.name=safeName();obj.time=Date.now();socket.send(JSON.stringify(obj));return true;}catch(e){return false;}
+}
+function connect(){
+  if(socket&&(socket.readyState===WebSocket.OPEN||socket.readyState===WebSocket.CONNECTING))return;
+  clearTimeout(retryTimer);clearInterval(heartbeat);setMp('CONNECTING','info');
+  socket=new WebSocket(WS_URL);
+  socket.addEventListener('open',()=>{setMp('ONLINE','good');setMsg('オンライン接続成功。同じURLの人と同期','good');broadcast({type:'join',x:0,y:0,z:0,yaw:0,pitch:0});broadcast({type:'englishHello',wantState:true,gameId:state.gameId});heartbeat=setInterval(()=>broadcast({type:'ping'}),10000);});
+  socket.addEventListener('message',ev=>{rx++;$('rx').textContent=rx;handleNet(ev.data);});
+  socket.addEventListener('close',()=>{clearInterval(heartbeat);setMp('RETRY','bad');retryTimer=setTimeout(connect,3000);});
+  socket.addEventListener('error',()=>setMp('ERROR','bad'));
+}
+function parse(raw){try{return JSON.parse(raw)}catch{return null}}
+function eachPayload(msg,cb,depth=0){if(!msg||depth>3)return;if(typeof msg==='string'){eachPayload(parse(msg),cb,depth+1);return;}if(Array.isArray(msg)){msg.forEach(x=>eachPayload(x,cb,depth+1));return;}cb(msg);['payload','data','message','state'].forEach(k=>{if(msg[k]&&msg[k]!==msg)eachPayload(msg[k],cb,depth+1);});}
+function handleNet(raw){eachPayload(raw,(msg)=>{
+  if(!msg||msg.clientId===clientId)return;
+  if(msg.type==='englishHello'&&msg.wantState){broadcast({type:'englishState',gameId:state.gameId,state:lightState(),reason:'hello-sync'});return;}
+  if(msg.type==='englishNewGame'&&msg.state){applyState(msg.state,'相手が新規ゲーム開始');return;}
+  if((msg.type==='englishState'||msg.type==='englishPlace')&&msg.state){
+    const incomingTurn=Number(msg.state.turnNo)||0;
+    if(msg.state.gameId!==state.gameId || incomingTurn>=state.turnNo){applyState(msg.state,'オンライン同期');}
+  }
+});}
+$('startBtn').onclick=()=>{unlockSpeech();$('start').style.display='none';initHarper();render();};
+$('connectBtn').onclick=()=>{unlockSpeech();initHarper();connect();};
+$('newGameBtn').onclick=()=>newGame(true);
+$('resetBtn').onclick=()=>{if(confirm('盤面をリセットしてオンラインにも送信する？'))newGame(true);};
+$('passBtn').onclick=passTurn;
+$('drawBtn').onclick=swapHand;
+$('nameInput').value=localStorage.englishName||('P-'+clientId);
+$('nameInput').addEventListener('change',()=>{localStorage.englishName=safeName();state.players[0].name=safeName();broadcast({type:'englishState',gameId:state.gameId,state:lightState(),reason:'rename'});render();});
+$('playerCount').addEventListener('change',()=>newGame(false));
+newGame(false);render();
+})();
+</script>
+</body>
+</html>
