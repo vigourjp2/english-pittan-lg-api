@@ -7,6 +7,13 @@ const MAX_CHARS = Number(process.env.MAX_CHARS || 240);
 const TIMEOUT_MS = Number(process.env.LINK_GRAMMAR_TIMEOUT_MS || 3500);
 const MYMEMORY_EMAIL = process.env.MYMEMORY_EMAIL || '';
 const LANGUAGETOOL_URL = process.env.LANGUAGETOOL_URL || 'https://api.languagetool.org/v2/check';
+// Real grammatical acceptability service. Default is a CoLA text-classification model,
+// not handwritten grammar rules. LABEL_1/ACCEPTABLE means acceptable.
+const HF_TOKEN = process.env.HF_TOKEN || '';
+const ACCEPTABILITY_MODEL = process.env.ACCEPTABILITY_MODEL || 'textattack/roberta-base-CoLA';
+const ACCEPTABILITY_URL = process.env.ACCEPTABILITY_URL || `https://api-inference.huggingface.co/models/${ACCEPTABILITY_MODEL}`;
+const ACCEPTABILITY_THRESHOLD = Number(process.env.ACCEPTABILITY_THRESHOLD || 0.72);
+const acceptabilityCache = new Map();
 const translateCache = new Map();
 const proofCache = new Map();
 
@@ -174,6 +181,55 @@ async function translateToJapanese(text) {
   return { ok:false, error:String(lastErr?.message || lastErr || 'translation failed') };
 }
 
+async function classifyAcceptability(text) {
+  text = normalizeText(text);
+  const key = text.toLowerCase();
+  if (acceptabilityCache.has(key)) return acceptabilityCache.get(key);
+
+  const headers = { 'content-type':'application/json', 'accept':'application/json' };
+  if (HF_TOKEN) headers.authorization = `Bearer ${HF_TOKEN}`;
+
+  const payload = { inputs:text, options:{ wait_for_model:true } };
+  let r, j;
+  try {
+    r = await fetch(ACCEPTABILITY_URL, { method:'POST', headers, body:JSON.stringify(payload) });
+    j = await r.json().catch(() => null);
+  } catch (e) {
+    return { ok:false, source:'hf-cola', error:String(e.message || e), model:ACCEPTABILITY_MODEL };
+  }
+  if (!r.ok) {
+    return { ok:false, source:'hf-cola', error:`HTTP ${r.status}`, raw:j, model:ACCEPTABILITY_MODEL };
+  }
+
+  // HF text-classification may return [{label,score}] or [[{label,score}]].
+  const arr = Array.isArray(j?.[0]) ? j[0] : (Array.isArray(j) ? j : []);
+  let acceptable = null;
+  let unacceptable = null;
+  for (const item of arr) {
+    const label = String(item?.label || '').toUpperCase();
+    const score = Number(item?.score || 0);
+    if (label.includes('LABEL_1') || (label.includes('ACCEPT') && !label.includes('UNACCEPT'))) acceptable = { label:item.label, score };
+    if (label.includes('LABEL_0') || label.includes('UNACCEPT')) unacceptable = { label:item.label, score };
+  }
+  const best = [...arr].sort((a,b) => Number(b?.score||0)-Number(a?.score||0))[0] || null;
+  const score = acceptable?.score ?? ((String(best?.label||'').toUpperCase().includes('LABEL_1')) ? Number(best?.score||0) : 0);
+  const isAcceptable = !!acceptable && score >= ACCEPTABILITY_THRESHOLD;
+  const result = {
+    ok:true,
+    source:'hf-cola',
+    model:ACCEPTABILITY_MODEL,
+    threshold:ACCEPTABILITY_THRESHOLD,
+    acceptable:isAcceptable,
+    acceptableScore:score,
+    unacceptableScore:unacceptable?.score ?? null,
+    label:acceptable?.label || best?.label || '',
+    raw:j
+  };
+  acceptabilityCache.set(key, result);
+  if (acceptabilityCache.size > 500) acceptabilityCache.delete(acceptabilityCache.keys().next().value);
+  return result;
+}
+
 async function checkStrict(text, { translate=false } = {}) {
   const originalText = normalizeText(text);
   let proof = null;
@@ -185,7 +241,12 @@ async function checkStrict(text, { translate=false } = {}) {
     proof = { ok:false, error:String(e.message || e) };
   }
   const parsed = await runLinkParser(normalizedText);
-  const ok = !!parsed.ok;
+  const acceptability = await classifyAcceptability(normalizedText);
+  const ok = !!parsed.ok && !!acceptability.ok && !!acceptability.acceptable;
+  let reason = '';
+  if (!parsed.ok) reason = 'strict Link Grammar parse failed';
+  else if (!acceptability.ok) reason = 'acceptability service failed';
+  else if (!acceptability.acceptable) reason = 'CoLA acceptability rejected';
   let tr = null;
   if (ok && translate) tr = await translateToJapanese(normalizedText);
   return {
@@ -195,10 +256,11 @@ async function checkStrict(text, { translate=false } = {}) {
     appliedCorrections: proof?.appliedCorrections || [],
     ok,
     gameOk: ok,
-    kind: 'Strict Link Grammar',
-    sentenceType: ok ? 'STRICT_LINK_GRAMMAR' : null,
-    reason: ok ? '' : 'strict Link Grammar parse failed',
+    kind: 'Link Grammar + CoLA Acceptability',
+    sentenceType: ok ? 'LG_COLA_ACCEPTED' : null,
+    reason,
     proof,
+    acceptability,
     ...parsed,
     ja: tr?.ja || '',
     translation: tr
@@ -208,7 +270,7 @@ async function checkStrict(text, { translate=false } = {}) {
 const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') return send(res, 200, { ok: true });
   const url = new URL(req.url, 'http://localhost');
-  if (url.pathname === '/health') return send(res, 200, { ok: true, service: 'link-grammar-api', mode:'strict-link-grammar-wrapper' });
+  if (url.pathname === '/health') return send(res, 200, { ok: true, service: 'link-grammar-api', mode:'link-grammar-plus-cola-acceptability', acceptabilityModel:ACCEPTABILITY_MODEL, acceptabilityThreshold:ACCEPTABILITY_THRESHOLD });
   try {
     if (url.pathname === '/proof') {
       const text = await getTextFromReq(req, url);
