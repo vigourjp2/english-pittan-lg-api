@@ -1,29 +1,24 @@
 # English Pittan Link Grammar API
 
-無料OSSの Link Grammar Parser を `link-parser` コマンド経由で呼ぶ最小API。
+RenderなどのDocker Web Serviceで動かす英文判定API。
 
-## ローカル確認
+## エンドポイント
 
-```bash
-docker build -t english-pittan-lg .
-docker run --rm -p 8787:8787 english-pittan-lg
-curl -X POST http://localhost:8787/check -H 'content-type: application/json' -d '{"text":"You go to school."}'
-```
+- `/health` 起動確認
+- `/check?text=You%20go%20to%20school.` Link Grammar + ゲーム用妥当性チェック
+- `/translate?text=I%20am%20big.` MyMemoryで日本語訳
+- `/check-and-translate?text=I%20am%20big.` 判定OKなら訳も返す
 
-## ゲーム側設定
+## 重要な修正
 
-`index-english.html` を開くURLに `lgapi` を付ける。
+- Harperを成立判定に使わない
+- `I like big` のような「他動詞 + 形容詞単体目的語」を汎用NG
+- 日本語訳は単語置換ではなく翻訳APIへ委譲
 
-```text
-https://game-aor.pages.dev/index-english.html?lgapi=https://YOUR-SERVICE.example.com
-```
+## Render設定
 
-またはブラウザのコンソールで:
-
-```js
-setLinkGrammarApi('https://YOUR-SERVICE.example.com')
-```
-
-## 注意
-
-Cloudflare Workers では C の `link-parser` を直接実行できないため、APIはコンテナ実行できる無料ホストかローカルPCに置く。
+- Runtime: Docker
+- Branch: main
+- Root Directory: 空欄
+- Dockerfile Path: Dockerfile
+- Instance Type: Free
