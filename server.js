@@ -151,20 +151,59 @@ function runLinkParser(text) {
     p.stdin.end();
   });
 }
+function stripHtml(s){
+  return String(s || '').replace(/<[^>]*>/g,'').replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/&amp;/g,'&').trim();
+}
+function normalizeJaTranslation(ja, src){
+  ja = stripHtml(ja).replace(/\s+/g, ' ').trim();
+  if (!ja) return '';
+  // 翻訳APIが原文をそのまま返す事故は失敗扱いにする。
+  const a = ja.toLowerCase().replace(/[.!?。！？\s]/g,'');
+  const b = String(src||'').toLowerCase().replace(/[.!?。！？\s]/g,'');
+  if (a && b && a === b) return '';
+  return ja;
+}
+async function translateByMyMemory(text){
+  const attempts = [text, /[.!?]$/.test(text) ? text : text + '.'];
+  let last = null;
+  for (const q of attempts) {
+    const params = new URLSearchParams({ q, langpair:'en|ja' });
+    if (MYMEMORY_EMAIL) params.set('de', MYMEMORY_EMAIL);
+    const r = await fetch('https://api.mymemory.translated.net/get?' + params.toString(), { headers:{accept:'application/json'} });
+    if(!r.ok) { last = 'mymemory HTTP '+r.status; continue; }
+    const j = await r.json();
+    const ja = normalizeJaTranslation(j?.responseData?.translatedText || '', text);
+    if(ja) return { ok:true, ja, source:'mymemory', rawStatus:j?.responseStatus };
+    last = 'mymemory empty translation';
+  }
+  throw new Error(last || 'mymemory failed');
+}
+async function translateByGoogleGtx(text){
+  // 無料・キーなしの最終フォールバック。Render側だけから呼び、結果はキャッシュする。
+  const params = new URLSearchParams({ client:'gtx', sl:'en', tl:'ja', dt:'t', q:text });
+  const r = await fetch('https://translate.googleapis.com/translate_a/single?' + params.toString(), { headers:{accept:'application/json'} });
+  if(!r.ok) throw new Error('google-gtx HTTP '+r.status);
+  const j = await r.json();
+  const ja = normalizeJaTranslation((j?.[0]||[]).map(x=>x?.[0]||'').join(''), text);
+  if(!ja) throw new Error('google-gtx empty translation');
+  return { ok:true, ja, source:'google-gtx' };
+}
 async function translateToJapanese(text) {
   text = normalizeText(text).replace(/[.!?]+$/,'');
   if (!text) return { ok:false, error:'empty text' };
   const key = text.toLowerCase();
   if (translateCache.has(key)) return { ok:true, ja:translateCache.get(key), source:'cache' };
-  const params = new URLSearchParams({ q:text, langpair:'en|ja' });
-  if (MYMEMORY_EMAIL) params.set('de', MYMEMORY_EMAIL);
-  const r = await fetch('https://api.mymemory.translated.net/get?' + params.toString(), { headers:{accept:'application/json'} });
-  if(!r.ok) throw new Error('translation HTTP '+r.status);
-  const j = await r.json();
-  const ja = j?.responseData?.translatedText || '';
-  if(!ja) throw new Error('empty translation');
-  cacheSet(translateCache,key,ja);
-  return { ok:true, ja, source:'mymemory', rawStatus:j?.responseStatus };
+  const errors = [];
+  for (const fn of [translateByMyMemory, translateByGoogleGtx]) {
+    try {
+      const out = await fn(text);
+      if (out?.ja) {
+        cacheSet(translateCache,key,out.ja);
+        return out;
+      }
+    } catch(e) { errors.push(String(e.message||e)); }
+  }
+  return { ok:false, error:'all translation providers failed', errors };
 }
 async function checkPipeline(rawText, withTranslation=false){
   const original = normalizeText(rawText);
