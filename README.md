@@ -1,25 +1,29 @@
 # English Pittan Link Grammar API
 
-Render Web Service用の英語判定APIです。
+Render Web Service用の Link Grammar 実行ラッパーです。
+
+## 方針
+
+- 英文成立判定は独自文法ロジックで作らない
+- `/check` と `/check-and-translate` は Link Grammar Parser の strict parse をそのまま採用
+- `link-parser` は `-null=0` と `-islands-ok=0` で実行
+- API側は `linkages > 0` かつ `No complete linkages found` なしのときだけ `ok:true`
+- LanguageTool は補正候補の適用だけに使う
+- 翻訳は `ok:true` の文だけ実行
 
 ## Endpoints
 
 - `GET /health`
-- `GET /proof?text=...`
-- `GET /translate?text=...`
-- `GET /check?text=...`
-- `GET /check-and-translate?text=...`
-
-## Pipeline
-
-1. LanguageTool で文法補正・校正
-2. Link Grammar Parser で構文解析
-3. Sentence mode で「独立した英文」か確認
-   - `apples they see` のような名詞句/関係節断片をNG
-   - `I am happy today can see` のような無接続run-onをNG
-   - `I am new books` のような be補語崩れをNG
-4. OK文だけ翻訳APIへ送信
+- `GET|POST /proof?text=...`
+- `GET|POST /translate?text=...`
+- `GET|POST /check?text=...`
+- `GET|POST /check-and-translate?text=...`
 
 ## Deploy
 
-Render の Docker Web Service としてこの4ファイルをルートに置いてください。
+Render の Docker Web Service として、この4ファイルをリポジトリのルートに置いてください。
+
+- `server.js`
+- `package.json`
+- `Dockerfile`
+- `README.md`
