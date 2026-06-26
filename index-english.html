@@ -27,7 +27,7 @@
 
   .fxBanner{position:fixed;left:50%;top:18%;transform:translateX(-50%) scale(.9);z-index:70;pointer-events:none;opacity:0;min-width:min(520px,92vw);text-align:center;padding:18px 16px;border-radius:24px;background:linear-gradient(135deg,rgba(22,163,74,.92),rgba(37,99,235,.9));border:2px solid rgba(255,255,255,.38);box-shadow:0 24px 80px rgba(0,0,0,.5),0 0 40px rgba(134,239,172,.35)}
   .fxBanner.show{animation:bannerBoom 2.4s ease both}.fxBanner.combo{background:linear-gradient(135deg,rgba(245,158,11,.94),rgba(219,39,119,.92),rgba(37,99,235,.9));box-shadow:0 24px 80px rgba(0,0,0,.5),0 0 50px rgba(250,204,21,.52)}.fxBig{font-size:30px;font-weight:1000;letter-spacing:.02em;text-shadow:0 3px 12px rgba(0,0,0,.35)}.fxEn{font-size:21px;font-weight:1000;margin-top:4px}.fxJa{font-size:16px;color:#fef3c7;margin-top:2px}.fxPts{font-size:18px;color:#bbf7d0;font-weight:1000;margin-top:4px}
-  .comboPanel{position:fixed;left:50%;top:33%;transform:translateX(-50%);z-index:69;width:min(620px,94vw);max-height:48vh;overflow:auto;background:rgba(15,23,42,.96);border:2px solid rgba(250,204,21,.55);border-radius:20px;padding:12px;box-shadow:0 24px 80px rgba(0,0,0,.55),0 0 35px rgba(250,204,21,.25);display:none;pointer-events:auto}.comboPanel.show{display:block;animation:comboHold .25s ease both}.comboPanel h3{margin:0 0 8px;font-size:17px;color:#fde68a}.comboItem{border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.07);border-radius:13px;padding:8px;margin-top:7px}.comboItem.active{outline:2px solid rgba(56,189,248,.75);background:rgba(56,189,248,.13)}.comboItem b{color:#fff;font-size:15px}.comboJa{color:#fef3c7;font-size:12px;margin-top:2px}.comboRoute{font-size:11px;color:#bfdbfe;margin-top:4px;line-height:1.35}.comboCards{display:flex;gap:4px;flex-wrap:wrap;margin-top:6px}.routeChip{font-size:10px;font-weight:900;border-radius:999px;background:rgba(56,189,248,.18);border:1px solid rgba(125,211,252,.35);padding:3px 6px;color:#dbeafe}.cell.routeHit{outline:3px solid rgba(250,204,21,.95);box-shadow:0 0 18px rgba(250,204,21,.75), inset 0 0 14px rgba(250,204,21,.2);transform:scale(1.04)}.routeStep{position:absolute;right:4px;top:4px;min-width:16px;height:16px;border-radius:999px;background:#facc15;color:#111827;font-size:10px;font-weight:1000;display:flex;align-items:center;justify-content:center;box-shadow:0 2px 8px rgba(0,0,0,.35)}@keyframes comboHold{from{opacity:0;transform:translateX(-50%) translateY(8px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}
+  .comboPanel{position:fixed;left:50%;top:33%;transform:translateX(-50%);z-index:69;width:min(620px,94vw);max-height:48vh;overflow:auto;background:rgba(15,23,42,.96);border:2px solid rgba(250,204,21,.55);border-radius:20px;padding:12px;box-shadow:0 24px 80px rgba(0,0,0,.55),0 0 35px rgba(250,204,21,.25);display:none;pointer-events:auto}.comboPanel.show{display:block;animation:comboHold .25s ease both}.comboPanel h3{margin:0 34px 8px 0;font-size:17px;color:#fde68a}.comboClose{position:sticky;top:0;float:right;z-index:2;width:30px;height:30px;border-radius:999px;border:1px solid rgba(255,255,255,.22);background:rgba(15,23,42,.92);color:#fff;font-size:20px;font-weight:1000;line-height:1;box-shadow:0 6px 18px rgba(0,0,0,.35)}.comboItem{border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.07);border-radius:13px;padding:8px;margin-top:7px}.comboItem.active{outline:2px solid rgba(56,189,248,.75);background:rgba(56,189,248,.13)}.comboItem b{color:#fff;font-size:15px}.comboJa{color:#fef3c7;font-size:12px;margin-top:2px}.comboRoute{font-size:11px;color:#bfdbfe;margin-top:4px;line-height:1.35}.comboCards{display:flex;gap:4px;flex-wrap:wrap;margin-top:6px}.routeChip{font-size:10px;font-weight:900;border-radius:999px;background:rgba(56,189,248,.18);border:1px solid rgba(125,211,252,.35);padding:3px 6px;color:#dbeafe}.cell.routeHit{outline:3px solid rgba(250,204,21,.95);box-shadow:0 0 18px rgba(250,204,21,.75), inset 0 0 14px rgba(250,204,21,.2);transform:scale(1.04)}.routeStep{position:absolute;right:4px;top:4px;min-width:16px;height:16px;border-radius:999px;background:#facc15;color:#111827;font-size:10px;font-weight:1000;display:flex;align-items:center;justify-content:center;box-shadow:0 2px 8px rgba(0,0,0,.35)}@keyframes comboHold{from{opacity:0;transform:translateX(-50%) translateY(8px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}
   @keyframes bannerBoom{0%{opacity:0;transform:translateX(-50%) scale(.72) rotate(-2deg);filter:brightness(2)}12%{opacity:1;transform:translateX(-50%) scale(1.08) rotate(1deg)}25%{transform:translateX(-50%) scale(1) rotate(0)}78%{opacity:1}100%{opacity:0;transform:translateX(-50%) scale(.96) translateY(-18px)}}
   .scorePop{position:fixed;z-index:80;pointer-events:none;font-weight:1000;font-size:26px;color:#fde68a;text-shadow:0 3px 12px rgba(0,0,0,.7);animation:scoreFly 1.2s ease-out both}.scorePop small{display:block;font-size:13px;color:#bbf7d0}.spark{position:fixed;z-index:79;width:8px;height:8px;border-radius:50%;pointer-events:none;background:#fde68a;box-shadow:0 0 14px #fde68a;animation:sparkFly .8s ease-out both}
   @keyframes scoreFly{0%{opacity:0;transform:translate(-50%,0) scale(.7)}15%{opacity:1;transform:translate(-50%,-10px) scale(1.15)}100%{opacity:0;transform:translate(-50%,-78px) scale(.9)}}
@@ -58,7 +58,7 @@
   </div>
 </div>
 <div id="fxBanner" class="fxBanner"><div class="fxBig">GOOD!</div><div class="fxEn" id="fxEn"></div><div class="fxJa" id="fxJa"></div><div class="fxPts" id="fxPts"></div></div>
-<div id="comboPanel" class="comboPanel"><h3 id="comboTitle">成立詳細</h3><div id="comboList"></div></div>
+<div id="comboPanel" class="comboPanel"><button id="comboClose" class="comboClose" type="button">×</button><h3 id="comboTitle">成立詳細</h3><div id="comboList"></div></div>
 <div id="app">
   <div class="top">
     <section class="panel hero">
@@ -98,7 +98,7 @@
     </section>
     <aside class="side">
       <section class="panel scorePanel"><h2>スコア / 陣地</h2><div class="players" id="players"></div></section>
-      <section class="panel dictPanel"><h2>成立ルール</h2><div class="rules">全ルート照合 + Link Grammar Parser API + フレーズバンク + 品詞テンプレ。<br><b>文</b>: You go to school / Music is fun<br><b>句</b>: listen to music / be good at<br><b>型</b>: 主語+動詞+目的語、be+形容詞+前置詞</div><div class="targetList" id="targetList"></div></section>
+      <section class="panel dictPanel"><h2>成立ルール</h2><div class="rules">全ルート照合。<b>文の成立判定はAPI裁定</b>（Link Grammar + LanguageTool + 翻訳API）。<br><b>文</b>: You go to school / I like you / She likes apples<br><b>句</b>: listen to music / be good at<br><b>方針</b>: ローカル品詞テンプレは手札・短句補助のみ</div><div class="targetList" id="targetList"></div></section>
       <section class="panel logPanel"><h2>ログ</h2><div class="log" id="log"></div></section>
     </aside>
   </main>
@@ -117,7 +117,7 @@ let recentCells=[];
 let suppressBroadcast=false;
 const WORDS = [
   // 主語・代名詞
-  {w:'I',pos:['subj','pron'],lv:1},{w:'you',pos:['subj','pron'],lv:1},{w:'he',pos:['subj','pron'],lv:1},{w:'she',pos:['subj','pron'],lv:1},{w:'we',pos:['subj','pron'],lv:1},{w:'they',pos:['subj','pron'],lv:1},{w:'it',pos:['subj','pron'],lv:1},{w:'me',pos:['noun','pronObj'],lv:1},
+  {w:'I',pos:['subj','pron'],lv:1},{w:'you',pos:['subj','pron','pronObj'],lv:1},{w:'he',pos:['subj','pron'],lv:1},{w:'she',pos:['subj','pron'],lv:1},{w:'we',pos:['subj','pron'],lv:1},{w:'they',pos:['subj','pron'],lv:1},{w:'it',pos:['subj','pron','pronObj'],lv:1},{w:'me',pos:['noun','pronObj'],lv:1},
   // be / 助動詞 / 否定
   {w:'am',pos:['be'],lv:1},{w:'are',pos:['be'],lv:1},{w:'is',pos:['be'],lv:1},{w:'was',pos:['bePast'],lv:2},{w:'were',pos:['bePast'],lv:2},{w:'not',pos:['not'],lv:1},
   {w:'can',pos:['modal'],lv:2},{w:'must',pos:['modal'],lv:2},{w:'will',pos:['modal'],lv:2},{w:'should',pos:['modal'],lv:3},
@@ -157,7 +157,7 @@ const PHRASE_MAP = new Map(PHRASE_BANK.map(([text,ja,kind,pts,level])=>[text.toL
 
 // Link Grammar Parser API連携。Cloudflare PagesだけではCライブラリを実行できないため、
 // 無料コンテナ等に置いたAPI URLを ?lgapi=https://... または localStorage で指定する。
-const LINK_GRAMMAR_CACHE_KEY='englishPittan.linkGrammarCache.v1';
+const LINK_GRAMMAR_CACHE_KEY='englishPittan.linkGrammarCache.v3';
 const LINK_GRAMMAR_API_KEY='englishPittan.linkGrammarApi';
 let linkGrammarApi=(new URL(location.href).searchParams.get('lgapi') || localStorage.getItem(LINK_GRAMMAR_API_KEY) || '').trim();
 let linkGrammarStatus=linkGrammarApi ? 'READY' : 'OFF';
@@ -168,18 +168,34 @@ async function linkGrammarEvaluate(words){
   const key=norm(w);
   if(!linkGrammarApi) return null;
   if(!isLikelyCompleteSentenceWords(w) || hasOrphanTail(w)) return null;
-  if(linkGrammarCache[key]!==undefined){
-    return linkGrammarCache[key] ? {kind:'LinkGrammar構文解析',pts:48+Math.min(24,w.length*5),text:capSentence(w).replace(/[.]$/,''),source:'linkGrammar',parser:'cache'} : null;
+  const cached=linkGrammarCache[key];
+  if(cached!==undefined){
+    if(cached && typeof cached==='object' && cached.ok){
+      return {kind:cached.kind||'LinkGrammar構文解析',pts:cached.pts||48+Math.min(24,w.length*5),text:cached.text||displayEnglish(w),source:'linkGrammar',parser:'cache',ja:cached.ja||''};
+    }
+    if(cached===true) return {kind:'LinkGrammar構文解析',pts:48+Math.min(24,w.length*5),text:displayEnglish(w),source:'linkGrammar',parser:'cache'};
+    return null;
   }
   try{
     linkGrammarStatus='CHECK'; renderSafe();
-    const res=await fetch(linkGrammarApi.replace(/\/$/,'')+'/check',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({text:capSentence(w),words:w})});
+    const base=linkGrammarApi.replace(/\/$/,'');
+    const text=displayEnglish(w);
+    // /check-and-translate がある新APIを優先。古いAPIなら /check にフォールバック。
+    let res=await fetch(base+'/check-and-translate',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({text,words:w})});
+    if(res.status===404) res=await fetch(base+'/check',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({text,words:w})});
     if(!res.ok) throw new Error('HTTP '+res.status);
     const data=await res.json();
     const pass=!!(data && data.ok && data.fullParse !== false && Number(data.nullCount||0)===0);
-    linkGrammarCache[key]=pass; try{localStorage.setItem(LINK_GRAMMAR_CACHE_KEY,JSON.stringify(linkGrammarCache));}catch(e){}
+    const ja=(data && (data.ja || data.translation?.ja || data.translation?.translatedText)) || '';
+    if(pass){
+      const ev={ok:true,kind:data.kind||'LinkGrammar構文解析',pts:48+Math.min(24,w.length*5),text:(data.text||text).replace(/[.]$/,''),ja};
+      linkGrammarCache[key]=ev;
+    }else{
+      linkGrammarCache[key]=false;
+    }
+    try{localStorage.setItem(LINK_GRAMMAR_CACHE_KEY,JSON.stringify(linkGrammarCache));}catch(e){}
     linkGrammarStatus='ON'; renderSafe();
-    return pass ? {kind:'LinkGrammar構文解析',pts:48+Math.min(24,w.length*5),text:capSentence(w).replace(/[.]$/,''),source:'linkGrammar',parser:data} : null;
+    return pass ? {kind:(data.kind||'LinkGrammar構文解析'),pts:48+Math.min(24,w.length*5),text:(data.text||text).replace(/[.]$/,''),source:'linkGrammar',parser:data,ja} : null;
   }catch(e){console.warn('Link Grammar API failed',e); linkGrammarStatus='ERR'; renderSafe(); return null;}
 }
 function setLinkGrammarApi(url){
@@ -353,6 +369,35 @@ function useColor(count, ownerColor){
   return {bg,border,text:'#fff',rainbow:count>=7};
 }
 function lowerWords(words){return (words||[]).map(x=>String(x||'').trim()).filter(Boolean).map(x=>x.toLowerCase());}
+function isThirdPersonSingularSubject(w){
+  w=String(w||'').toLowerCase();
+  if(['he','she','it'].includes(w)) return true;
+  if(['i','you','we','they','me'].includes(w)) return false;
+  const ps=wordPos(w);
+  if(!ps.includes('noun')) return false;
+  if(['people'].includes(w)) return false;
+  if(w.endsWith('s') && !['tennis'].includes(w)) return false;
+  return true;
+}
+function present3sg(v){
+  v=String(v||'').toLowerCase();
+  const irregular={have:'has',do:'does'};
+  if(irregular[v]) return irregular[v];
+  if(/[^aeiou]y$/.test(v)) return v.slice(0,-1)+'ies';
+  if(/(s|x|z|ch|sh|o)$/.test(v)) return v+'es';
+  return v+'s';
+}
+function applySubjectVerbAgreement(words){
+  const w=lowerWords(words);
+  if(w.length>=2 && isThirdPersonSingularSubject(w[0]) && wordPos(w[1]).includes('verb')){
+    // 助動詞の後や be動詞は対象外。盤面カードは原形のまま、成立文だけ3単現sへ自動整形する。
+    const out=w.slice();
+    out[1]=present3sg(out[1]);
+    return out;
+  }
+  return w;
+}
+function displayEnglish(words){ return capSentence(applySubjectVerbAgreement(words)).replace(/[.]$/,''); }
 function isSubjWord(w){return ['i','you','he','she','we','they'].includes(w);}
 function beForSubject(w){
   w=String(w||'').toLowerCase();
@@ -365,11 +410,16 @@ function beForSubject(w){
 function beMatches(subj,be){return beForSubject(subj)===String(be||'').toLowerCase();}
 function canUseBaseVerb(subj){return !['he','she','it'].includes(String(subj||'').toLowerCase());}
 function isNounLike(w){return wordPos(w).includes('noun');}
+function isObjectLike(w){
+  const ps=wordPos(w);
+  // 目的語として使える語。you/it/me は目的格にもなれる。he/she/we/they/I はここでは通さない。
+  return ps.includes('noun') || ps.includes('pronObj') || ps.includes('ving');
+}
 function isAdjLike(w){return wordPos(w).includes('adj');}
 function isTimeWord(w){return wordPos(w).includes('advTime');}
 function isVerbObjectOK(v,o){
   v=String(v||'').toLowerCase(); o=String(o||'').toLowerCase();
-  const anyNoun=isNounLike(o);
+  const anyNoun=isObjectLike(o);
   if(v==='like'||v==='enjoy') return anyNoun;
   if(v==='play') return ['soccer','tennis','baseball','games','music'].includes(o);
   if(v==='study'||v==='learn') return ['english','japanese','music','books','game','games'].includes(o);
@@ -391,7 +441,7 @@ function evalCorePattern(w){
   const n=w.length;
   const hp=(i,pos)=>wordPos(w[i]).includes(pos);
   const text=w.join(' ');
-  const cap=text.split(' ').map((x,i)=> x==='i'?'I': (x==='english'?'English':x)).join(' ');
+  const cap=displayEnglish(w);
   // short phrases
   if(n===2 && hp(0,'adv') && hp(1,'adj')) return {kind:'副詞+形容詞',pts:12,text:cap};
   if(n===2 && hp(0,'not') && hp(1,'adj')) return {kind:'否定フレーズ',pts:12,text:cap};
@@ -418,16 +468,16 @@ function evalCorePattern(w){
   }
 
   // general verb sentences: base verb is safe for I/you/we/they in this deck
-  if(n===3 && hp(0,'subj') && hp(1,'verb') && canUseBaseVerb(w[0]) && isVerbObjectOK(w[1],w[2])) {
+  if(n===3 && hp(0,'subj') && hp(1,'verb') && isVerbObjectOK(w[1],w[2])) {
     return {kind:'一般動詞の文',pts:34,text:cap};
   }
-  if(n===4 && hp(0,'subj') && w[1]==='go' && hp(2,'to') && hp(3,'noun') && canUseBaseVerb(w[0])) {
+  if(n===4 && hp(0,'subj') && w[1]==='go' && hp(2,'to') && hp(3,'noun')) {
     return {kind:'go to の文',pts:42,text:cap};
   }
-  if(n===4 && hp(0,'subj') && hp(1,'verbWant') && hp(2,'to') && hp(3,'verb') && canUseBaseVerb(w[0])) {
+  if(n===4 && hp(0,'subj') && hp(1,'verbWant') && hp(2,'to') && hp(3,'verb')) {
     return {kind:'want to 文',pts:52,text:cap};
   }
-  if(n===5 && hp(0,'subj') && hp(1,'verbWant') && hp(2,'to') && hp(3,'verb') && isVerbObjectOK(w[3],w[4]) && canUseBaseVerb(w[0])) {
+  if(n===5 && hp(0,'subj') && hp(1,'verbWant') && hp(2,'to') && hp(3,'verb') && isVerbObjectOK(w[3],w[4])) {
     return {kind:'want to+目的語の文',pts:62,text:cap};
   }
   if(n===3 && hp(0,'subj') && hp(1,'modal') && hp(2,'verb')) {
@@ -439,7 +489,7 @@ function evalCorePattern(w){
   if(n===3 && hp(0,'verb') && hp(1,'prep') && hp(2,'noun')) {
     return {kind:'動詞+前置詞フレーズ',pts:24,text:cap};
   }
-  if(n===4 && hp(0,'subj') && hp(1,'verb') && hp(2,'prep') && hp(3,'noun') && canUseBaseVerb(w[0])) {
+  if(n===4 && hp(0,'subj') && hp(1,'verb') && hp(2,'prep') && hp(3,'noun')) {
     return {kind:'一般動詞+前置詞の文',pts:46,text:cap};
   }
   if(n===4 && (hp(0,'subj')||hp(0,'noun')) && hp(1,'be') && beMatches(w[0],w[1]) && hp(2,'adj') && hp(3,'prep')) {
@@ -448,7 +498,7 @@ function evalCorePattern(w){
   if(n===5 && (hp(0,'subj')||hp(0,'noun')) && hp(1,'be') && beMatches(w[0],w[1]) && hp(2,'adj') && hp(3,'prep') && hp(4,'noun')) {
     return {kind:'be+形容詞+前置詞句の文',pts:58,text:cap};
   }
-  if(n===4 && hp(0,'subj') && hp(1,'verb') && hp(2,'article') && hp(3,'noun') && canUseBaseVerb(w[0])) {
+  if(n===4 && hp(0,'subj') && hp(1,'verb') && hp(2,'article') && hp(3,'noun')) {
     return {kind:'一般動詞+冠詞+名詞の文',pts:42,text:cap};
   }
   if(n===4 && hp(0,'verb') && hp(1,'prep') && hp(2,'article') && hp(3,'noun')) {
@@ -482,14 +532,47 @@ function evaluateSequence(words){
   return grammarEvaluate(words);
 }
 async function evaluateSequenceAsync(words){
-  const ev=grammarEvaluate(words);
-  if(ev) return ev;
+  // 完全文の正解判定はAPI優先。ローカル grammarEvaluate はフォールバックにしない。
+  // ローカル品詞表は手札カテゴリ・短句ヒント用であって、英文成立の裁定者ではない。
   const lg=await linkGrammarEvaluate(words);
   if(lg) return lg;
-  // Harperは成立判定の主役にしない。Link Grammar API未設定時の最後の補助だけ。
-  return await harperEvaluate(words);
+  return null;
 }
 
+const TRANSLATION_CACHE_KEY='englishPittan.translationCache.v2';
+let translationCache={};
+try{translationCache=JSON.parse(localStorage.getItem(TRANSLATION_CACHE_KEY)||'{}')||{};}catch(e){translationCache={};}
+async function translateWithApi(text){
+  if(!linkGrammarApi) return '';
+  const key=String(text||'').trim().toLowerCase();
+  if(!key) return '';
+  if(translationCache[key]) return translationCache[key];
+  try{
+    const base=linkGrammarApi.replace(/\/$/,'');
+    const res=await fetch(base+'/translate?text='+encodeURIComponent(text));
+    if(!res.ok) throw new Error('HTTP '+res.status);
+    const data=await res.json();
+    const ja=(data && (data.ja || data.translatedText || data.translation?.ja || data.translation?.translatedText)) || '';
+    if(ja){
+      translationCache[key]=ja;
+      try{localStorage.setItem(TRANSLATION_CACHE_KEY,JSON.stringify(translationCache));}catch(e){}
+      return ja;
+    }
+  }catch(e){console.warn('translate API failed',e);}
+  return '';
+}
+async function resolveJapanese(words,ev){
+  if(ev && ev.ja) return ev.ja;
+  const key=norm(words);
+  if(EXACT_JA.has(key)) return EXACT_JA.get(key);
+  if(PHRASE_MAP.has(key)) return PHRASE_MAP.get(key).ja;
+  const text=(ev?.text || displayEnglish(words)).trim();
+  if(text && isLikelyCompleteSentenceWords(words)){
+    const apiJa=await translateWithApi(text);
+    if(apiJa) return apiJa;
+  }
+  return translateSequence(words,ev);
+}
 function translateSequence(words,ev){
   const key=norm(words);
   if(EXACT_JA.has(key)) return EXACT_JA.get(key);
@@ -601,11 +684,9 @@ function showFx(made,gained,cellIndex,comboInfo=null){
 async function scanFromCell(placeIndex){
   const found=[];
   const candidates=[];
-  const maxLen=8;
-  const maxTurns=2;
   const starts=[];
-  // 置いた単語を含む全候補ルートを列挙する。
-  // 横・縦・右下へ曲がるルートを総当たりし、内部ルール→フレーズバンク→Harperの順で照合。
+  // 今回置いた単語を含む候補ルートだけ列挙する。
+  // 右・下の単調進行だけ維持。語数上限・曲がり回数制限は廃止。
   for(let y=0;y<N;y++){
     for(let x=0;x<N;x++){
       const c=state.board[idx(x,y)];
@@ -618,7 +699,6 @@ async function scanFromCell(placeIndex){
   }
   function dfs(x,y,path,lastMove,turns){
     pushPath(path, turns===0 ? (lastMove==='D'?'縦':'横') : `隣接ルート${turns}曲がり`);
-    if(path.length>=maxLen) return;
     for(const mv of [{dx:1,dy:0,k:'R'},{dx:0,dy:1,k:'D'}]){
       const nx=x+mv.dx, ny=y+mv.dy;
       if(nx<0||ny<0||nx>=N||ny>=N) continue;
@@ -627,13 +707,13 @@ async function scanFromCell(placeIndex){
       if(!cell) continue;
       if(path.some(s=>s.i===ni)) continue;
       const nt = lastMove && lastMove!==mv.k ? turns+1 : turns;
-      if(nt>maxTurns) continue;
+      // 曲がり回数でも語数でも落とさない。右/下の単調進行と盤面端で自然終了する。
       dfs(nx,ny,path.concat({i:ni,w:cell.w}),mv.k,nt);
     }
   }
   for(const st of starts){ dfs(st.x,st.y,[{i:st.i,w:st.w}],null,0); }
 
-  // まず内部・フレーズバンクを同期評価。未知の完全英文だけHarperへ回す。
+  // まず内部・フレーズバンクを同期評価。未知の完全英文だけLink Grammar APIへ回す。Harper判定は使わない。
   const seenCand=new Set();
   const uniq=[];
   for(const c of candidates){
@@ -644,12 +724,25 @@ async function scanFromCell(placeIndex){
   }
   for(const c of uniq){
     const words=c.path.map(s=>s.w);
-    let ev=evaluateSequence(words);
-    if(!ev && isLikelyCompleteSentenceWords(words)) ev=await evaluateSequenceAsync(words);
-    if(ev){
-      ev.ja=translateSequence(words,ev);
-      found.push({...ev,cells:c.path.map(s=>s.i),dir:c.label});
+    const likelySentence=isLikelyCompleteSentenceWords(words);
+    let ev=null;
+
+    if(likelySentence){
+      // 3語以上で主語/名詞から始まる候補は「文」とみなし、成立判定は必ずAPIに一任する。
+      // APIがNG/未接続なら、ローカルの品詞テンプレには絶対にフォールバックしない。
+      // これで I am new books / I like you などをHTML側の個別品詞修正で裁かず、
+      // LanguageTool + Link Grammar + 翻訳API の結果だけを採用する。
+      ev=await evaluateSequenceAsync(words);
+      if(!ev) continue;
+    }else{
+      // 主語から始まらない短い熟語・連語だけ、ローカルのPhraseBankで救う。
+      // 例: go to school / listen to music / very happy
+      ev=evaluateSequence(words);
+      if(!ev) continue;
     }
+
+    ev.ja=await resolveJapanese(words,ev);
+    found.push({...ev,cells:c.path.map(s=>s.i),dir:c.label});
   }
   found.sort((a,b)=>(b.cells.length-a.cells.length)||(b.pts-a.pts));
   const seen=new Set();
@@ -726,10 +819,21 @@ function showComboDetails(scoring,comboInfo){
     return `<div class="comboItem" data-route="${i}"><b>${i+1}. ${esc(m.text)}</b><div class="comboJa">${esc(ja)} / ${esc(m.kind||'')}</div><div class="comboRoute">${esc(m.dir||'経路')}：${esc(routeText(m))}</div><div class="comboCards">${chips}</div></div>`;
   }).join('');
   panel.classList.add('show');
-  panel.querySelectorAll('.comboItem').forEach((el,i)=>{el.onclick=()=>highlightRoute(scoring[i],i,2600);});
+  // コンボ詳細は読了前に消さない。次コンボ・閉じる・盤面リセットまで保持する。
   clearTimeout(panel._hideTimer);
-  panel._hideTimer=setTimeout(()=>panel.classList.remove('show'),14000);
-  highlightRoute(scoring[0],0,2200);
+  panel._hideTimer=null;
+  panel.querySelectorAll('.comboItem').forEach((el,i)=>{el.onclick=()=>highlightRoute(scoring[i],i,5200);});
+  const closeBtn=$('comboClose');
+  if(closeBtn && !closeBtn._wired){
+    closeBtn._wired=true;
+    closeBtn.onclick=()=>{
+      clearTimeout(panel._hideTimer);
+      panel.classList.remove('show');
+      routeFocusCells=[];
+      render();
+    };
+  }
+  highlightRoute(scoring[0],0,5200);
 }
 async function placeTile(cellIndex){
   if(selectedHandIndex<0){setMsg('先に手札を選んで！','bad');return;}
@@ -817,7 +921,7 @@ function render(){
   $('selectedInfo').textContent=selectedHandIndex>=0?`選択: ${(tp.hand||[])[selectedHandIndex]}`:'未選択';
   const ps=$('players');ps.innerHTML='';state.players.forEach((p,i)=>{const row=document.createElement('div');row.className='player '+(i===state.turn?'current':'');row.innerHTML=`<span class="dot" style="background:${p.color}"></span><span class="pname">${esc(p.name)} <small>陣地${p.tiles||0}</small></span><span class="pscore">${p.score}</span>`;ps.appendChild(row);});
   const log=$('log');log.innerHTML='';state.log.forEach(x=>{const div=document.createElement('div');div.className='logItem';div.innerHTML=`<span class="${x.good?'goodText':'badText'}">●</span> ${esc(x.text)}`;log.appendChild(div);});
-  $('targetList').innerHTML=`<span class="chip">LinkGrammar:${esc(linkGrammarStatus)}</span><span class="chip">Harper:${esc(harperStatus)}</span><span class="chip">PhraseBank:${PHRASE_BANK.length}</span><span class="chip">全ルート最大8語/2曲がり</span>`+targets.slice(0,10).map(t=>`<span class="chip">${esc(t)}</span>`).join('');
+  $('targetList').innerHTML=`<span class="chip">LinkGrammar:${esc(linkGrammarStatus)}</span><span class="chip">Harper:判定OFF</span><span class="chip">PhraseBank:${PHRASE_BANK.length}</span><span class="chip">今回置いたカード必須</span><span class="chip">語数上限なし/曲がり制限なし</span>`+targets.slice(0,10).map(t=>`<span class="chip">${esc(t)}</span>`).join('');
 }
 function esc(s){return String(s).replace(/[&<>"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m]));}
 function hexAlpha(hex,a){const h=hex.replace('#','');const r=parseInt(h.slice(0,2),16),g=parseInt(h.slice(2,4),16),b=parseInt(h.slice(4,6),16);return `rgba(${r},${g},${b},${a})`;}
