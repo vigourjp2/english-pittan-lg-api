@@ -20,9 +20,9 @@ const PIXABAY_TIMEOUT_MS = Number(process.env.PIXABAY_TIMEOUT_MS || 9000);
 const sentenceImageCache = new Map();
 const translateCache = new Map();
 
-const REASON_JOB_RETRY_DELAYS_MS = (process.env.REASON_JOB_RETRY_DELAYS_MS || '0,2000,4000,8000,15000,30000').split(',').map(x => Number(x.trim())).filter(Number.isFinite);
-const REASON_JOB_MAX_ATTEMPTS_RAW = Number(process.env.REASON_JOB_MAX_ATTEMPTS || 4);
-const REASON_JOB_MAX_ATTEMPTS = Math.max(1, Math.min(6, Number.isFinite(REASON_JOB_MAX_ATTEMPTS_RAW) ? REASON_JOB_MAX_ATTEMPTS_RAW : 4)); // v25: Render環境変数が999999等でも強制クランプ
+const REASON_JOB_RETRY_DELAYS_MS = (process.env.REASON_JOB_RETRY_DELAYS_MS || '3000,8000,15000,30000').split(',').map(x => Number(x.trim())).filter(Number.isFinite); // v26: 失敗直後の0ms即リトライを廃止
+const REASON_JOB_MAX_ATTEMPTS_RAW = Number(process.env.REASON_JOB_MAX_ATTEMPTS || 3);
+const REASON_JOB_MAX_ATTEMPTS = Math.max(1, Math.min(5, Number.isFinite(REASON_JOB_MAX_ATTEMPTS_RAW) ? REASON_JOB_MAX_ATTEMPTS_RAW : 3)); // v26: Render環境変数が999999等でも強制クランプ、標準3回
 const REASON_JOB_MAX_CACHE = Number(process.env.REASON_JOB_MAX_CACHE || 800);
 const reasonJobs = new Map();
 let reasonQueueRunning = false;
@@ -130,15 +130,22 @@ function enqueueReasonJob(text, diagnostics = {}) {
   const src = normalizeText(text);
   const key = reasonKey(src);
   if (!src || !key) return null;
+  const now = Date.now();
+  const pr = reasonPriorityFromDiagnostics(diagnostics);
   let job = reasonJobs.get(key);
-  if (!job) {
+  const terminal = job && ['failure','failed','error','cancelled','canceled'].includes(String(job.status || '').toLowerCase());
+  const newerRequest = !job || pr.priorityEpoch > (job.priorityEpoch || 0) || (pr.priorityEpoch === (job.priorityEpoch || 0) && pr.prioritySeq < (job.prioritySeq || 0));
+  if (!job || (terminal && newerRequest)) {
+    // v26: 失敗済みjobを同じ英文キーで再利用しない。
+    // 「I am」が過去に4回失敗済みだと、新規ゲームでも一瞬で再試行4/failureになるため、
+    // 新しい一手から来た再要求は attempts=0 の新jobとして作り直す。
     job = {
       id: 'r' + (reasonJobSeq++).toString(36) + '-' + Math.random().toString(36).slice(2,8),
       key, text:src,
       diagnostics: { judgeSource: diagnostics.judgeSource || 'link-grammar', linkGrammarOk: !!diagnostics.linkGrammarOk, linkages: Number(diagnostics.linkages || 0) },
       status:'pending', attempts:0,
-      createdAt: Date.now(), updatedAt: Date.now(), nextRetryAt: Date.now(),
-      ...reasonPriorityFromDiagnostics(diagnostics),
+      createdAt: now, updatedAt: now, nextRetryAt: now,
+      ...pr,
       lastError:'', result:null
     };
     reasonJobs.set(key, job);
@@ -146,17 +153,16 @@ function enqueueReasonJob(text, diagnostics = {}) {
     reasonQueueRevision++;
     trimReasonJobs();
   } else if (job.status !== 'success') {
-    // keep latest diagnostics but never reset attempts/result.
-    // v23: 同じ英文でも「新しく置いたカード由来」で再発生したら優先度だけは更新する。
+    // v26: running中は割り込めないが、終わった瞬間の再ソート用に優先度だけ更新する。
+    // terminalで newerRequest ではない場合は、無限復活させず failure のまま返す。
     job.diagnostics = { ...job.diagnostics, ...diagnostics };
-    const pr = reasonPriorityFromDiagnostics(diagnostics);
-    if (pr.priorityEpoch > (job.priorityEpoch || 0) || (pr.priorityEpoch === (job.priorityEpoch || 0) && pr.prioritySeq < (job.prioritySeq || 0))) {
+    if (newerRequest) {
       job.priorityEpoch = pr.priorityEpoch;
       job.prioritySeq = pr.prioritySeq;
     }
-    if (job.status !== 'running') job.status = 'pending';
-    if (!job.nextRetryAt || job.nextRetryAt > Date.now()) job.nextRetryAt = Date.now();
-    job.updatedAt = Date.now();
+    if (!terminal && job.status !== 'running') job.status = 'pending';
+    if (!terminal && (!job.nextRetryAt || job.nextRetryAt > now)) job.nextRetryAt = now;
+    job.updatedAt = now;
     reasonQueueRevision++;
   }
   scheduleReasonQueue(0);
@@ -1056,7 +1062,7 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-reason-job-v25-clamped-visible-single-worker-queue',
+        mode:'link-grammar-reason-job-v26-no-instant-terminal-reuse',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
