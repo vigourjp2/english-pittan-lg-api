@@ -1,18 +1,10 @@
-# English Pittan Link Grammar API
+# English Word Puzzle Fixed
 
-Link Grammar + Hugging Face Chat acceptability judge.
+修正内容:
+- API判定の失敗結果を localStorage に保存しないよう修正。
+- 判定キャッシュキーを `englishPittan.linkGrammarCache.v6.successOnly` に変更し、古い false キャッシュを踏まないように変更。
+- 手札の表示ラベルを固定スロット名ではなく、実単語の品詞ラベルに変更。例: Japanese は `名詞/形容詞`。
+- `/check-and-translate-batch` は継続利用。ゲームURLは `?lgapi=https://english-pittan-lg-api.onrender.com` を付けて使う。
 
-## Environment variables
-
-- `HF_TOKEN`: Hugging Face token with Inference Providers permission
-- `HF_CHAT_MODEL`: optional, default `deepseek-ai/DeepSeek-R1:fastest`
-- `HF_CHAT_URL`: optional, default `https://router.huggingface.co/v1/chat/completions`
-
-## Endpoints
-
-- `/health`
-- `/check?text=I%20like%20you`
-- `/check-and-translate?text=I%20like%20you`
-- `/check-and-translate-batch` POST `{ "candidates": [{"text":"I like listening","words":["I","like","listening"]}] }`
-- `/acceptability?text=I%20like%20you`
-- `/translate?text=I%20like%20you`
+ゲームURL例:
+https://game-aor.pages.dev/index-english.html?lgapi=https://english-pittan-lg-api.onrender.com&v=20260627c
