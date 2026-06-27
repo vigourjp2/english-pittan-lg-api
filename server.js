@@ -191,7 +191,7 @@ async function judgeAcceptability(text) {
     'Decide whether the input is one complete, natural, standalone Standard English sentence.',
     'Reject word salad, fragments, run-ons, leftover extra verbs, unnatural word order, object-fronting/topicalization, or sequences that only parse by unusual poetic/elliptical readings.',
     'Accept ordinary simple English sentences, including normal auxiliaries, adverbs, adjectives, objects, and prepositional phrases.',
-    'Return ONLY compact JSON: {"ok":true|false,"reason":"short reason","sentenceType":"short label"}.'
+    'Classify the input as complete_sentence, fragment, phrase, word_salad, or invalid. gameOk must be true only when the input is one complete, natural, standalone Standard English sentence. Return ONLY compact JSON: {"ok":true|false,"gameOk":true|false,"type":"complete_sentence|fragment|phrase|word_salad|invalid","reason":"short reason","sentenceType":"short label"}.'
   ].join(' ');
 
   const payload = {
@@ -222,6 +222,8 @@ async function judgeAcceptability(text) {
     }
     return {
       ok: !!parsed.ok,
+      gameOk: parsed.gameOk !== undefined ? !!parsed.gameOk : !!parsed.ok,
+      type: String(parsed.type || (parsed.ok ? 'complete_sentence' : 'invalid')),
       method:'hf-chat',
       model:HF_CHAT_MODEL,
       reason: parsed.ok ? '' : String(parsed.reason || 'rejected by acceptability judge'),
@@ -297,17 +299,85 @@ async function checkSentence(text, withTranslate = false) {
 
   const acceptability = await judgeAcceptability(checkedText);
   const ok = !!acceptability.ok;
+  const type = acceptability.type || (ok ? 'complete_sentence' : 'invalid');
+  const gameOk = !!(ok && acceptability.gameOk !== false && type === 'complete_sentence');
   let translation = null;
-  if (ok && withTranslate) translation = await translateToJapanese(checkedText);
+  if (gameOk && withTranslate) translation = await translateToJapanese(checkedText);
   return {
     originalText, text: checkedText, normalized: proof.normalized, appliedCorrections: proof.appliedCorrections || [],
-    ok, gameOk: ok, kind:'Link Grammar + HF Chat Acceptability',
-    sentenceType: ok ? (acceptability.sentenceType || 'LG_HF_CHAT_ACCEPTED') : null,
-    reason: ok ? '' : (acceptability.reason || 'acceptability rejected'), proof,
+    ok, gameOk, type, kind:'Link Grammar + HF Chat Acceptability',
+    sentenceType: gameOk ? (acceptability.sentenceType || 'complete_sentence') : (acceptability.sentenceType || type),
+    reason: gameOk ? '' : (acceptability.reason || 'acceptability rejected'), proof,
     fullParse: parsed.fullParse, strictLinkGrammar: parsed.strictLinkGrammar,
     linkages: parsed.linkages, nullCount: parsed.nullCount, stdout: parsed.stdout, stderr: parsed.stderr, code: parsed.code,
     acceptability, ja: translation?.ja || '', translation
   };
+}
+
+function normalizeCandidateItem(item, i = 0) {
+  if (typeof item === 'string') {
+    const text = normalizeText(item);
+    return { id: String(i), text, words: text.split(/\s+/).filter(Boolean) };
+  }
+  const words = Array.isArray(item?.words) ? item.words.map(x => normalizeText(String(x))).filter(Boolean) : null;
+  const text = normalizeText(item?.text || (words ? words.join(' ') : ''));
+  return { id: String(item?.id ?? i), text, words: words || text.split(/\s+/).filter(Boolean) };
+}
+
+async function checkSentenceBatch(req) {
+  const raw = await readBody(req);
+  let j = {};
+  try { j = JSON.parse(raw || '{}'); } catch { j = {}; }
+  const input = Array.isArray(j?.candidates) ? j.candidates : [];
+  const max = Math.max(1, Math.min(Number(j?.limit || 120), 240));
+  const seen = new Map();
+  for (let i = 0; i < input.length && seen.size < max; i++) {
+    const item = normalizeCandidateItem(input[i], i);
+    if (!item.text) continue;
+    const key = item.text.toLowerCase();
+    if (!seen.has(key)) seen.set(key, item);
+  }
+  const items = [...seen.values()];
+  const results = [];
+  const concurrency = Math.max(1, Math.min(Number(process.env.BATCH_CONCURRENCY || 4), 8));
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const item = items[next++];
+      try {
+        const checked = await checkSentence(item.text, true);
+        const accept = checked.acceptability || {};
+        const type = accept.type || (checked.gameOk ? 'complete_sentence' : (checked.fullParse ? 'fragment' : 'invalid'));
+        const gameOk = !!(checked.ok && checked.gameOk && (accept.gameOk !== false) && type === 'complete_sentence');
+        results.push({
+          id: item.id,
+          words: item.words,
+          originalText: checked.originalText,
+          text: String(checked.text || item.text).replace(/[.!?]$/,''),
+          ok: !!checked.ok,
+          gameOk,
+          validEnglish: !!checked.ok,
+          type,
+          sentenceType: checked.sentenceType || accept.sentenceType || type,
+          kind: checked.kind || 'API判定',
+          reason: checked.reason || accept.reason || '',
+          ja: gameOk ? (checked.ja || checked.translation?.ja || '') : '',
+          fullParse: checked.fullParse,
+          strictLinkGrammar: checked.strictLinkGrammar,
+          linkages: checked.linkages,
+          nullCount: checked.nullCount,
+          normalized: checked.normalized,
+          appliedCorrections: checked.appliedCorrections || []
+        });
+      } catch (e) {
+        results.push({ id:item.id, words:item.words, text:item.text, ok:false, gameOk:false, validEnglish:false, type:'error', reason:String(e.message || e), ja:'' });
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
+  const order = new Map(items.map((x,i)=>[x.id,i]));
+  results.sort((a,b)=>(order.get(a.id)??0)-(order.get(b.id)??0));
+  return { ok:true, count:results.length, results };
 }
 
 const server = http.createServer(async (req, res) => {
@@ -338,6 +408,10 @@ const server = http.createServer(async (req, res) => {
       const text = await getTextFromReq(req, url);
       if (!text) return send(res, 400, { ok:false, error:'empty text' });
       return send(res, 200, { text, ...(await judgeAcceptability(text)) });
+    }
+    if (url.pathname === '/check-and-translate-batch') {
+      if (req.method !== 'POST') return send(res, 405, { ok:false, error:'POST required' });
+      return send(res, 200, await checkSentenceBatch(req));
     }
     if (url.pathname === '/check' || url.pathname === '/check-and-translate') {
       const text = await getTextFromReq(req, url);

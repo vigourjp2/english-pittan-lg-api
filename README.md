@@ -13,5 +13,6 @@ Link Grammar + Hugging Face Chat acceptability judge.
 - `/health`
 - `/check?text=I%20like%20you`
 - `/check-and-translate?text=I%20like%20you`
+- `/check-and-translate-batch` POST `{ "candidates": [{"text":"I like listening","words":["I","like","listening"]}] }`
 - `/acceptability?text=I%20like%20you`
 - `/translate?text=I%20like%20you`
