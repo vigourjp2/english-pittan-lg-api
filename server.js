@@ -726,7 +726,7 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-reason-job-v13-confirmed-api-result-only',
+        mode:'link-grammar-reason-job-v14-placement-lock-stale-guard',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
