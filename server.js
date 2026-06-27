@@ -3,19 +3,20 @@ import { spawn } from 'node:child_process';
 
 const PORT = Number(process.env.PORT || 8787);
 const ALLOW_ORIGIN = process.env.ALLOW_ORIGIN || '*';
-const MAX_CHARS = Number(process.env.MAX_CHARS || 240);
-const TIMEOUT_MS = Number(process.env.LINK_GRAMMAR_TIMEOUT_MS || 3500);
-const MYMEMORY_EMAIL = process.env.MYMEMORY_EMAIL || '';
+const MAX_CHARS = Number(process.env.MAX_CHARS || 180);
+const LINK_TIMEOUT_MS = Number(process.env.LINK_TIMEOUT_MS || 3500);
+const HF_TIMEOUT_MS = Number(process.env.HF_TIMEOUT_MS || 12000);
+const LT_TIMEOUT_MS = Number(process.env.LT_TIMEOUT_MS || 5000);
+
 const LANGUAGETOOL_URL = process.env.LANGUAGETOOL_URL || 'https://api.languagetool.org/v2/check';
-// Real grammatical acceptability service. Default is a CoLA text-classification model,
-// not handwritten grammar rules. LABEL_1/ACCEPTABLE means acceptable.
 const HF_TOKEN = process.env.HF_TOKEN || '';
-const ACCEPTABILITY_MODEL = process.env.ACCEPTABILITY_MODEL || 'textattack/roberta-base-CoLA';
-const ACCEPTABILITY_URL = process.env.ACCEPTABILITY_URL || `https://api-inference.huggingface.co/models/${ACCEPTABILITY_MODEL}`;
+const ACCEPTABILITY_MODEL = process.env.ACCEPTABILITY_MODEL || 'EstherT/sentence-acceptability';
 const ACCEPTABILITY_THRESHOLD = Number(process.env.ACCEPTABILITY_THRESHOLD || 0.72);
-const acceptabilityCache = new Map();
+const HF_PROVIDER = process.env.HF_PROVIDER || 'hf-inference';
+const HF_ZERO_SHOT_MODEL = process.env.HF_ZERO_SHOT_MODEL || 'facebook/bart-large-mnli';
+const HF_ZERO_SHOT_FALLBACK = String(process.env.HF_ZERO_SHOT_FALLBACK || '1') !== '0';
+const MYMEMORY_EMAIL = process.env.MYMEMORY_EMAIL || '';
 const translateCache = new Map();
-const proofCache = new Map();
 
 function send(res, code, obj) {
   res.writeHead(code, {
@@ -27,6 +28,7 @@ function send(res, code, obj) {
   });
   res.end(JSON.stringify(obj));
 }
+
 function normalizeText(text) {
   return String(text || '')
     .replace(/[\r\n]+/g, ' ')
@@ -35,19 +37,24 @@ function normalizeText(text) {
     .trim()
     .slice(0, MAX_CHARS);
 }
-function sentenceForParser(text) {
+
+function terminalSentence(text) {
   const t = normalizeText(text);
-  if (!t) return '';
-  return /[.!?]$/.test(t) ? t : t + '.';
+  return /[.!?]$/.test(t) ? t : `${t}.`;
 }
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let data = '';
-    req.on('data', c => { data += c; if (data.length > 16384) reject(new Error('too large')); });
+    req.on('data', c => {
+      data += c;
+      if (data.length > 32768) reject(new Error('request body too large'));
+    });
     req.on('end', () => resolve(data));
     req.on('error', reject);
   });
 }
+
 async function getTextFromReq(req, url) {
   let text = url.searchParams.get('text') || '';
   if (req.method === 'POST') {
@@ -62,235 +69,354 @@ async function getTextFromReq(req, url) {
   return normalizeText(text);
 }
 
-function parseLinkParserOutput(out, err, code) {
-  const noComplete = /No complete linkages found/i.test(out) || /No complete linkages found/i.test(err);
-  const hardError = /\+\+\+\+\+ error/i.test(out) || /\+\+\+\+\+ error/i.test(err) || code !== 0;
-  const linkageMatch = out.match(/Found\s+(\d+)\s+linkages/i);
-  const linkages = linkageMatch ? Number(linkageMatch[1]) : (noComplete || hardError ? 0 : 1);
-  // We run link-parser with -null=0 and -islands-ok=0. Therefore a successful complete
-  // linkage here is the Link Grammar strict criterion; no handwritten grammar validation.
-  const ok = !hardError && !noComplete && linkages > 0;
-  return {
-    ok,
-    fullParse: ok,
-    strictLinkGrammar: ok,
-    linkages,
-    nullCount: 0,
-    stdout: out.slice(0, 2400),
-    stderr: err.slice(0, 1200),
-    code
-  };
+async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 10000) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, { ...options, signal: ac.signal });
+    const raw = await r.text();
+    let json = null;
+    try { json = raw ? JSON.parse(raw) : null; } catch { json = { raw }; }
+    if (!r.ok) {
+      const msg = json?.error || json?.message || raw || `HTTP ${r.status}`;
+      const e = new Error(msg);
+      e.status = r.status;
+      e.body = json;
+      throw e;
+    }
+    return json;
+  } finally {
+    clearTimeout(timer);
+  }
 }
+
+function applyLanguageToolCorrections(text, matches = []) {
+  let corrected = text;
+  const usable = matches
+    .filter(m => m?.replacements?.[0]?.value)
+    .filter(m => {
+      const id = String(m.rule?.id || '');
+      // 大文字開始やピリオドなど、カードゲーム上の表記に関係ないものは補正しない。
+      return !['UPPERCASE_SENTENCE_START', 'MORFOLOGIK_RULE_EN_US'].includes(id);
+    })
+    .sort((a, b) => b.offset - a.offset);
+  for (const m of usable) {
+    corrected = corrected.slice(0, m.offset) + m.replacements[0].value + corrected.slice(m.offset + m.length);
+  }
+  return normalizeText(corrected);
+}
+
+async function proofreadEnglish(text) {
+  const src = normalizeText(text);
+  if (!src) return { ok:false, text:src, corrected:src, normalized:false, matches:[], error:'empty text' };
+  try {
+    const body = new URLSearchParams({ text: src, language: 'en-US' });
+    const j = await fetchJsonWithTimeout(LANGUAGETOOL_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', 'accept': 'application/json' },
+      body
+    }, LT_TIMEOUT_MS);
+    const matches = Array.isArray(j?.matches) ? j.matches : [];
+    const corrected = applyLanguageToolCorrections(src, matches);
+    return {
+      ok: true,
+      text: src,
+      corrected,
+      normalized: corrected !== src,
+      matchesCount: matches.length,
+      appliedCorrections: matches.map(m => ({
+        offset: m.offset,
+        length: m.length,
+        replacement: m.replacements?.[0]?.value || '',
+        ruleId: m.rule?.id || '',
+        message: m.message || ''
+      })).slice(0, 12)
+    };
+  } catch (e) {
+    return { ok:false, text:src, corrected:src, normalized:false, matchesCount:0, appliedCorrections:[], error:String(e.message || e) };
+  }
+}
+
 function runLinkParser(text) {
   return new Promise((resolve) => {
-    const input = sentenceForParser(text);
-    if (!input) return resolve({ ok:false, fullParse:false, strictLinkGrammar:false, linkages:0, nullCount:0, stdout:'', stderr:'empty text', code:null });
-    const args = [
-      'en',
-      '-batch',
-      '-verbosity=0',
-      '-graphics=0',
-      '-null=0',
-      '-islands-ok=0',
-      '-spell=0',
-      '-timeout=3'
-    ];
+    const args = ['en', '-batch', '-verbosity=0', '-graphics=0', '-null=0', '-islands-ok=0', '-spell=0', '-timeout=3'];
     const p = spawn('link-parser', args, { stdio: ['pipe', 'pipe', 'pipe'] });
-    let out = '', err = '';
-    const timer = setTimeout(() => { try { p.kill('SIGKILL'); } catch {} }, TIMEOUT_MS);
+    let out = '';
+    let err = '';
+    const timer = setTimeout(() => { try { p.kill('SIGKILL'); } catch {} }, LINK_TIMEOUT_MS);
     p.stdout.on('data', d => out += d.toString());
     p.stderr.on('data', d => err += d.toString());
     p.on('error', e => {
       clearTimeout(timer);
-      resolve({ ok:false, fullParse:false, strictLinkGrammar:false, linkages:0, nullCount:0, stdout:'', stderr:String(e.message || e), code:null });
+      resolve({ ok:false, fullParse:false, strictLinkGrammar:false, linkages:0, nullCount:0, stdout:'', stderr:String(e.message || e), code:-1 });
     });
     p.on('close', code => {
       clearTimeout(timer);
-      resolve(parseLinkParserOutput(out, err, code));
+      const hardError = /\+\+\+\+\+ error/i.test(out) || /No complete linkages found/i.test(out) || code !== 0;
+      const m = out.match(/Found\s+(\d+)\s+linkages/i);
+      const linkages = m ? Number(m[1]) : (hardError ? 0 : 1);
+      const ok = !hardError && linkages > 0;
+      resolve({
+        ok,
+        fullParse: ok,
+        strictLinkGrammar: ok,
+        linkages,
+        nullCount: 0,
+        stdout: out.slice(0, 1800),
+        stderr: err.slice(0, 1000),
+        code
+      });
     });
-    p.stdin.write(input + '\n');
+    p.stdin.write(terminalSentence(text) + '\n');
     p.stdin.end();
   });
 }
 
-async function proofreadWithLanguageTool(text) {
-  text = normalizeText(text);
-  const key = text.toLowerCase();
-  if (proofCache.has(key)) return proofCache.get(key);
-  const body = new URLSearchParams({ text, language: 'en-US', enabledOnly: 'false' });
-  const r = await fetch(LANGUAGETOOL_URL, {
-    method: 'POST',
-    headers: { 'content-type': 'application/x-www-form-urlencoded', 'accept': 'application/json' },
-    body
-  });
-  if (!r.ok) throw new Error('LanguageTool HTTP ' + r.status);
-  const j = await r.json();
-  const matches = Array.isArray(j.matches) ? j.matches : [];
-  // Apply LanguageTool's first suggested replacements only. This is not a grammar engine
-  // implemented here; it is external service normalization before strict Link Grammar parse.
-  let corrected = text;
-  const appliedCorrections = [];
-  const usable = matches
-    .filter(m => m && Array.isArray(m.replacements) && m.replacements.length && Number.isFinite(m.offset) && Number.isFinite(m.length))
-    .sort((a,b) => b.offset - a.offset);
-  for (const m of usable) {
-    const replacement = String(m.replacements[0]?.value || '');
-    if (!replacement) continue;
-    corrected = corrected.slice(0, m.offset) + replacement + corrected.slice(m.offset + m.length);
-    appliedCorrections.unshift({ offset:m.offset, length:m.length, replacement, ruleId:m.rule?.id || '', message:m.message || '' });
-  }
-  const result = { ok:true, source:'LanguageTool', matchesCount:matches.length, appliedCorrections, corrected:normalizeText(corrected), rawMatches:matches.slice(0, 6).map(m => ({ message:m.message, ruleId:m.rule?.id, category:m.rule?.category?.id, offset:m.offset, length:m.length, replacements:(m.replacements||[]).slice(0,3).map(r=>r.value) })) };
-  proofCache.set(key, result);
-  if (proofCache.size > 300) proofCache.delete(proofCache.keys().next().value);
-  return result;
+function hfHeaders() {
+  const h = { 'content-type': 'application/json', 'accept': 'application/json' };
+  if (HF_TOKEN) h.authorization = `Bearer ${HF_TOKEN}`;
+  return h;
 }
 
-async function translateMyMemory(text) {
-  const params = new URLSearchParams({ q:text, langpair:'en|ja' });
-  if (MYMEMORY_EMAIL) params.set('de', MYMEMORY_EMAIL);
-  const r = await fetch('https://api.mymemory.translated.net/get?' + params.toString(), { headers: { accept:'application/json' } });
-  if (!r.ok) throw new Error('MyMemory HTTP ' + r.status);
-  const j = await r.json();
-  const ja = j?.responseData?.translatedText || '';
-  if (!ja || ja.trim().toLowerCase() === text.trim().toLowerCase()) throw new Error('empty translation');
-  return { ok:true, ja, source:'mymemory', rawStatus:j?.responseStatus };
+function flattenClassificationOutput(output) {
+  if (Array.isArray(output) && Array.isArray(output[0])) return output[0];
+  if (Array.isArray(output)) return output;
+  if (output && Array.isArray(output.labels) && Array.isArray(output.scores)) {
+    return output.labels.map((label, i) => ({ label, score: output.scores[i] }));
+  }
+  return [];
 }
-async function translateGoogleGtx(text) {
-  const url = 'https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=ja&dt=t&q=' + encodeURIComponent(text);
-  const r = await fetch(url, { headers: { accept:'application/json' } });
-  if (!r.ok) throw new Error('google-gtx HTTP ' + r.status);
-  const j = await r.json();
-  const ja = Array.isArray(j?.[0]) ? j[0].map(x => x?.[0] || '').join('') : '';
-  if (!ja) throw new Error('empty translation');
-  return { ok:true, ja, source:'google-gtx' };
+
+function labelKind(label) {
+  const s = String(label || '').toLowerCase().replace(/[ _-]+/g, '');
+  if (!s) return 'unknown';
+  if (s.includes('unacceptable') || s.includes('ungrammatical') || s.includes('incorrect') || s.includes('notacceptable') || s === 'label0' || s === '0' || s === 'negative') return 'bad';
+  if (s.includes('acceptable') || s.includes('grammatical') || s.includes('correct') || s === 'label1' || s === '1' || s === 'positive') return 'good';
+  return 'unknown';
 }
+
+function interpretClassification(items, threshold) {
+  const rows = flattenClassificationOutput(items)
+    .map(x => ({ label: String(x.label ?? ''), score: Number(x.score ?? 0) }))
+    .filter(x => x.label && Number.isFinite(x.score))
+    .sort((a, b) => b.score - a.score);
+  const good = rows.find(r => labelKind(r.label) === 'good');
+  const bad = rows.find(r => labelKind(r.label) === 'bad');
+  const top = rows[0] || null;
+  let goodScore = good?.score ?? null;
+  let badScore = bad?.score ?? null;
+  let ok = false;
+  let reason = 'acceptability label not recognized';
+  if (good) {
+    ok = good.score >= threshold && (!bad || good.score >= bad.score);
+    reason = ok ? '' : `acceptability score below threshold: ${good.score}`;
+  } else if (top && labelKind(top.label) === 'good') {
+    goodScore = top.score;
+    ok = top.score >= threshold;
+    reason = ok ? '' : `acceptability score below threshold: ${top.score}`;
+  } else if (top && labelKind(top.label) === 'bad') {
+    badScore = top.score;
+    ok = false;
+    reason = `model predicted ${top.label}`;
+  }
+  return { ok, score: goodScore, badScore, threshold, top, labels: rows.slice(0, 8), reason };
+}
+
+async function callHfTextClassification(text, model) {
+  const apiUrl = `https://router.huggingface.co/${HF_PROVIDER}/models/${model}`;
+  const payload = {
+    inputs: terminalSentence(text),
+    parameters: { top_k: 5, function_to_apply: 'softmax' },
+    options: { wait_for_model: true }
+  };
+  const raw = await fetchJsonWithTimeout(apiUrl, {
+    method: 'POST',
+    headers: hfHeaders(),
+    body: JSON.stringify(payload)
+  }, HF_TIMEOUT_MS);
+  return { raw, apiUrl };
+}
+
+async function callHfZeroShot(text, model) {
+  const apiUrl = `https://router.huggingface.co/${HF_PROVIDER}/models/${model}`;
+  const payload = {
+    inputs: terminalSentence(text),
+    parameters: {
+      candidate_labels: ['grammatical English sentence', 'ungrammatical English word sequence'],
+      multi_label: false
+    },
+    options: { wait_for_model: true }
+  };
+  const raw = await fetchJsonWithTimeout(apiUrl, {
+    method: 'POST',
+    headers: hfHeaders(),
+    body: JSON.stringify(payload)
+  }, HF_TIMEOUT_MS);
+  const rows = flattenClassificationOutput(raw)
+    .map(x => ({ label: String(x.label ?? ''), score: Number(x.score ?? 0) }))
+    .filter(x => x.label && Number.isFinite(x.score))
+    .sort((a, b) => b.score - a.score);
+  const good = rows.find(r => /grammatical/i.test(r.label) && !/ungrammatical/i.test(r.label));
+  const bad = rows.find(r => /ungrammatical/i.test(r.label));
+  const score = good?.score ?? null;
+  const ok = !!good && score >= ACCEPTABILITY_THRESHOLD && (!bad || good.score >= bad.score);
+  return { ok, score, badScore: bad?.score ?? null, threshold: ACCEPTABILITY_THRESHOLD, top: rows[0] || null, labels: rows, raw, apiUrl, model, method: 'zero-shot', reason: ok ? '' : `zero-shot acceptability below threshold or ungrammatical top label` };
+}
+
+async function judgeAcceptability(text) {
+  if (!HF_TOKEN) {
+    return { ok:false, method:'hf', model:ACCEPTABILITY_MODEL, reason:'HF_TOKEN is not set' };
+  }
+  try {
+    const { raw, apiUrl } = await callHfTextClassification(text, ACCEPTABILITY_MODEL);
+    const judged = interpretClassification(raw, ACCEPTABILITY_THRESHOLD);
+    return { ...judged, raw, apiUrl, model: ACCEPTABILITY_MODEL, method: 'text-classification' };
+  } catch (e) {
+    const primaryError = {
+      message: String(e.message || e),
+      status: e.status || null,
+      body: e.body || null,
+      model: ACCEPTABILITY_MODEL,
+      method: 'text-classification'
+    };
+    if (!HF_ZERO_SHOT_FALLBACK) {
+      return { ok:false, model:ACCEPTABILITY_MODEL, method:'text-classification', reason:'acceptability service failed', error:primaryError };
+    }
+    try {
+      const z = await callHfZeroShot(text, HF_ZERO_SHOT_MODEL);
+      return { ...z, primaryError, fallbackUsed: true };
+    } catch (e2) {
+      return {
+        ok:false,
+        model: ACCEPTABILITY_MODEL,
+        method: 'text-classification',
+        reason:'acceptability service failed',
+        error: primaryError,
+        fallbackError: { message:String(e2.message || e2), status:e2.status || null, body:e2.body || null, model:HF_ZERO_SHOT_MODEL, method:'zero-shot' }
+      };
+    }
+  }
+}
+
 async function translateToJapanese(text) {
-  text = normalizeText(text).replace(/[.!?]+$/,'');
+  text = normalizeText(text).replace(/[.!?]+$/, '');
   if (!text) return { ok:false, error:'empty text' };
   const key = text.toLowerCase();
-  if (translateCache.has(key)) return { ok:true, ja:translateCache.get(key).ja, source:translateCache.get(key).source || 'cache' };
-  let lastErr = null;
-  for (const fn of [translateMyMemory, translateGoogleGtx]) {
-    try {
-      const tr = await fn(text);
-      translateCache.set(key, { ja:tr.ja, source:tr.source });
-      if (translateCache.size > 500) translateCache.delete(translateCache.keys().next().value);
-      return tr;
-    } catch (e) { lastErr = e; }
-  }
-  return { ok:false, error:String(lastErr?.message || lastErr || 'translation failed') };
+  if (translateCache.has(key)) return { ok:true, ja:translateCache.get(key), source:'cache' };
+  const params = new URLSearchParams({ q:text, langpair:'en|ja' });
+  if (MYMEMORY_EMAIL) params.set('de', MYMEMORY_EMAIL);
+  const url = 'https://api.mymemory.translated.net/get?' + params.toString();
+  const j = await fetchJsonWithTimeout(url, { headers: { accept:'application/json' } }, 7000);
+  const ja = j?.responseData?.translatedText || '';
+  if (!ja) throw new Error('empty translation');
+  translateCache.set(key, ja);
+  if (translateCache.size > 500) translateCache.delete(translateCache.keys().next().value);
+  return { ok:true, ja, source:'mymemory', rawStatus:j?.responseStatus };
 }
 
-async function classifyAcceptability(text) {
-  text = normalizeText(text);
-  const key = text.toLowerCase();
-  if (acceptabilityCache.has(key)) return acceptabilityCache.get(key);
-
-  const headers = { 'content-type':'application/json', 'accept':'application/json' };
-  if (HF_TOKEN) headers.authorization = `Bearer ${HF_TOKEN}`;
-
-  const payload = { inputs:text, options:{ wait_for_model:true } };
-  let r, j;
-  try {
-    r = await fetch(ACCEPTABILITY_URL, { method:'POST', headers, body:JSON.stringify(payload) });
-    j = await r.json().catch(() => null);
-  } catch (e) {
-    return { ok:false, source:'hf-cola', error:String(e.message || e), model:ACCEPTABILITY_MODEL };
-  }
-  if (!r.ok) {
-    return { ok:false, source:'hf-cola', error:`HTTP ${r.status}`, raw:j, model:ACCEPTABILITY_MODEL };
-  }
-
-  // HF text-classification may return [{label,score}] or [[{label,score}]].
-  const arr = Array.isArray(j?.[0]) ? j[0] : (Array.isArray(j) ? j : []);
-  let acceptable = null;
-  let unacceptable = null;
-  for (const item of arr) {
-    const label = String(item?.label || '').toUpperCase();
-    const score = Number(item?.score || 0);
-    if (label.includes('LABEL_1') || (label.includes('ACCEPT') && !label.includes('UNACCEPT'))) acceptable = { label:item.label, score };
-    if (label.includes('LABEL_0') || label.includes('UNACCEPT')) unacceptable = { label:item.label, score };
-  }
-  const best = [...arr].sort((a,b) => Number(b?.score||0)-Number(a?.score||0))[0] || null;
-  const score = acceptable?.score ?? ((String(best?.label||'').toUpperCase().includes('LABEL_1')) ? Number(best?.score||0) : 0);
-  const isAcceptable = !!acceptable && score >= ACCEPTABILITY_THRESHOLD;
-  const result = {
-    ok:true,
-    source:'hf-cola',
-    model:ACCEPTABILITY_MODEL,
-    threshold:ACCEPTABILITY_THRESHOLD,
-    acceptable:isAcceptable,
-    acceptableScore:score,
-    unacceptableScore:unacceptable?.score ?? null,
-    label:acceptable?.label || best?.label || '',
-    raw:j
-  };
-  acceptabilityCache.set(key, result);
-  if (acceptabilityCache.size > 500) acceptabilityCache.delete(acceptabilityCache.keys().next().value);
-  return result;
-}
-
-async function checkStrict(text, { translate=false } = {}) {
+async function checkSentence(text, withTranslate = false) {
   const originalText = normalizeText(text);
-  let proof = null;
-  let normalizedText = originalText;
-  try {
-    proof = await proofreadWithLanguageTool(originalText);
-    normalizedText = proof.corrected || originalText;
-  } catch (e) {
-    proof = { ok:false, error:String(e.message || e) };
+  const proof = await proofreadEnglish(originalText);
+  const checkedText = proof.corrected || originalText;
+  const parsed = await runLinkParser(checkedText);
+
+  if (!parsed.ok) {
+    return {
+      originalText,
+      text: checkedText,
+      normalized: proof.normalized,
+      appliedCorrections: proof.appliedCorrections || [],
+      ok:false,
+      gameOk:false,
+      kind:'Link Grammar + HF Acceptability',
+      sentenceType:null,
+      reason:'link grammar parse failed',
+      proof,
+      fullParse: parsed.fullParse,
+      strictLinkGrammar: parsed.strictLinkGrammar,
+      linkages: parsed.linkages,
+      nullCount: parsed.nullCount,
+      stdout: parsed.stdout,
+      stderr: parsed.stderr,
+      code: parsed.code,
+      acceptability:null,
+      ja:'',
+      translation:null
+    };
   }
-  const parsed = await runLinkParser(normalizedText);
-  const acceptability = await classifyAcceptability(normalizedText);
-  const ok = !!parsed.ok && !!acceptability.ok && !!acceptability.acceptable;
-  let reason = '';
-  if (!parsed.ok) reason = 'strict Link Grammar parse failed';
-  else if (!acceptability.ok) reason = 'acceptability service failed';
-  else if (!acceptability.acceptable) reason = 'CoLA acceptability rejected';
-  let tr = null;
-  if (ok && translate) tr = await translateToJapanese(normalizedText);
+
+  const acceptability = await judgeAcceptability(checkedText);
+  const ok = !!acceptability.ok;
+  let translation = null;
+  if (ok && withTranslate) {
+    try { translation = await translateToJapanese(checkedText); }
+    catch (e) { translation = { ok:false, error:String(e.message || e) }; }
+  }
   return {
     originalText,
-    text: normalizedText,
-    normalized: normalizedText !== originalText,
-    appliedCorrections: proof?.appliedCorrections || [],
+    text: checkedText,
+    normalized: proof.normalized,
+    appliedCorrections: proof.appliedCorrections || [],
     ok,
     gameOk: ok,
-    kind: 'Link Grammar + CoLA Acceptability',
-    sentenceType: ok ? 'LG_COLA_ACCEPTED' : null,
-    reason,
+    kind:'Link Grammar + HF Acceptability',
+    sentenceType: ok ? 'LG_HF_ACCEPTED' : null,
+    reason: ok ? '' : (acceptability.reason || 'acceptability rejected'),
     proof,
+    fullParse: parsed.fullParse,
+    strictLinkGrammar: parsed.strictLinkGrammar,
+    linkages: parsed.linkages,
+    nullCount: parsed.nullCount,
+    stdout: parsed.stdout,
+    stderr: parsed.stderr,
+    code: parsed.code,
     acceptability,
-    ...parsed,
-    ja: tr?.ja || '',
-    translation: tr
+    ja: translation?.ja || '',
+    translation
   };
 }
 
 const server = http.createServer(async (req, res) => {
-  if (req.method === 'OPTIONS') return send(res, 200, { ok: true });
+  if (req.method === 'OPTIONS') return send(res, 200, { ok:true });
   const url = new URL(req.url, 'http://localhost');
-  if (url.pathname === '/health') return send(res, 200, { ok: true, service: 'link-grammar-api', mode:'link-grammar-plus-cola-acceptability', acceptabilityModel:ACCEPTABILITY_MODEL, acceptabilityThreshold:ACCEPTABILITY_THRESHOLD });
   try {
+    if (url.pathname === '/health') {
+      return send(res, 200, {
+        ok:true,
+        service:'link-grammar-api',
+        mode:'link-grammar-plus-hf-acceptability-router',
+        acceptabilityModel: ACCEPTABILITY_MODEL,
+        acceptabilityThreshold: ACCEPTABILITY_THRESHOLD,
+        hfProvider: HF_PROVIDER,
+        zeroShotFallback: HF_ZERO_SHOT_FALLBACK,
+        zeroShotModel: HF_ZERO_SHOT_MODEL,
+        hfTokenPresent: !!HF_TOKEN
+      });
+    }
     if (url.pathname === '/proof') {
       const text = await getTextFromReq(req, url);
       if (!text) return send(res, 400, { ok:false, error:'empty text' });
-      return send(res, 200, { text, ...(await proofreadWithLanguageTool(text)) });
+      return send(res, 200, await proofreadEnglish(text));
     }
     if (url.pathname === '/translate') {
       const text = await getTextFromReq(req, url);
       if (!text) return send(res, 400, { ok:false, error:'empty text' });
       return send(res, 200, { text, ...(await translateToJapanese(text)) });
     }
+    if (url.pathname === '/acceptability') {
+      const text = await getTextFromReq(req, url);
+      if (!text) return send(res, 400, { ok:false, error:'empty text' });
+      return send(res, 200, { text, ...(await judgeAcceptability(text)) });
+    }
     if (url.pathname === '/check' || url.pathname === '/check-and-translate') {
       const text = await getTextFromReq(req, url);
       if (!text) return send(res, 400, { ok:false, error:'empty text' });
-      const result = await checkStrict(text, { translate:url.pathname === '/check-and-translate' });
-      return send(res, 200, result);
+      return send(res, 200, await checkSentence(text, url.pathname === '/check-and-translate'));
     }
     return send(res, 404, { ok:false, error:'not found' });
   } catch (e) {
-    return send(res, 500, { ok:false, error:String(e.message || e) });
+    return send(res, 500, { ok:false, error:String(e.message || e), status:e.status || null, body:e.body || null });
   }
 });
-server.listen(PORT, () => console.log(`Link Grammar strict wrapper listening on ${PORT}`));
+
+server.listen(PORT, () => console.log(`Link Grammar + HF Acceptability API listening on ${PORT}`));

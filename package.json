@@ -1,1 +1,9 @@
-{"name":"english-pittan-link-grammar-api","version":"3.0.0","type":"module","scripts":{"start":"node server.js"},"engines":{"node":">=20"}}
+{
+  "name": "english-pittan-lg-api",
+  "version": "2.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {}
+}
