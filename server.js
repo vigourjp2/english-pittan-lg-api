@@ -374,19 +374,20 @@ async function explainRejectedSentence(text, diagnostics = {}) {
   if (!HF_TOKEN) return { ok:false, method:'hf-chat-reason-only', model:HF_CHAT_MODEL, error:'HF_TOKEN is not set' };
 
   const safeDiagnostics = {
-    judgeSource: diagnostics.judgeSource || 'link-grammar-plus-hf-chat',
+    judgeSource: diagnostics.judgeSource || 'link-grammar',
     linkGrammarOk: !!diagnostics.linkGrammarOk,
-    linkages: Number(diagnostics.linkages || 0),
-    acceptabilityType: diagnostics.acceptabilityType || '',
-    acceptabilityReasonRaw: diagnostics.acceptabilityReasonRaw || '',
-    sentenceType: diagnostics.sentenceType || ''
+    linkages: Number(diagnostics.linkages || 0)
   };
 
   const system = [
     'You explain English grammar rejections for an educational English word puzzle game.',
     'The game engine has already rejected the input as not being a complete, natural, standalone English sentence. Do not override, reverse, or debate that rejection.',
-    'Do not use terse internal labels such as "missing verb", "fragment", "parse failed", or "invalid" as the user-facing explanation.',
-    'Do not invent game rules. Do not apply word-specific hardcoded rules. Explain only what is incomplete, missing, or structurally unnatural in the exact input.',
+    'Explain the exact input as a learner-facing grammar explanation, not as a game rule.',
+    'Before explaining, internally identify what words are already present and what grammatical role they can play.',
+    'Do not say a part of speech or word type is missing if that part of speech or word type is already present in the input.',
+    'Avoid terse internal labels such as "missing verb", "fragment", "parse failed", or "invalid" as the user-facing explanation.',
+    'Do not use word-specific hardcoded rules. Explain only what information or structure is incomplete, missing, or unnatural in the exact input.',
+    'If a more specific explanation is possible, prefer it over vague alternatives like "a verb or something".',
     'Use plain language suitable for a learner. Return only JSON with keys: explanationEn, explanationJa, confidence.'
   ].join(' ');
 
@@ -490,9 +491,8 @@ async function checkSentence(text, withTranslate = false) {
         judgeSource:'link-grammar-plus-hf-chat',
         linkGrammarOk:false,
         linkages:parsed.linkages,
-        acceptabilityType:type,
-        acceptabilityReasonRaw:acceptability.reason || '',
-        sentenceType:acceptability.sentenceType || type
+        // Do not pass HF acceptability's terse/raw reason here.
+        // It can bias the reason-only model toward bad labels such as "missing verb".
       });
     }
     return {
@@ -519,9 +519,8 @@ async function checkSentence(text, withTranslate = false) {
       judgeSource:'link-grammar-plus-hf-chat',
       linkGrammarOk:true,
       linkages:parsed.linkages,
-      acceptabilityType:type,
-      acceptabilityReasonRaw:acceptability.reason || '',
-      sentenceType:acceptability.sentenceType || type
+      // Do not pass HF acceptability's terse/raw reason here.
+      // It can bias the reason-only model toward bad labels such as "missing verb".
     });
   }
   return {
@@ -612,7 +611,7 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-plus-hf-chat-acceptability-plus-hf-reason-explain',
+        mode:'link-grammar-plus-hf-chat-acceptability-plus-hf-reason-explain-v2-unbiased',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
