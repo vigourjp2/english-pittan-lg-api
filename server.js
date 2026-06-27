@@ -367,6 +367,71 @@ async function judgeAcceptability(text) {
   }
 }
 
+
+async function explainRejectedSentence(text, diagnostics = {}) {
+  const src = normalizeText(text);
+  if (!src) return { ok:false, method:'hf-chat-reason-only', model:HF_CHAT_MODEL, error:'empty text' };
+  if (!HF_TOKEN) return { ok:false, method:'hf-chat-reason-only', model:HF_CHAT_MODEL, error:'HF_TOKEN is not set' };
+
+  const safeDiagnostics = {
+    judgeSource: diagnostics.judgeSource || 'link-grammar-plus-hf-chat',
+    linkGrammarOk: !!diagnostics.linkGrammarOk,
+    linkages: Number(diagnostics.linkages || 0),
+    acceptabilityType: diagnostics.acceptabilityType || '',
+    acceptabilityReasonRaw: diagnostics.acceptabilityReasonRaw || '',
+    sentenceType: diagnostics.sentenceType || ''
+  };
+
+  const system = [
+    'You explain English grammar rejections for an educational English word puzzle game.',
+    'The game engine has already rejected the input as not being a complete, natural, standalone English sentence. Do not override, reverse, or debate that rejection.',
+    'Do not use terse internal labels such as "missing verb", "fragment", "parse failed", or "invalid" as the user-facing explanation.',
+    'Do not invent game rules. Do not apply word-specific hardcoded rules. Explain only what is incomplete, missing, or structurally unnatural in the exact input.',
+    'Use plain language suitable for a learner. Return only JSON with keys: explanationEn, explanationJa, confidence.'
+  ].join(' ');
+
+  const payload = {
+    model: HF_CHAT_MODEL,
+    messages: [
+      { role:'system', content: system },
+      { role:'user', content: JSON.stringify({ input: src, diagnostics: safeDiagnostics }) }
+    ],
+    temperature: 0,
+    max_tokens: 180,
+    response_format: { type:'json_object' }
+  };
+
+  try {
+    const j = await fetchJsonWithTimeout(HF_CHAT_URL, {
+      method:'POST',
+      headers:{
+        'authorization': `Bearer ${HF_TOKEN}`,
+        'content-type': 'application/json',
+        'accept': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    }, HF_TIMEOUT_MS);
+    const content = j?.choices?.[0]?.message?.content || j?.choices?.[0]?.text || '';
+    const parsed = tryExtractJson(content) || {};
+    const explanationEn = String(parsed.explanationEn || '').trim();
+    const explanationJa = String(parsed.explanationJa || '').trim();
+    if (!explanationEn && !explanationJa) {
+      return { ok:false, method:'hf-chat-reason-only', model:HF_CHAT_MODEL, error:'HF reason returned empty explanation', raw:j, content };
+    }
+    return {
+      ok:true,
+      method:'hf-chat-reason-only',
+      model:HF_CHAT_MODEL,
+      explanationEn,
+      explanationJa,
+      confidence: parsed.confidence ?? null,
+      rawReason: parsed
+    };
+  } catch (e) {
+    return { ok:false, method:'hf-chat-reason-only', model:HF_CHAT_MODEL, error:String(e.message || e), status:e.status || null, body:e.body || null };
+  }
+}
+
 async function translateByGoogleGtx(text) {
   const q = normalizeText(text).replace(/[.!?]+$/, '');
   const url = 'https://translate.googleapis.com/translate_a/single?' + new URLSearchParams({
@@ -418,12 +483,25 @@ async function checkSentence(text, withTranslate = false) {
     const type = acceptability.type || 'invalid';
     const gameOk = !!(acceptability.ok && acceptability.gameOk !== false && type === 'complete_sentence');
     let translation = null;
+    let reasonExplain = null;
     if (gameOk && withTranslate) translation = await translateToJapanese(checkedText);
+    if (!gameOk) {
+      reasonExplain = await explainRejectedSentence(checkedText, {
+        judgeSource:'link-grammar-plus-hf-chat',
+        linkGrammarOk:false,
+        linkages:parsed.linkages,
+        acceptabilityType:type,
+        acceptabilityReasonRaw:acceptability.reason || '',
+        sentenceType:acceptability.sentenceType || type
+      });
+    }
     return {
       originalText, text: checkedText, normalized: proof.normalized, appliedCorrections: proof.appliedCorrections || [],
-      ok: gameOk, gameOk, type, kind:'Link Grammar + HF Chat Acceptability',
+      ok: gameOk, gameOk, type, kind:'Link Grammar + HF Chat Acceptability + HF Reason Explain',
       sentenceType: gameOk ? (acceptability.sentenceType || 'complete_sentence') : (acceptability.sentenceType || type),
-      reason: gameOk ? '' : (acceptability.reason || 'link grammar parse failed'), proof,
+      reason: gameOk ? '' : (reasonExplain?.explanationJa || reasonExplain?.explanationEn || acceptability.reason || 'link grammar parse failed'),
+      reasonSource: gameOk ? '' : (reasonExplain?.ok ? reasonExplain.method : 'hf-chat-reason-only-failed'),
+      reasonExplain, proof,
       fullParse: parsed.fullParse, strictLinkGrammar: parsed.strictLinkGrammar,
       linkages: parsed.linkages, nullCount: parsed.nullCount, stdout: parsed.stdout, stderr: parsed.stderr, code: parsed.code,
       acceptability, ja: translation?.ja || '', translation
@@ -434,12 +512,25 @@ async function checkSentence(text, withTranslate = false) {
   const type = acceptability.type || (ok ? 'complete_sentence' : 'invalid');
   const gameOk = !!(ok && acceptability.gameOk !== false && type === 'complete_sentence');
   let translation = null;
+  let reasonExplain = null;
   if (gameOk && withTranslate) translation = await translateToJapanese(checkedText);
+  if (!gameOk) {
+    reasonExplain = await explainRejectedSentence(checkedText, {
+      judgeSource:'link-grammar-plus-hf-chat',
+      linkGrammarOk:true,
+      linkages:parsed.linkages,
+      acceptabilityType:type,
+      acceptabilityReasonRaw:acceptability.reason || '',
+      sentenceType:acceptability.sentenceType || type
+    });
+  }
   return {
     originalText, text: checkedText, normalized: proof.normalized, appliedCorrections: proof.appliedCorrections || [],
-    ok, gameOk, type, kind:'Link Grammar + HF Chat Acceptability',
+    ok, gameOk, type, kind:'Link Grammar + HF Chat Acceptability + HF Reason Explain',
     sentenceType: gameOk ? (acceptability.sentenceType || 'complete_sentence') : (acceptability.sentenceType || type),
-    reason: gameOk ? '' : (acceptability.reason || 'acceptability rejected'), proof,
+    reason: gameOk ? '' : (reasonExplain?.explanationJa || reasonExplain?.explanationEn || acceptability.reason || 'acceptability rejected'),
+    reasonSource: gameOk ? '' : (reasonExplain?.ok ? reasonExplain.method : 'hf-chat-reason-only-failed'),
+    reasonExplain, proof,
     fullParse: parsed.fullParse, strictLinkGrammar: parsed.strictLinkGrammar,
     linkages: parsed.linkages, nullCount: parsed.nullCount, stdout: parsed.stdout, stderr: parsed.stderr, code: parsed.code,
     acceptability, ja: translation?.ja || '', translation
@@ -492,7 +583,8 @@ async function checkSentenceBatch(req) {
           type,
           sentenceType: checked.sentenceType || accept.sentenceType || type,
           kind: checked.kind || 'API判定',
-          reason: checked.reason || accept.reason || '',
+          reason: checked.reason || checked.reasonExplain?.explanationJa || checked.reasonExplain?.explanationEn || accept.reason || '',
+          reasonSource: checked.reasonSource || checked.reasonExplain?.method || '',
           ja: gameOk ? (checked.ja || checked.translation?.ja || '') : '',
           fullParse: checked.fullParse,
           strictLinkGrammar: checked.strictLinkGrammar,
@@ -520,7 +612,7 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-plus-hf-chat-acceptability',
+        mode:'link-grammar-plus-hf-chat-acceptability-plus-hf-reason-explain',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
@@ -548,6 +640,11 @@ const server = http.createServer(async (req, res) => {
       const text = await getTextFromReq(req, url);
       if (!text) return send(res, 400, { ok:false, error:'empty text' });
       return send(res, 200, { text, ...(await judgeAcceptability(text)) });
+    }
+    if (url.pathname === '/reason-explain') {
+      const text = await getTextFromReq(req, url);
+      if (!text) return send(res, 400, { ok:false, error:'empty text' });
+      return send(res, 200, { text, ...(await explainRejectedSentence(text, { judgeSource:'manual-reason-explain' })) });
     }
     if (url.pathname === '/check-and-translate-batch') {
       if (req.method !== 'POST') return send(res, 405, { ok:false, error:'POST required' });
