@@ -21,7 +21,8 @@ const sentenceImageCache = new Map();
 const translateCache = new Map();
 
 const REASON_JOB_RETRY_DELAYS_MS = (process.env.REASON_JOB_RETRY_DELAYS_MS || '0,2000,4000,8000,15000,30000').split(',').map(x => Number(x.trim())).filter(Number.isFinite);
-const REASON_JOB_MAX_ATTEMPTS = Number(process.env.REASON_JOB_MAX_ATTEMPTS || 4); // v24: 無限リトライ禁止。詰まり防止
+const REASON_JOB_MAX_ATTEMPTS_RAW = Number(process.env.REASON_JOB_MAX_ATTEMPTS || 4);
+const REASON_JOB_MAX_ATTEMPTS = Math.max(1, Math.min(6, Number.isFinite(REASON_JOB_MAX_ATTEMPTS_RAW) ? REASON_JOB_MAX_ATTEMPTS_RAW : 4)); // v25: Render環境変数が999999等でも強制クランプ
 const REASON_JOB_MAX_CACHE = Number(process.env.REASON_JOB_MAX_CACHE || 800);
 const reasonJobs = new Map();
 let reasonQueueRunning = false;
@@ -48,6 +49,23 @@ function waitingReasonJobs() {
 }
 function runningReasonJob() {
   return activeReasonJobs().find(j => j.status === 'running') || null;
+}
+
+function expireOverAttemptJobs() {
+  let changed = false;
+  for (const j of reasonJobs.values()) {
+    const st = String(j.status || '').toLowerCase();
+    if (['success','failure','failed','error','cancelled','canceled','running'].includes(st)) continue;
+    if (Number(j.attempts || 0) >= REASON_JOB_MAX_ATTEMPTS) {
+      j.status = 'failure';
+      j.nextRetryAt = null;
+      j.lastError = j.lastError || `reason attempts exceeded (${REASON_JOB_MAX_ATTEMPTS})`;
+      j.updatedAt = Date.now();
+      reasonStats.failure++;
+      changed = true;
+    }
+  }
+  if (changed) reasonQueueRevision++;
 }
 function reasonQueueMeta(job) {
   if (!job) return { queueRevision: reasonQueueRevision, queueRole:'missing', queueIndex:null, queueLabel:'' };
@@ -153,9 +171,10 @@ async function processReasonQueue() {
   reasonQueueRunning = true;
   try {
     while (true) {
+      expireOverAttemptJobs();
       const now = Date.now();
       const ready = [...reasonJobs.values()]
-        .filter(j => j.status !== 'success' && j.status !== 'running' && (j.nextRetryAt || 0) <= now)
+        .filter(j => !['success','failure','failed','error','cancelled','canceled','running'].includes(String(j.status || '').toLowerCase()) && Number(j.attempts || 0) < REASON_JOB_MAX_ATTEMPTS && (j.nextRetryAt || 0) <= now)
         .sort(compareReasonJobs)[0];
       if (!ready) break;
       ready.status = 'running';
@@ -193,7 +212,8 @@ async function processReasonQueue() {
   } finally {
     reasonQueueRunning = false;
   }
-  const next = [...reasonJobs.values()].filter(j => j.status !== 'success' && j.status !== 'running').sort((a,b)=>(a.nextRetryAt||0)-(b.nextRetryAt||0) || compareReasonJobs(a,b))[0];
+  expireOverAttemptJobs();
+  const next = [...reasonJobs.values()].filter(j => !['success','failure','failed','error','cancelled','canceled','running'].includes(String(j.status || '').toLowerCase())).sort((a,b)=>(a.nextRetryAt||0)-(b.nextRetryAt||0) || compareReasonJobs(a,b))[0];
   if (next) scheduleReasonQueue(Math.max(0, (next.nextRetryAt || Date.now()) - Date.now()));
 }
 
@@ -1036,14 +1056,14 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-reason-job-v24-visible-single-worker-queue',
+        mode:'link-grammar-reason-job-v25-clamped-visible-single-worker-queue',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
         pixabayKeyPresent: !!PIXABAY_API_KEY,
         hfModelScanVersion: 'v2-no-generation-params-for-classifiers',
         hfModelScanModels: HF_SCAN_MODELS,
-        reasonJobs: { size: reasonJobs.size, running: reasonQueueRunning, stats: reasonStats, successCacheSize: [...reasonJobs.values()].filter(j=>j.status==='success').length, pendingSize: [...reasonJobs.values()].filter(j=>j.status!=='success').length }
+        reasonJobs: { size: reasonJobs.size, running: reasonQueueRunning, maxAttempts: REASON_JOB_MAX_ATTEMPTS, rawMaxAttempts: REASON_JOB_MAX_ATTEMPTS_RAW, stats: reasonStats, successCacheSize: [...reasonJobs.values()].filter(j=>j.status==='success').length, pendingSize: [...reasonJobs.values()].filter(j=>!['success','failure','failed','error','cancelled','canceled'].includes(String(j.status||'').toLowerCase())).length }
       });
     }
     if (url.pathname === '/proof') {
