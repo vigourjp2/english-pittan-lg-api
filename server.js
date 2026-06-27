@@ -969,7 +969,7 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-reason-job-v20-queued-polling-no-hardcoded-reason',
+        mode:'link-grammar-reason-job-v21-queued-server',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
