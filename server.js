@@ -60,6 +60,40 @@ function isNonRetryableReasonError(err) {
 function reasonKey(text) {
   return normalizeText(text).toLowerCase().replace(/[.!?]+$/,'').replace(/\s+/g,' ');
 }
+function reasonContextSignature(diagnostics = {}) {
+  // v38: 理由探索は「その時点の手札/候補カード」に依存する。
+  // 文だけで成功キャッシュすると、候補なしで作った古い結果が、候補ありの現在盤面に再利用される。
+  // 単語別文法ルールではなく、探索入力そのものをjob keyに含める。
+  const hand = uniqueWordsFromArray(diagnostics.reasonHandCandidates || diagnostics.handCandidates || [], 40);
+  const deck = uniqueWordsFromArray(diagnostics.reasonDeckCandidates || diagnostics.reasonCandidates || diagnostics.deckCandidates || [], 220);
+  const sig = JSON.stringify({ hand, deck });
+  let h = 2166136261;
+  for (let i = 0; i < sig.length; i++) {
+    h ^= sig.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return h.toString(36);
+}
+function reasonJobKey(text, diagnostics = {}) {
+  return reasonKey(text) + '|ctx:' + reasonContextSignature(diagnostics);
+}
+function latestReasonJobByText(text) {
+  const k = reasonKey(text);
+  return [...reasonJobs.values()]
+    .filter(j => reasonKey(j.text) === k)
+    .sort((a,b)=>(b.updatedAt||0)-(a.updatedAt||0))[0] || null;
+}
+function reasonDiagnosticsForJob(diagnostics = {}) {
+  // v38: 作成時に候補カードを捨てない。ここを捨てていたため「1通りしか試してない」になった。
+  return {
+    ...diagnostics,
+    judgeSource: diagnostics.judgeSource || 'link-grammar',
+    linkGrammarOk: !!diagnostics.linkGrammarOk,
+    linkages: Number(diagnostics.linkages || 0),
+    reasonHandCandidates: uniqueWordsFromArray(diagnostics.reasonHandCandidates || diagnostics.handCandidates || [], 40),
+    reasonDeckCandidates: uniqueWordsFromArray(diagnostics.reasonDeckCandidates || diagnostics.reasonCandidates || diagnostics.deckCandidates || [], 220)
+  };
+}
 function trimReasonJobs() {
   if (reasonJobs.size <= REASON_JOB_MAX_CACHE) return;
   const removable = [...reasonJobs.entries()].filter(([,j]) => j.status === 'success').sort((a,b)=>(a[1].updatedAt||0)-(b[1].updatedAt||0));
@@ -154,7 +188,7 @@ function compareReasonJobs(a, b) {
 }
 function enqueueReasonJob(text, diagnostics = {}) {
   const src = normalizeText(text);
-  const key = reasonKey(src);
+  const key = reasonJobKey(src, diagnostics);
   if (!src || !key) return null;
   const now = Date.now();
   const pr = reasonPriorityFromDiagnostics(diagnostics);
@@ -168,7 +202,7 @@ function enqueueReasonJob(text, diagnostics = {}) {
     job = {
       id: 'r' + (reasonJobSeq++).toString(36) + '-' + Math.random().toString(36).slice(2,8),
       key, text:src,
-      diagnostics: { judgeSource: diagnostics.judgeSource || 'link-grammar', linkGrammarOk: !!diagnostics.linkGrammarOk, linkages: Number(diagnostics.linkages || 0) },
+      diagnostics: reasonDiagnosticsForJob(diagnostics),
       status:'pending', attempts:0,
       createdAt: now, updatedAt: now, nextRetryAt: now,
       ...pr,
@@ -181,7 +215,7 @@ function enqueueReasonJob(text, diagnostics = {}) {
   } else if (job.status !== 'success') {
     // v26: running中は割り込めないが、終わった瞬間の再ソート用に優先度だけ更新する。
     // terminalで newerRequest ではない場合は、無限復活させず failure のまま返す。
-    job.diagnostics = { ...job.diagnostics, ...diagnostics };
+    job.diagnostics = reasonDiagnosticsForJob({ ...job.diagnostics, ...diagnostics });
     if (newerRequest) {
       job.priorityEpoch = pr.priorityEpoch;
       job.prioritySeq = pr.prioritySeq;
@@ -569,18 +603,31 @@ function strictLinkGrammarGameOk(parsed) {
   );
 }
 
+
+function contextualShortAnswerInfo(text) {
+  // v37: no phrase-specific contextual-short-answer classification.
+  // Acceptance is based only on the actual Strict Link Grammar API result.
+  return null;
+}
+
 function localAcceptabilityFromLinkParser(text, parsed) {
   const src = normalizeText(text);
   const words = src.split(/\s+/).filter(Boolean);
   const lgOk = strictLinkGrammarGameOk(parsed);
   if (lgOk) {
+    const shortAnswer = contextualShortAnswerInfo(src);
     return {
       ok:true,
       gameOk:true,
       type:'complete_sentence',
       method:'strict-link-grammar-only',
       reason:'',
-      sentenceType:'complete_sentence',
+      sentenceType: shortAnswer?.sentenceType || 'complete_sentence',
+      utteranceType: shortAnswer?.utteranceType || 'standalone_sentence',
+      displayKind: shortAnswer?.displayKind || '完全な文',
+      jaHint: shortAnswer?.ja || '',
+      noteJa: shortAnswer?.noteJa || '',
+      noteEn: shortAnswer?.noteEn || '',
       gate:'link-grammar-only',
       hfUsed:false
     };
@@ -833,7 +880,7 @@ async function explainByExploration(text, diagnostics = {}) {
   }
   return {
     ok:true,
-    method:'strict-link-grammar-oracle-exploration-v35',
+    method:'strict-link-grammar-oracle-exploration-v38-context-aware-reason-jobs',
     model:'none',
     observedStructure: top ? 'nearest successful path found by strict Link Grammar exploration' : 'no successful path found in bounded exploration',
     incompletePart: top ? top.action : 'unknown within candidate search budget',
@@ -912,14 +959,15 @@ async function checkSentence(text, withTranslate = false, reasonMeta = {}) {
     let translation = null;
     let reasonExplain = null;
     let reasonJob = null;
-    if (gameOk && withTranslate) translation = await translateToJapanese(checkedText);
+    if (gameOk && acceptability.jaHint) translation = { ok:true, ja:acceptability.jaHint, source:'contextual-short-answer' };
+    else if (gameOk && withTranslate) translation = await translateToJapanese(checkedText);
     if (!gameOk) {
       reasonJob = enqueueReasonJob(checkedText, { judgeSource:'link-grammar', linkGrammarOk:false, linkages:parsed.linkages, ...reasonMeta });
       if (reasonJob?.status === 'success') reasonExplain = reasonJob.result;
     }
     return {
       originalText, text: checkedText, normalized: proof.normalized, appliedCorrections: proof.appliedCorrections || [],
-      ok: gameOk, gameOk, type, kind:'Strict Link Grammar ONLY + Exploration Reason Queue v33',
+      ok: gameOk, gameOk, type, kind:'Strict Link Grammar ONLY + Exploration Reason Queue v38',
       sentenceType: gameOk ? (acceptability.sentenceType || 'complete_sentence') : (acceptability.sentenceType || type),
       reason: gameOk ? '' : (reasonExplain?.explanationJa || reasonExplain?.explanationEn || ''),
       reasonSource: gameOk ? '' : (reasonExplain?.ok ? reasonExplain.method : 'reason-job-pending'),
@@ -938,14 +986,15 @@ async function checkSentence(text, withTranslate = false, reasonMeta = {}) {
   let translation = null;
   let reasonExplain = null;
   let reasonJob = null;
-  if (gameOk && withTranslate) translation = await translateToJapanese(checkedText);
+  if (gameOk && acceptability.jaHint) translation = { ok:true, ja:acceptability.jaHint, source:'contextual-short-answer' };
+  else if (gameOk && withTranslate) translation = await translateToJapanese(checkedText);
   if (!gameOk) {
     reasonJob = enqueueReasonJob(checkedText, { judgeSource:'link-grammar', linkGrammarOk:true, linkages:parsed.linkages, ...reasonMeta });
     if (reasonJob?.status === 'success') reasonExplain = reasonJob.result;
   }
   return {
     originalText, text: checkedText, normalized: proof.normalized, appliedCorrections: proof.appliedCorrections || [],
-    ok, gameOk, type, kind:'Strict Link Grammar ONLY + Exploration Reason Queue v33',
+    ok, gameOk, type, kind:'Strict Link Grammar ONLY + Exploration Reason Queue v38',
     sentenceType: gameOk ? (acceptability.sentenceType || 'complete_sentence') : (acceptability.sentenceType || type),
     reason: gameOk ? '' : (reasonExplain?.explanationJa || reasonExplain?.explanationEn || ''),
     reasonSource: gameOk ? '' : (reasonExplain?.ok ? reasonExplain.method : 'reason-job-pending'),
@@ -1273,11 +1322,11 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-strict-only-v35-judge-lock-ui-no-hardcode',
+        mode:'link-grammar-strict-only-v38-context-aware-reason-jobs',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-oracle-exploration-no-hardcode',
+        reasonProvider:'strict-link-grammar-oracle-exploration-context-aware-reason-jobs',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:true,
@@ -1324,7 +1373,7 @@ const server = http.createServer(async (req, res) => {
         text,
         elapsedMs: Date.now() - startedAt,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-oracle-exploration-no-hardcode',
+        reasonProvider:'strict-link-grammar-oracle-exploration-context-aware-reason-jobs',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:true,
@@ -1349,7 +1398,7 @@ const server = http.createServer(async (req, res) => {
       const id = url.searchParams.get('id') || '';
       let job = null;
       if (id) job = [...reasonJobs.values()].find(j => j.id === id) || null;
-      if (!job && text) job = reasonJobs.get(reasonKey(text)) || null;
+      if (!job && text) job = latestReasonJobByText(text);
       if (!job) return send(res, 200, { ok:false, status:'missing', text });
       return send(res, 200, { text: job.text, ...publicReasonJob(job) });
     }
@@ -1408,4 +1457,4 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => console.log(`Strict Link Grammar v35 Exploration API listening on ${PORT}`));
+server.listen(PORT, () => console.log(`Strict Link Grammar v36 Contextual Short Answer API listening on ${PORT}`));
