@@ -286,18 +286,25 @@ async function checkSentence(text, withTranslate = false) {
   const checkedText = proof.corrected || originalText;
   const parsed = await runLinkParser(checkedText);
 
+  const acceptability = await judgeAcceptability(checkedText);
+
   if (!parsed.ok) {
+    // StrictLG: Link Grammar がNGならゲーム判定は必ずNGのまま。
+    // HF Chat Acceptability は、NG理由を補足するためだけに使う。
+    const type = acceptability.type || 'invalid';
+    const hfReason = acceptability.reason ? String(acceptability.reason) : '';
+    const reason = hfReason || 'link grammar parse failed';
     return {
       originalText, text: checkedText, normalized: proof.normalized, appliedCorrections: proof.appliedCorrections || [],
-      ok:false, gameOk:false, kind:'Link Grammar + HF Chat Acceptability', sentenceType:null,
-      reason:'link grammar parse failed', proof,
+      ok: false, gameOk: false, type, kind:'Strict Link Grammar + HF reason only',
+      sentenceType: acceptability.sentenceType || type,
+      reason, proof,
       fullParse: parsed.fullParse, strictLinkGrammar: parsed.strictLinkGrammar,
       linkages: parsed.linkages, nullCount: parsed.nullCount, stdout: parsed.stdout, stderr: parsed.stderr, code: parsed.code,
-      acceptability:null, ja:'', translation:null
+      acceptability, ja: '', translation: null
     };
   }
 
-  const acceptability = await judgeAcceptability(checkedText);
   const ok = !!acceptability.ok;
   const type = acceptability.type || (ok ? 'complete_sentence' : 'invalid');
   const gameOk = !!(ok && acceptability.gameOk !== false && type === 'complete_sentence');
@@ -388,7 +395,7 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-plus-hf-chat-acceptability',
+        mode:'strict-link-grammar-hf-reason-only',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN
