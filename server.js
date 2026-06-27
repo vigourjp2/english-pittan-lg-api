@@ -478,11 +478,10 @@ async function judgeAcceptability(text) {
   }
 }
 
-
 async function explainRejectedSentence(text, diagnostics = {}) {
   const src = normalizeText(text);
   if (!src) return { ok:false, method:'hf-chat-reason-only', model:HF_CHAT_MODEL, error:'empty text' };
-  if (!HF_TOKEN) return { ok:false, method:'hf-chat-reason-only', model:HF_CHAT_MODEL, error:'HF_TOKEN is not set' };
+  if (!HF_TOKEN) return { ok:false, method:'hf-chat-reason-only', model:HF_CHAT_MODEL, status:'unavailable', error:'HF_TOKEN is not set' };
 
   const safeDiagnostics = {
     judgeSource: diagnostics.judgeSource || 'link-grammar',
@@ -548,7 +547,7 @@ async function explainRejectedSentence(text, diagnostics = {}) {
       rawReason: parsed
     };
   } catch (e) {
-    return { ok:false, method:'hf-chat-reason-only', model:HF_CHAT_MODEL, error:String(e.message || e), status:e.status || null, body:e.body || null };
+    return { ok:false, method:'hf-chat-reason-only', model:HF_CHAT_MODEL, status:'failure', error:String(e.message || e), httpStatus:e.status || null };
   }
 }
 
@@ -606,7 +605,9 @@ async function checkSentence(text, withTranslate = false) {
     let reasonExplain = null;
     let reasonJob = null;
     if (gameOk && withTranslate) translation = await translateToJapanese(checkedText);
-    if (!gameOk) {
+    if (!gameOk && HF_TOKEN) {
+      // v20: 不成立理由は reason job に投入し、キューで順次処理する。
+      // 単語別ハードコーディングは使わず、成功した reason-explain だけを表示する。
       reasonJob = enqueueReasonJob(checkedText, { judgeSource:'link-grammar', linkGrammarOk:false, linkages:parsed.linkages });
       if (reasonJob?.status === 'success') reasonExplain = reasonJob.result;
     }
@@ -615,8 +616,8 @@ async function checkSentence(text, withTranslate = false) {
       ok: gameOk, gameOk, type, kind:'Link Grammar + HF Reason Job',
       sentenceType: gameOk ? (acceptability.sentenceType || 'complete_sentence') : (acceptability.sentenceType || type),
       reason: gameOk ? '' : (reasonExplain?.explanationJa || reasonExplain?.explanationEn || ''),
-      reasonSource: gameOk ? '' : (reasonExplain?.ok ? reasonExplain.method : 'reason-job-pending'),
-      reasonStatus: gameOk ? 'none' : (reasonJob?.status || 'pending'),
+      reasonSource: gameOk ? '' : (reasonExplain?.ok ? reasonExplain.method : (reasonJob ? 'reason-job-pending' : 'reason-unavailable')),
+      reasonStatus: gameOk ? 'none' : (reasonExplain?.ok ? 'success' : (reasonJob?.status || 'unavailable')),
       reasonJobId: gameOk ? '' : (reasonJob?.id || ''),
       reasonExplain, proof,
       fullParse: parsed.fullParse, strictLinkGrammar: parsed.strictLinkGrammar,
@@ -632,7 +633,9 @@ async function checkSentence(text, withTranslate = false) {
   let reasonExplain = null;
   let reasonJob = null;
   if (gameOk && withTranslate) translation = await translateToJapanese(checkedText);
-  if (!gameOk) {
+  if (!gameOk && HF_TOKEN) {
+    // v20: 不成立理由は reason job に投入し、キューで順次処理する。
+    // 単語別ハードコーディングは使わず、成功した reason-explain だけを表示する。
     reasonJob = enqueueReasonJob(checkedText, { judgeSource:'link-grammar-plus-hf-chat', linkGrammarOk:true, linkages:parsed.linkages });
     if (reasonJob?.status === 'success') reasonExplain = reasonJob.result;
   }
@@ -642,7 +645,7 @@ async function checkSentence(text, withTranslate = false) {
     sentenceType: gameOk ? (acceptability.sentenceType || 'complete_sentence') : (acceptability.sentenceType || type),
     reason: gameOk ? '' : (reasonExplain?.explanationJa || reasonExplain?.explanationEn || ''),
     reasonSource: gameOk ? '' : (reasonExplain?.ok ? reasonExplain.method : 'reason-job-pending'),
-    reasonStatus: gameOk ? 'none' : (reasonJob?.status || 'pending'),
+    reasonStatus: gameOk ? 'none' : (reasonExplain?.ok ? 'success' : (reasonJob?.status || 'pending')),
     reasonJobId: gameOk ? '' : (reasonJob?.id || ''),
     reasonExplain, proof,
     fullParse: parsed.fullParse, strictLinkGrammar: parsed.strictLinkGrammar,
@@ -966,7 +969,7 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-reason-job-v14-placement-lock-stale-guard',
+        mode:'link-grammar-reason-job-v20-queued-polling-no-hardcoded-reason',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
