@@ -15,6 +15,9 @@ const HF_TOKEN = process.env.HF_TOKEN || '';
 const HF_CHAT_MODEL = process.env.HF_CHAT_MODEL || 'deepseek-ai/DeepSeek-R1:fastest';
 const HF_CHAT_URL = process.env.HF_CHAT_URL || 'https://router.huggingface.co/v1/chat/completions';
 const MYMEMORY_EMAIL = process.env.MYMEMORY_EMAIL || '';
+const PIXABAY_API_KEY = process.env.PIXABAY_API_KEY || '';
+const PIXABAY_TIMEOUT_MS = Number(process.env.PIXABAY_TIMEOUT_MS || 9000);
+const sentenceImageCache = new Map();
 const translateCache = new Map();
 
 const REASON_JOB_RETRY_DELAYS_MS = (process.env.REASON_JOB_RETRY_DELAYS_MS || '0,2000,4000,8000,15000,30000').split(',').map(x => Number(x.trim())).filter(Number.isFinite);
@@ -718,6 +721,151 @@ async function checkSentenceBatch(req) {
   return { ok:true, count:results.length, results };
 }
 
+
+function sentenceImageNorm(text) {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/[“”]/g, '"')
+    .replace(/[^a-z0-9'\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+function sentenceImageWords(text) {
+  return sentenceImageNorm(text).split(/\s+/).filter(Boolean);
+}
+function toPixabayGerund(v) {
+  v = String(v || '').toLowerCase().trim();
+  if (!v) return '';
+  if (v.endsWith('ie')) return v.slice(0, -2) + 'ying';
+  if (v.endsWith('e') && !['be','see','flee'].includes(v)) return v.slice(0, -1) + 'ing';
+  // simple consonant-vowel-consonant doubling for short verbs: run -> running, sit -> sitting
+  if (/^[a-z]{3}$/.test(v) && /[bcdfghjklmnpqrstvwxyz][aeiou][bcdfghjklmnpqrstvwxyz]$/.test(v) && !/[wxy]$/.test(v)) return v + v.slice(-1) + 'ing';
+  return v + 'ing';
+}
+function buildSentenceImageQueries(sentence) {
+  const words = sentenceImageWords(sentence).filter(w => !['a','an','the'].includes(w));
+  if (!words.length) return [];
+  const first = words[0];
+  const pronounSubject = new Set(['i','he','she','me','him','her']);
+  const pluralSubject = new Set(['we','they','you','us','them']);
+  const beWords = new Set(['am','are','is','was','were','be','been','being']);
+  const modalWords = new Set(['can','will','would','could','should','must','may','might']);
+
+  const subject = pronounSubject.has(first) ? 'child' : (pluralSubject.has(first) ? 'children' : first);
+  let i = 1;
+  while (i < words.length && (modalWords.has(words[i]) || beWords.has(words[i]))) i++;
+  const verb = words[i] || '';
+  const rest = words.slice(i + 1).filter(w => !['to','of','for','in','on','at'].includes(w) || words.length <= 4);
+  const restText = rest.join(' ');
+  const originalNoArticles = words.join(' ');
+
+  const queries = [];
+  function add(q) {
+    q = String(q || '')
+      .replace(/\b(a|an|the)\b/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 100);
+    if (q && !queries.includes(q)) queries.push(q);
+  }
+
+  if (verb) {
+    const gerund = toPixabayGerund(verb);
+    add([subject, gerund, restText, 'illustration'].filter(Boolean).join(' '));
+    add([subject, verb, restText, 'illustration'].filter(Boolean).join(' '));
+    add([gerund, restText, 'illustration'].filter(Boolean).join(' '));
+  }
+  add([subject, restText, 'illustration'].filter(Boolean).join(' '));
+  add([originalNoArticles, 'illustration'].filter(Boolean).join(' '));
+  return queries.slice(0, 5);
+}
+function scorePixabayHit(hit, query) {
+  const text = sentenceImageNorm([hit?.tags, hit?.name, hit?.type].filter(Boolean).join(' '));
+  const qWords = sentenceImageWords(query).filter(w => !['illustration','image','picture'].includes(w));
+  let score = 0;
+  for (const w of qWords) {
+    if (!w) continue;
+    if (text.split(/\s+/).includes(w)) score += 8;
+    else if (text.includes(w)) score += 3;
+  }
+  if (String(hit?.type || '').includes('vector')) score += 8;
+  if (String(hit?.type || '').includes('illustration')) score += 6;
+  if (hit?.isGRated === true) score += 6;
+  if (hit?.isLowQuality === true) score -= 80;
+  if (hit?.isAiGenerated === true) score -= 25;
+  const tags = text;
+  if (/\b(child|kid|boy|girl|person|people|student|player)\b/.test(tags)) score += 8;
+  if (/\b(icon|symbol|background|pattern)\b/.test(tags)) score -= 10;
+  const w = Number(hit?.webformatWidth || hit?.imageWidth || 0);
+  const h = Number(hit?.webformatHeight || hit?.imageHeight || 0);
+  if (w && h) {
+    const ratio = w / h;
+    if (ratio > 0.55 && ratio < 1.8) score += 4;
+    if (ratio < 0.35 || ratio > 2.6) score -= 10;
+  }
+  score += Math.min(10, Number(hit?.likes || 0) / 12);
+  score += Math.min(8, Number(hit?.downloads || 0) / 15000);
+  return score;
+}
+async function searchPixabayImages(query) {
+  const params = new URLSearchParams({
+    key: PIXABAY_API_KEY,
+    q: query,
+    image_type: 'illustration',
+    safesearch: 'true',
+    per_page: '20',
+    order: 'popular'
+  });
+  const url = 'https://pixabay.com/api/?' + params.toString();
+  const data = await fetchJsonWithTimeout(url, {}, PIXABAY_TIMEOUT_MS);
+  const hits = Array.isArray(data?.hits) ? data.hits : [];
+  return { data, hits };
+}
+async function sentenceImageForText(sentence) {
+  const text = normalizeText(sentence).replace(/[.!?]$/,'');
+  if (!text) return { ok:false, error:'empty q' };
+  if (!PIXABAY_API_KEY) return { ok:false, sentence:text, error:'missing PIXABAY_API_KEY' };
+  const cacheKey = sentenceImageNorm(text);
+  const cached = sentenceImageCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return { ...cached.value, cache:true };
+
+  const queries = buildSentenceImageQueries(text);
+  const all = [];
+  const tried = [];
+  for (const query of queries) {
+    tried.push(query);
+    const { hits } = await searchPixabayImages(query);
+    for (const hit of hits) all.push({ hit, query, score: scorePixabayHit(hit, query) });
+    // enough candidates: stop early to keep latency down
+    if (all.length >= 8) break;
+  }
+  all.sort((a,b)=>b.score-a.score);
+  const best = all.find(x => x.hit?.webformatURL || x.hit?.largeImageURL || x.hit?.previewURL);
+  if (!best) return { ok:false, sentence:text, queries:tried, error:'no_image_found' };
+  const h = best.hit;
+  const value = {
+    ok:true,
+    sentence:text,
+    query:best.query,
+    score:Math.round(best.score * 10) / 10,
+    imageUrl:h.webformatURL || h.largeImageURL || h.previewURL,
+    previewUrl:h.previewURL || '',
+    largeImageUrl:h.largeImageURL || '',
+    pageURL:h.pageURL || '',
+    tags:h.tags || '',
+    provider:'pixabay',
+    attribution:'Image via Pixabay',
+    type:h.type || '',
+    width:h.webformatWidth || h.imageWidth || 0,
+    height:h.webformatHeight || h.imageHeight || 0,
+    user:h.user || '',
+    id:h.id || ''
+  };
+  sentenceImageCache.set(cacheKey, { value, expiresAt:Date.now() + 6 * 60 * 60 * 1000 });
+  if (sentenceImageCache.size > 300) sentenceImageCache.delete(sentenceImageCache.keys().next().value);
+  return value;
+}
+
 const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') return send(res, 200, { ok:true });
   const url = new URL(req.url, 'http://localhost');
@@ -730,6 +878,7 @@ const server = http.createServer(async (req, res) => {
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
+        pixabayKeyPresent: !!PIXABAY_API_KEY,
         hfModelScanVersion: 'v2-no-generation-params-for-classifiers',
         hfModelScanModels: HF_SCAN_MODELS,
         reasonJobs: { size: reasonJobs.size, running: reasonQueueRunning, stats: reasonStats, successCacheSize: [...reasonJobs.values()].filter(j=>j.status==='success').length, pendingSize: [...reasonJobs.values()].filter(j=>j.status!=='success').length }
@@ -744,6 +893,12 @@ const server = http.createServer(async (req, res) => {
       const text = await getTextFromReq(req, url);
       if (!text) return send(res, 400, { ok:false, error:'empty text' });
       return send(res, 200, { text, ...(await translateToJapanese(text)) });
+    }
+
+    if (url.pathname === '/sentence-image') {
+      const text = url.searchParams.get('q') || url.searchParams.get('text') || '';
+      if (!text) return send(res, 400, { ok:false, error:'missing q' });
+      return send(res, 200, await sentenceImageForText(text));
     }
 
     if (url.pathname === '/hf-model-scan' || url.pathname === '/hf-model-scan-v2') {
