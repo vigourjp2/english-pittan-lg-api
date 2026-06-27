@@ -383,12 +383,16 @@ async function explainRejectedSentence(text, diagnostics = {}) {
     'You explain English grammar rejections for an educational English word puzzle game.',
     'The game engine has already rejected the input as not being a complete, natural, standalone English sentence. Do not override, reverse, or debate that rejection.',
     'Explain the exact input as a learner-facing grammar explanation, not as a game rule.',
-    'Before explaining, internally identify what words are already present and what grammatical role they can play.',
-    'Do not say a part of speech or word type is missing if that part of speech or word type is already present in the input.',
+    'Use a structure-first method for every input:',
+    'Step 1: identify the words already present and their likely grammatical roles in observedStructure.',
+    'Step 2: identify only the additional information, relationship, or sentence structure needed to make the input complete in incompletePart.',
+    'Step 3: write a concise learner-facing explanation based on Step 1 and Step 2.',
+    'Consistency rule: do not claim that any word type, grammatical role, or sentence element is missing if your observedStructure says it is already present.',
+    'If you are uncertain about a specific grammatical label, describe the missing information more generally instead of guessing a part of speech.',
     'Avoid terse internal labels such as "missing verb", "fragment", "parse failed", or "invalid" as the user-facing explanation.',
-    'Do not use word-specific hardcoded rules. Explain only what information or structure is incomplete, missing, or unnatural in the exact input.',
-    'If a more specific explanation is possible, prefer it over vague alternatives like "a verb or something".',
-    'Use plain language suitable for a learner. Return only JSON with keys: explanationEn, explanationJa, confidence.'
+    'Do not use word-specific hardcoded rules or memorize examples. Explain only what information or structure is incomplete, missing, or unnatural in the exact input.',
+    'Avoid vague alternatives like "a verb or something". Prefer the most specific missing information that follows from the observed structure.',
+    'Use plain language suitable for a learner. Return only JSON with keys: observedStructure, incompletePart, explanationEn, explanationJa, confidence.'
   ].join(' ');
 
   const payload = {
@@ -414,6 +418,8 @@ async function explainRejectedSentence(text, diagnostics = {}) {
     }, HF_TIMEOUT_MS);
     const content = j?.choices?.[0]?.message?.content || j?.choices?.[0]?.text || '';
     const parsed = tryExtractJson(content) || {};
+    const observedStructure = String(parsed.observedStructure || '').trim();
+    const incompletePart = String(parsed.incompletePart || '').trim();
     const explanationEn = String(parsed.explanationEn || '').trim();
     const explanationJa = String(parsed.explanationJa || '').trim();
     if (!explanationEn && !explanationJa) {
@@ -423,6 +429,8 @@ async function explainRejectedSentence(text, diagnostics = {}) {
       ok:true,
       method:'hf-chat-reason-only',
       model:HF_CHAT_MODEL,
+      observedStructure,
+      incompletePart,
       explanationEn,
       explanationJa,
       confidence: parsed.confidence ?? null,
@@ -611,7 +619,7 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-plus-hf-chat-acceptability-plus-hf-reason-explain-v2-unbiased',
+        mode:'link-grammar-plus-hf-chat-acceptability-plus-hf-reason-explain-v3-structure-first',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
