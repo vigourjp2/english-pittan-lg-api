@@ -7,18 +7,14 @@ const MAX_CHARS = Number(process.env.MAX_CHARS || 180);
 const LINK_TIMEOUT_MS = Number(process.env.LINK_TIMEOUT_MS || 3500);
 const LT_TIMEOUT_MS = Number(process.env.LT_TIMEOUT_MS || 5000);
 const HF_TIMEOUT_MS = Number(process.env.HF_TIMEOUT_MS || 25000);
+const HF_MODEL_SCAN_TIMEOUT_MS = Number(process.env.HF_MODEL_SCAN_TIMEOUT_MS || 20000);
+const HF_SCAN_MODELS = (process.env.HF_SCAN_MODELS || 'textattack/roberta-base-CoLA,cointegrated/roberta-large-cola-krishna2020,mrm8488/deberta-v3-small-finetuned-cola,EstherT/sentence-acceptability,nikolasmoya/c4-binary-english-grammar-checker,vennify/t5-base-grammar-correction,samadpls/t5-base-grammar-checker,hassaanik/grammar-correction-model').split(',').map(s => s.trim()).filter(Boolean);
 
 const LANGUAGETOOL_URL = process.env.LANGUAGETOOL_URL || 'https://api.languagetool.org/v2/check';
 const HF_TOKEN = process.env.HF_TOKEN || '';
 const HF_CHAT_MODEL = process.env.HF_CHAT_MODEL || 'deepseek-ai/DeepSeek-R1:fastest';
 const HF_CHAT_URL = process.env.HF_CHAT_URL || 'https://router.huggingface.co/v1/chat/completions';
 const MYMEMORY_EMAIL = process.env.MYMEMORY_EMAIL || '';
-const SAPLING_API_KEY = process.env.SAPLING_API_KEY || '';
-const SAPLING_API_URL = process.env.SAPLING_API_URL || 'https://api.sapling.ai/api/v1/edits';
-const SAPLING_TIMEOUT_MS = Number(process.env.SAPLING_TIMEOUT_MS || 10000);
-const GRAMMARBOT_API_KEY = process.env.GRAMMARBOT_API_KEY || '';
-const GRAMMARBOT_API_URL = process.env.GRAMMARBOT_API_URL || 'https://neural.grammarbot.io/v1/check';
-const GRAMMARBOT_TIMEOUT_MS = Number(process.env.GRAMMARBOT_TIMEOUT_MS || 12000);
 const translateCache = new Map();
 
 function send(res, code, obj) {
@@ -189,6 +185,71 @@ function tryExtractJson(s) {
   return null;
 }
 
+
+function hfModelPath(model) {
+  return String(model || '').split('/').map(encodeURIComponent).join('/');
+}
+
+function summarizeHfOutput(model, data) {
+  const raw = data;
+  const flat = Array.isArray(data) && Array.isArray(data[0]) ? data[0] : data;
+  const labels = [];
+  if (Array.isArray(flat)) {
+    for (const x of flat.slice(0, 8)) {
+      if (x && typeof x === 'object') labels.push({ label: x.label, score: x.score });
+    }
+  }
+  let generatedText = '';
+  if (Array.isArray(data) && data[0]?.generated_text) generatedText = String(data[0].generated_text || '');
+  else if (data?.generated_text) generatedText = String(data.generated_text || '');
+  const error = data?.error || data?.message || '';
+  const top = labels.slice().sort((a,b)=>(Number(b.score)||0)-(Number(a.score)||0))[0] || null;
+  return { model, ok: !error, error, top, labels, generatedText, raw };
+}
+
+async function callHfInferenceModel(model, text) {
+  const src = normalizeText(text);
+  if (!HF_TOKEN) return { model, ok:false, error:'HF_TOKEN is not set' };
+  const path = hfModelPath(model);
+  const urls = [
+    `https://router.huggingface.co/hf-inference/models/${path}`,
+    `https://api-inference.huggingface.co/models/${path}`
+  ];
+  const payload = {
+    inputs: src,
+    options: { wait_for_model: true },
+    parameters: { max_new_tokens: 80, return_all_scores: true }
+  };
+  const attempts = [];
+  for (const endpoint of urls) {
+    try {
+      const data = await fetchJsonWithTimeout(endpoint, {
+        method: 'POST',
+        headers: {
+          'authorization': `Bearer ${HF_TOKEN}`,
+          'content-type': 'application/json',
+          'accept': 'application/json'
+        },
+        body: JSON.stringify(payload)
+      }, HF_MODEL_SCAN_TIMEOUT_MS);
+      return { provider:'hf-inference', endpoint, ...summarizeHfOutput(model, data) };
+    } catch (e) {
+      attempts.push({ endpoint, error:String(e.message || e), status:e.status || null, body:e.body || null });
+    }
+  }
+  return { model, ok:false, provider:'hf-inference', error:'all HF inference endpoints failed', attempts };
+}
+
+async function scanHfModels(text, modelFilter = '') {
+  const src = normalizeText(text);
+  const models = modelFilter ? [modelFilter] : HF_SCAN_MODELS;
+  const results = [];
+  for (const model of models) {
+    results.push(await callHfInferenceModel(model, src));
+  }
+  return { ok:true, text:src, count:results.length, models, results };
+}
+
 async function judgeAcceptability(text) {
   if (!HF_TOKEN) return { ok:false, method:'hf-chat', model:HF_CHAT_MODEL, reason:'HF_TOKEN is not set' };
 
@@ -247,98 +308,6 @@ async function judgeAcceptability(text) {
   }
 }
 
-
-async function explainWithSapling(text) {
-  const src = normalizeText(text);
-  if (!src) return { ok:false, provider:'sapling', text:src, error:'empty text' };
-  if (!SAPLING_API_KEY) {
-    return { ok:false, provider:'sapling', text:src, error:'SAPLING_API_KEY is not set' };
-  }
-
-  const payload = {
-    key: SAPLING_API_KEY,
-    text: src,
-    session_id: 'english-pittan-reason-test'
-  };
-
-  try {
-    const data = await fetchJsonWithTimeout(SAPLING_API_URL, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'accept': 'application/json'
-      },
-      body: JSON.stringify(payload)
-    }, SAPLING_TIMEOUT_MS);
-
-    return {
-      ok: true,
-      provider: 'sapling',
-      text: src,
-      editsCount: Array.isArray(data?.edits) ? data.edits.length : 0,
-      data
-    };
-  } catch (e) {
-    return {
-      ok: false,
-      provider: 'sapling',
-      text: src,
-      error: String(e.message || e),
-      status: e.status || null,
-      body: e.body || null
-    };
-  }
-}
-
-async function explainWithGrammarBot(text) {
-  const src = normalizeText(text);
-  if (!src) return { ok:false, provider:'grammarbot', text:src, error:'empty text' };
-
-  const payload = { text: src };
-  // GrammarBotはAPIキー無しでも低制限で動く可能性があるため、キー未設定でも検証する。
-  // キーがある場合だけ付ける。判定には使わず、理由候補の実測用。
-  if (GRAMMARBOT_API_KEY) payload.api_key = GRAMMARBOT_API_KEY;
-
-  try {
-    const data = await fetchJsonWithTimeout(GRAMMARBOT_API_URL, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'accept': 'application/json'
-      },
-      body: JSON.stringify(payload)
-    }, GRAMMARBOT_TIMEOUT_MS);
-
-    const matches = Array.isArray(data?.matches) ? data.matches : [];
-    return {
-      ok: true,
-      provider: 'grammarbot',
-      text: src,
-      matchesCount: matches.length,
-      matches: matches.slice(0, 12).map(m => ({
-        message: m?.message || '',
-        shortMessage: m?.shortMessage || '',
-        offset: m?.offset ?? null,
-        length: m?.length ?? null,
-        ruleId: m?.rule?.id || '',
-        issueType: m?.rule?.issueType || '',
-        category: m?.rule?.category?.id || m?.rule?.category?.name || '',
-        replacements: Array.isArray(m?.replacements) ? m.replacements.slice(0, 5).map(r => r?.value || '').filter(Boolean) : []
-      })),
-      data
-    };
-  } catch (e) {
-    return {
-      ok: false,
-      provider: 'grammarbot',
-      text: src,
-      error: String(e.message || e),
-      status: e.status || null,
-      body: e.body || null
-    };
-  }
-}
-
 async function translateByGoogleGtx(text) {
   const q = normalizeText(text).replace(/[.!?]+$/, '');
   const url = 'https://translate.googleapis.com/translate_a/single?' + new URLSearchParams({
@@ -387,19 +356,18 @@ async function checkSentence(text, withTranslate = false) {
   const acceptability = await judgeAcceptability(checkedText);
 
   if (!parsed.ok) {
-    // StrictLG: Link Grammar がNGならゲーム判定は必ずNGのまま。
-    // HF Chat Acceptability は、NG理由を補足するためだけに使う。
     const type = acceptability.type || 'invalid';
-    const hfReason = acceptability.reason ? String(acceptability.reason) : '';
-    const reason = hfReason || 'link grammar parse failed';
+    const gameOk = !!(acceptability.ok && acceptability.gameOk !== false && type === 'complete_sentence');
+    let translation = null;
+    if (gameOk && withTranslate) translation = await translateToJapanese(checkedText);
     return {
       originalText, text: checkedText, normalized: proof.normalized, appliedCorrections: proof.appliedCorrections || [],
-      ok: false, gameOk: false, type, kind:'Strict Link Grammar + HF reason only',
-      sentenceType: acceptability.sentenceType || type,
-      reason, proof,
+      ok: gameOk, gameOk, type, kind:'Link Grammar + HF Chat Acceptability',
+      sentenceType: gameOk ? (acceptability.sentenceType || 'complete_sentence') : (acceptability.sentenceType || type),
+      reason: gameOk ? '' : (acceptability.reason || 'link grammar parse failed'), proof,
       fullParse: parsed.fullParse, strictLinkGrammar: parsed.strictLinkGrammar,
       linkages: parsed.linkages, nullCount: parsed.nullCount, stdout: parsed.stdout, stderr: parsed.stderr, code: parsed.code,
-      acceptability, ja: '', translation: null
+      acceptability, ja: translation?.ja || '', translation
     };
   }
 
@@ -493,12 +461,11 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'strict-link-grammar-hf-reason-only',
+        mode:'link-grammar-plus-hf-chat-acceptability',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
-        saplingKeyPresent: !!SAPLING_API_KEY,
-        grammarbotKeyPresent: !!GRAMMARBOT_API_KEY
+        hfModelScanModels: HF_SCAN_MODELS
       });
     }
     if (url.pathname === '/proof') {
@@ -506,20 +473,16 @@ const server = http.createServer(async (req, res) => {
       if (!text) return send(res, 400, { ok:false, error:'empty text' });
       return send(res, 200, await proofreadEnglish(text));
     }
-    if (url.pathname === '/explain-sapling') {
-      const text = await getTextFromReq(req, url);
-      if (!text) return send(res, 400, { ok:false, error:'empty text' });
-      return send(res, 200, await explainWithSapling(text));
-    }
-    if (url.pathname === '/explain-grammarbot') {
-      const text = await getTextFromReq(req, url);
-      if (!text) return send(res, 400, { ok:false, error:'empty text' });
-      return send(res, 200, await explainWithGrammarBot(text));
-    }
     if (url.pathname === '/translate') {
       const text = await getTextFromReq(req, url);
       if (!text) return send(res, 400, { ok:false, error:'empty text' });
       return send(res, 200, { text, ...(await translateToJapanese(text)) });
+    }
+
+    if (url.pathname === '/hf-model-scan') {
+      const text = await getTextFromReq(req, url);
+      if (!text) return send(res, 400, { ok:false, error:'empty text' });
+      return send(res, 200, await scanHfModels(text, url.searchParams.get('model') || ''));
     }
     if (url.pathname === '/acceptability') {
       const text = await getTextFromReq(req, url);
