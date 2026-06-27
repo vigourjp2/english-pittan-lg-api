@@ -28,8 +28,34 @@ const reasonJobs = new Map();
 let reasonQueueRunning = false;
 let reasonQueueTimer = null;
 let reasonJobSeq = 1;
-let reasonStats = { created:0, success:0, retry:0, failure:0 };
+let reasonStats = { created:0, success:0, retry:0, failure:0, unavailable:0 };
 let reasonQueueRevision = 0;
+
+function isTerminalReasonStatus(st) {
+  return ['success','failure','failed','error','cancelled','canceled','unavailable'].includes(String(st || '').toLowerCase());
+}
+function isNonRetryableReasonError(err) {
+  if (err?.retryable === false) return true;
+  const bodyText = (() => {
+    try { return typeof err?.body === 'string' ? err.body : JSON.stringify(err?.body || ''); } catch { return ''; }
+  })();
+  const msg = String((err?.message || err || '') + ' ' + bodyText).toLowerCase();
+  const status = Number(err?.status || 0);
+  // v28: HF Inference Providers の月間無料枠/プリペイド枠切れは、再試行しても成功しない。
+  // これを retryable にすると「一瞬で再試行3→失敗」やキュー詰まりに見えるため、unavailable へ即落とす。
+  const quotaLike =
+    msg.includes('depleted your monthly included credits') ||
+    msg.includes('monthly included credits') ||
+    msg.includes('pre-paid credits') ||
+    msg.includes('inference providers') && msg.includes('credits') ||
+    msg.includes('insufficient credits') ||
+    msg.includes('credits exhausted') ||
+    msg.includes('quota exceeded') ||
+    msg.includes('billing') ||
+    msg.includes('payment required');
+  return !HF_TOKEN || status === 400 || status === 401 || status === 402 || status === 403 || status === 404 || quotaLike || msg.includes('hf_token is not set') || msg.includes('authorization') || msg.includes('unauthorized') || msg.includes('forbidden') || msg.includes('model not found') || msg.includes('invalid api key') || msg.includes('invalid token');
+}
+
 
 function reasonKey(text) {
   return normalizeText(text).toLowerCase().replace(/[.!?]+$/,'').replace(/\s+/g,' ');
@@ -42,7 +68,7 @@ function trimReasonJobs() {
   }
 }
 function activeReasonJobs() {
-  return [...reasonJobs.values()].filter(j => !['success','failure','failed','error','cancelled','canceled'].includes(String(j.status || '').toLowerCase()));
+  return [...reasonJobs.values()].filter(j => !['success','failure','failed','error','cancelled','canceled','unavailable'].includes(String(j.status || '').toLowerCase()));
 }
 function waitingReasonJobs() {
   return activeReasonJobs().filter(j => j.status !== 'running').sort(compareReasonJobs);
@@ -55,7 +81,7 @@ function expireOverAttemptJobs() {
   let changed = false;
   for (const j of reasonJobs.values()) {
     const st = String(j.status || '').toLowerCase();
-    if (['success','failure','failed','error','cancelled','canceled','running'].includes(st)) continue;
+    if (['success','failure','failed','error','cancelled','canceled','unavailable','running'].includes(st)) continue;
     if (Number(j.attempts || 0) >= REASON_JOB_MAX_ATTEMPTS) {
       j.status = 'failure';
       j.nextRetryAt = null;
@@ -70,7 +96,7 @@ function expireOverAttemptJobs() {
 function reasonQueueMeta(job) {
   if (!job) return { queueRevision: reasonQueueRevision, queueRole:'missing', queueIndex:null, queueLabel:'' };
   if (job.status === 'running') return { queueRevision: reasonQueueRevision, queueRole:'running', queueIndex:0, queueLabel:'理由解析中' };
-  if (['success','failure','failed','error'].includes(String(job.status || '').toLowerCase())) {
+  if (['success','failure','failed','error','unavailable'].includes(String(job.status || '').toLowerCase())) {
     return { queueRevision: reasonQueueRevision, queueRole:job.status, queueIndex:null, queueLabel:'' };
   }
   const wait = waitingReasonJobs();
@@ -180,7 +206,7 @@ async function processReasonQueue() {
       expireOverAttemptJobs();
       const now = Date.now();
       const ready = [...reasonJobs.values()]
-        .filter(j => !['success','failure','failed','error','cancelled','canceled','running'].includes(String(j.status || '').toLowerCase()) && Number(j.attempts || 0) < REASON_JOB_MAX_ATTEMPTS && (j.nextRetryAt || 0) <= now)
+        .filter(j => !['success','failure','failed','error','cancelled','canceled','unavailable','running'].includes(String(j.status || '').toLowerCase()) && Number(j.attempts || 0) < REASON_JOB_MAX_ATTEMPTS && (j.nextRetryAt || 0) <= now)
         .sort(compareReasonJobs)[0];
       if (!ready) break;
       ready.status = 'running';
@@ -189,7 +215,12 @@ async function processReasonQueue() {
       try {
         const r = await explainRejectedSentence(ready.text, ready.diagnostics || {});
         const hasExplanation = !!(r?.ok && (String(r.explanationJa||'').trim() || String(r.explanationEn||'').trim()));
-        if (!hasExplanation) throw new Error(r?.error || 'reason-explain returned no explanation');
+        if (!hasExplanation) {
+          const err = new Error(r?.error || 'reason-explain returned no explanation');
+          err.status = r?.status || null;
+          err.retryable = r?.retryable !== false;
+          throw err;
+        }
         ready.status = 'success';
         ready.result = r;
         ready.lastError = '';
@@ -197,6 +228,15 @@ async function processReasonQueue() {
         reasonStats.success++;
         reasonQueueRevision++;
       } catch (e) {
+        if (isNonRetryableReasonError(e)) {
+          ready.status = 'unavailable';
+          ready.nextRetryAt = null;
+          ready.lastError = String(e.message || e);
+          ready.updatedAt = Date.now();
+          reasonStats.unavailable++;
+          reasonQueueRevision++;
+          continue;
+        }
         ready.attempts++;
         ready.lastError = String(e.message || e);
         ready.updatedAt = Date.now();
@@ -219,7 +259,7 @@ async function processReasonQueue() {
     reasonQueueRunning = false;
   }
   expireOverAttemptJobs();
-  const next = [...reasonJobs.values()].filter(j => !['success','failure','failed','error','cancelled','canceled','running'].includes(String(j.status || '').toLowerCase())).sort((a,b)=>(a.nextRetryAt||0)-(b.nextRetryAt||0) || compareReasonJobs(a,b))[0];
+  const next = [...reasonJobs.values()].filter(j => !['success','failure','failed','error','cancelled','canceled','unavailable','running'].includes(String(j.status || '').toLowerCase())).sort((a,b)=>(a.nextRetryAt||0)-(b.nextRetryAt||0) || compareReasonJobs(a,b))[0];
   if (next) scheduleReasonQueue(Math.max(0, (next.nextRetryAt || Date.now()) - Date.now()));
 }
 
@@ -516,137 +556,298 @@ async function scanHfModels(text, modelFilter = '') {
   };
 }
 
-async function judgeAcceptability(text) {
-  if (!HF_TOKEN) return { ok:false, method:'hf-chat', model:HF_CHAT_MODEL, reason:'HF_TOKEN is not set' };
 
-  const system = [
-    'You are a strict English sentence acceptability judge for a children\'s word-order game.',
-    'Decide whether the input is one complete, natural, standalone Standard English sentence.',
-    'Reject word salad, fragments, run-ons, leftover extra verbs, unnatural word order, object-fronting/topicalization, or sequences that only parse by unusual poetic/elliptical readings.',
-    'Accept ordinary simple English sentences, including normal auxiliaries, adverbs, adjectives, objects, and prepositional phrases.',
-    'Classify the input as complete_sentence, fragment, phrase, word_salad, or invalid. gameOk must be true only when the input is one complete, natural, standalone Standard English sentence. Return ONLY compact JSON: {"ok":true|false,"gameOk":true|false,"type":"complete_sentence|fragment|phrase|word_salad|invalid","reason":"short reason","sentenceType":"short label"}.'
-  ].join(' ');
-
-  const payload = {
-    model: HF_CHAT_MODEL,
-    messages: [
-      { role: 'system', content: system },
-      { role: 'user', content: `INPUT: ${JSON.stringify(normalizeText(text))}` }
-    ],
-    temperature: 0,
-    max_tokens: 80,
-    response_format: { type: 'json_object' }
-  };
-
-  try {
-    const j = await fetchJsonWithTimeout(HF_CHAT_URL, {
-      method: 'POST',
-      headers: {
-        'authorization': `Bearer ${HF_TOKEN}`,
-        'content-type': 'application/json',
-        'accept': 'application/json'
-      },
-      body: JSON.stringify(payload)
-    }, HF_TIMEOUT_MS);
-    const content = j?.choices?.[0]?.message?.content || j?.choices?.[0]?.text || '';
-    const parsed = tryExtractJson(content);
-    if (!parsed || typeof parsed.ok !== 'boolean') {
-      return { ok:false, method:'hf-chat', model:HF_CHAT_MODEL, reason:'HF chat returned non-JSON decision', raw:j, content };
-    }
-    return {
-      ok: !!parsed.ok,
-      gameOk: parsed.gameOk !== undefined ? !!parsed.gameOk : !!parsed.ok,
-      type: String(parsed.type || (parsed.ok ? 'complete_sentence' : 'invalid')),
-      method:'hf-chat',
-      model:HF_CHAT_MODEL,
-      reason: parsed.ok ? '' : String(parsed.reason || 'rejected by acceptability judge'),
-      sentenceType: String(parsed.sentenceType || (parsed.ok ? 'HF_CHAT_ACCEPTED' : 'HF_CHAT_REJECTED')),
-      rawDecision: parsed
-    };
-  } catch (e) {
-    return {
-      ok:false,
-      method:'hf-chat',
-      model:HF_CHAT_MODEL,
-      reason:'HF chat acceptability service failed',
-      error:{ message:String(e.message || e), status:e.status || null, body:e.body || null }
-    };
-  }
+function strictLinkGrammarGameOk(parsed) {
+  return !!(
+    parsed &&
+    parsed.ok === true &&
+    parsed.fullParse === true &&
+    parsed.strictLinkGrammar === true &&
+    Number(parsed.linkages || 0) > 0 &&
+    Number(parsed.nullCount || 0) === 0 &&
+    Number(parsed.code || 0) === 0
+  );
 }
 
-
-async function explainRejectedSentence(text, diagnostics = {}) {
+function localAcceptabilityFromLinkParser(text, parsed) {
   const src = normalizeText(text);
-  if (!src) return { ok:false, method:'hf-chat-reason-only', model:HF_CHAT_MODEL, error:'empty text' };
-  if (!HF_TOKEN) return { ok:false, method:'hf-chat-reason-only', model:HF_CHAT_MODEL, error:'HF_TOKEN is not set' };
-
-  const safeDiagnostics = {
-    judgeSource: diagnostics.judgeSource || 'link-grammar',
-    linkGrammarOk: !!diagnostics.linkGrammarOk,
-    linkages: Number(diagnostics.linkages || 0)
-  };
-
-  const system = [
-    'You explain English grammar rejections for an educational English word puzzle game.',
-    'The game engine has already rejected the input as not being a complete, natural, standalone English sentence. Do not override, reverse, or debate that rejection.',
-    'Explain the exact input as a learner-facing grammar explanation, not as a game rule.',
-    'Use a structure-first method for every input:',
-    'Step 1: identify the words already present and their likely grammatical roles in observedStructure.',
-    'Step 2: identify only the additional information, relationship, or sentence structure needed to make the input complete in incompletePart.',
-    'Step 3: write a concise learner-facing explanation based on Step 1 and Step 2.',
-    'Consistency rule: do not claim that any word type, grammatical role, or sentence element is missing if your observedStructure says it is already present.',
-    'If you are uncertain about a specific grammatical label, describe the missing information more generally instead of guessing a part of speech.',
-    'Avoid terse internal labels such as "missing verb", "fragment", "parse failed", or "invalid" as the user-facing explanation.',
-    'Do not use word-specific hardcoded rules or memorize examples. Explain only what information or structure is incomplete, missing, or unnatural in the exact input.',
-    'Avoid vague alternatives like "a verb or something". Prefer the most specific missing information that follows from the observed structure.',
-    'Use plain language suitable for a learner. Return only JSON with keys: observedStructure, incompletePart, explanationEn, explanationJa, confidence.'
-  ].join(' ');
-
-  const payload = {
-    model: HF_CHAT_MODEL,
-    messages: [
-      { role:'system', content: system },
-      { role:'user', content: JSON.stringify({ input: src, diagnostics: safeDiagnostics }) }
-    ],
-    temperature: 0,
-    max_tokens: 180,
-    response_format: { type:'json_object' }
-  };
-
-  try {
-    const j = await fetchJsonWithTimeout(HF_CHAT_URL, {
-      method:'POST',
-      headers:{
-        'authorization': `Bearer ${HF_TOKEN}`,
-        'content-type': 'application/json',
-        'accept': 'application/json'
-      },
-      body: JSON.stringify(payload)
-    }, HF_TIMEOUT_MS);
-    const content = j?.choices?.[0]?.message?.content || j?.choices?.[0]?.text || '';
-    const parsed = tryExtractJson(content) || {};
-    const observedStructure = String(parsed.observedStructure || '').trim();
-    const incompletePart = String(parsed.incompletePart || '').trim();
-    const explanationEn = String(parsed.explanationEn || '').trim();
-    const explanationJa = String(parsed.explanationJa || '').trim();
-    if (!explanationEn && !explanationJa) {
-      return { ok:false, method:'hf-chat-reason-only', model:HF_CHAT_MODEL, error:'HF reason returned empty explanation', raw:j, content };
-    }
+  const words = src.split(/\s+/).filter(Boolean);
+  const lgOk = strictLinkGrammarGameOk(parsed);
+  if (lgOk) {
     return {
       ok:true,
-      method:'hf-chat-reason-only',
-      model:HF_CHAT_MODEL,
-      observedStructure,
-      incompletePart,
-      explanationEn,
-      explanationJa,
-      confidence: parsed.confidence ?? null,
-      rawReason: parsed
+      gameOk:true,
+      type:'complete_sentence',
+      method:'strict-link-grammar-only',
+      reason:'',
+      sentenceType:'complete_sentence',
+      gate:'link-grammar-only',
+      hfUsed:false
     };
-  } catch (e) {
-    return { ok:false, method:'hf-chat-reason-only', model:HF_CHAT_MODEL, error:String(e.message || e), status:e.status || null, body:e.body || null };
   }
+  return {
+    ok:false,
+    gameOk:false,
+    type: words.length <= 1 ? 'word' : 'fragment_or_invalid_order',
+    method:'strict-link-grammar-only',
+    reason:'Strict Link Grammar could not build a complete full parse with nullCount=0.',
+    sentenceType: words.length <= 1 ? 'single_word' : 'not_complete_sentence',
+    gate:'link-grammar-only',
+    hfUsed:false
+  };
 }
+
+function localReasonFromDiagnostics(text, diagnostics = {}) {
+  const src = normalizeText(text);
+  const words = src.split(/\s+/).filter(Boolean);
+  const linkages = Number(diagnostics.linkages || 0);
+  const linkGrammarOk = !!diagnostics.linkGrammarOk;
+  let observedStructure = '';
+  let incompletePart = '';
+  let explanationEn = '';
+  let explanationJa = '';
+
+  if (!src) {
+    observedStructure = 'empty input';
+    incompletePart = 'no words were provided';
+    explanationEn = 'No words were placed, so this cannot be checked as a complete English sentence.';
+    explanationJa = '単語が置かれていないため、完全な英文として判定できません。';
+  } else if (words.length === 1) {
+    observedStructure = 'single word';
+    incompletePart = 'a complete sentence needs more structure than one word';
+    explanationEn = `"${src}" is only one word. A complete English sentence normally needs enough words to form a full statement.`;
+    explanationJa = `「${src}」は単語だけです。完全な英文にするには、文として意味が完結するだけの語のつながりが必要です。`;
+  } else if (!linkGrammarOk || linkages <= 0) {
+    observedStructure = 'multiple words, but no complete strict Link Grammar linkage';
+    incompletePart = 'the placed words do not connect as one complete sentence under strict parsing';
+    explanationEn = `The words "${src}" did not form a complete strict Link Grammar parse. Some word connection is missing, extra, or in an unnatural order for a complete sentence.`;
+    explanationJa = `「${src}」は Strict Link Grammar で完全な文として結びつきませんでした。語のつながりが足りない、余っている、または語順が自然な完全英文になっていない可能性があります。`;
+  } else {
+    observedStructure = 'parser accepted structure but game rejected it by a secondary rule';
+    incompletePart = 'game acceptability rule rejected the candidate';
+    explanationEn = `The candidate "${src}" was rejected by the game acceptability rule, not by a paid AI service.`;
+    explanationJa = `「${src}」はゲーム側の成立条件で不成立になりました。有料AIサービスではなく、ローカル判定結果です。`;
+  }
+  return {
+    ok:true,
+    method:'local-link-grammar-reason-v30',
+    model:'none',
+    observedStructure,
+    incompletePart,
+    explanationEn,
+    explanationJa,
+    confidence: linkGrammarOk ? 0.7 : 0.85,
+    rawReason:{ local:true, words, diagnostics:{ linkGrammarOk, linkages, judgeSource:diagnostics.judgeSource || '' } }
+  };
+}
+
+async function judgeAcceptability(text) {
+  // v29: HF/chat acceptability judge removed. 判定は checkSentence() 側で Strict Link Grammar の結果から決める。
+  return localAcceptabilityFromLinkParser(text, { ok:true, fullParse:true, strictLinkGrammar:true, linkages:1, nullCount:0, code:0 });
+}
+
+
+
+function uniqueWordsFromArray(arr, max = 160) {
+  const out = [];
+  const seen = new Set();
+  for (const x of Array.isArray(arr) ? arr : []) {
+    const w = normalizeText(String(x || '')).replace(/[.!?]+$/,'').trim();
+    if (!w || /\s/.test(w)) continue;
+    const k = w.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(w);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+function uniqueSentence(words) {
+  return normalizeText((words || []).join(' ')).replace(/[.!?]+$/,'');
+}
+function limitedPermutations(arr, max = 120) {
+  const a = (arr || []).slice();
+  const out = [];
+  const used = Array(a.length).fill(false);
+  const cur = [];
+  const seen = new Set();
+  function rec() {
+    if (out.length >= max) return;
+    if (cur.length === a.length) {
+      const s = uniqueSentence(cur);
+      if (!seen.has(s.toLowerCase())) { seen.add(s.toLowerCase()); out.push(cur.slice()); }
+      return;
+    }
+    const local = new Set();
+    for (let i = 0; i < a.length; i++) {
+      const k = String(a[i]).toLowerCase();
+      if (used[i] || local.has(k)) continue;
+      local.add(k); used[i] = true; cur.push(a[i]); rec(); cur.pop(); used[i] = false;
+      if (out.length >= max) return;
+    }
+  }
+  rec();
+  return out;
+}
+
+async function explainByExploration(text, diagnostics = {}) {
+  const src = normalizeText(text).replace(/[.!?]+$/,'');
+  const words = src.split(/\s+/).filter(Boolean);
+  const hand = uniqueWordsFromArray(diagnostics.reasonHandCandidates || diagnostics.handCandidates || [], 24);
+  const deck = uniqueWordsFromArray(diagnostics.reasonDeckCandidates || diagnostics.reasonCandidates || diagnostics.deckCandidates || [], 140);
+  const candidates = uniqueWordsFromArray([...hand, ...deck], 160);
+  const handSet = new Set(hand.map(w => w.toLowerCase()));
+  const originalKey = src.toLowerCase();
+  const maxChecks = Math.max(30, Math.min(Number(process.env.REASON_EXPLORE_MAX_CHECKS || 180), 480));
+  const maxSuggestions = Math.max(1, Math.min(Number(process.env.REASON_EXPLORE_MAX_SUGGESTIONS || 6), 12));
+  let checks = 0;
+  const checked = new Map();
+  const suggestions = [];
+
+  async function isGood(sentence) {
+    const t = normalizeText(sentence).replace(/[.!?]+$/,'');
+    const k = t.toLowerCase();
+    if (!t || k === originalKey) return false;
+    if (checked.has(k)) return checked.get(k);
+    if (checks >= maxChecks) return false;
+    checks++;
+    const parsed = await runLinkParser(t);
+    const ok = strictLinkGrammarGameOk(parsed);
+    checked.set(k, { ok, parsed, text:t });
+    return checked.get(k);
+  }
+  async function trySuggestion(op) {
+    if (suggestions.length >= maxSuggestions) return true;
+    const sentence = uniqueSentence(op.words);
+    const r = await isGood(sentence);
+    if (r && r.ok) {
+      suggestions.push({
+        action: op.action,
+        source: op.source || 'deck',
+        candidate: op.candidate || '',
+        candidate2: op.candidate2 || '',
+        from: op.from || '',
+        to: op.to || '',
+        remove: op.remove || '',
+        sentence: r.text,
+        linkages: r.parsed.linkages,
+        fullParse: r.parsed.fullParse,
+        strictLinkGrammar: r.parsed.strictLinkGrammar
+      });
+    }
+    return suggestions.length >= maxSuggestions;
+  }
+  async function runPhase(list, fn) {
+    for (const x of list) {
+      if (checks >= maxChecks || suggestions.length >= maxSuggestions) break;
+      if (await fn(x)) break;
+    }
+  }
+
+  // 1) 現在手札での最短一手。ここが一番ゲームとして役に立つ。
+  await runPhase(hand, async c => trySuggestion({ action:'add-right', source:'hand', candidate:c, words:[...words, c] }));
+  await runPhase(hand, async c => trySuggestion({ action:'add-left', source:'hand', candidate:c, words:[c, ...words] }));
+  for (let i = 0; i < words.length && checks < maxChecks && suggestions.length < maxSuggestions; i++) {
+    await runPhase(hand, async c => {
+      if (String(c).toLowerCase() === String(words[i]).toLowerCase()) return false;
+      const nw = words.slice(); nw[i] = c;
+      return trySuggestion({ action:'replace', source:'hand', from:words[i], to:c, words:nw });
+    });
+  }
+
+  // 2) 余計なカードを外す・並べ替える。これは候補カード不要なので嘘が少ない。
+  for (let i = 0; i < words.length && checks < maxChecks && suggestions.length < maxSuggestions; i++) {
+    if (words.length <= 2) break;
+    const nw = words.slice(0,i).concat(words.slice(i+1));
+    await trySuggestion({ action:'delete', source:'board', remove:words[i], words:nw });
+  }
+  if (words.length >= 2 && words.length <= 5 && checks < maxChecks && suggestions.length < maxSuggestions) {
+    for (const perm of limitedPermutations(words, 120)) {
+      if (checks >= maxChecks || suggestions.length >= maxSuggestions) break;
+      const s = uniqueSentence(perm);
+      if (s.toLowerCase() === originalKey) continue;
+      await trySuggestion({ action:'reorder', source:'board', words:perm });
+    }
+  }
+
+  // 3) 山札/全カード候補での一手。手札に無くても「こういうカードが来たら成立」が見える。
+  const deckOnly = candidates.filter(c => !handSet.has(c.toLowerCase()));
+  await runPhase(deckOnly, async c => trySuggestion({ action:'add-right', source:'deck', candidate:c, words:[...words, c] }));
+  await runPhase(deckOnly, async c => trySuggestion({ action:'add-left', source:'deck', candidate:c, words:[c, ...words] }));
+  for (let i = 0; i < words.length && checks < maxChecks && suggestions.length < maxSuggestions; i++) {
+    await runPhase(deckOnly, async c => {
+      if (String(c).toLowerCase() === String(words[i]).toLowerCase()) return false;
+      const nw = words.slice(); nw[i] = c;
+      return trySuggestion({ action:'replace', source:'deck', from:words[i], to:c, words:nw });
+    });
+  }
+
+  // 4) 手札2枚先。探索爆発を避けるため手札だけ。
+  if (hand.length && checks < maxChecks && suggestions.length < maxSuggestions) {
+    for (let i = 0; i < hand.length && checks < maxChecks && suggestions.length < maxSuggestions; i++) {
+      for (let j = 0; j < hand.length && checks < maxChecks && suggestions.length < maxSuggestions; j++) {
+        if (i === j && hand.length > 1) continue;
+        await trySuggestion({ action:'add-two-right', source:'hand', candidate:hand[i], candidate2:hand[j], words:[...words, hand[i], hand[j]] });
+      }
+    }
+  }
+
+  const top = suggestions[0] || null;
+  let explanationJa = '';
+  let explanationEn = '';
+  if (top) {
+    const srcLabel = top.source === 'hand' ? '手札の' : (top.source === 'deck' ? '候補カードの' : '盤面の');
+    if (top.action === 'add-right') {
+      explanationJa = `${srcLabel}「${top.candidate}」を後ろに置くと英文になります。候補: ${top.sentence}`;
+      explanationEn = `Adding "${top.candidate}" after this makes a complete sentence: ${top.sentence}`;
+    } else if (top.action === 'add-left') {
+      explanationJa = `${srcLabel}「${top.candidate}」を前に置くと英文になります。候補: ${top.sentence}`;
+      explanationEn = `Adding "${top.candidate}" before this makes a complete sentence: ${top.sentence}`;
+    } else if (top.action === 'replace') {
+      explanationJa = `「${top.from}」を${srcLabel}「${top.to}」に変えると英文になります。候補: ${top.sentence}`;
+      explanationEn = `Replacing "${top.from}" with "${top.to}" makes a complete sentence: ${top.sentence}`;
+    } else if (top.action === 'delete') {
+      explanationJa = `「${top.remove}」を外すと英文になります。候補: ${top.sentence}`;
+      explanationEn = `Removing "${top.remove}" makes a complete sentence: ${top.sentence}`;
+    } else if (top.action === 'reorder') {
+      explanationJa = `カードの順番を変えると英文になります。候補: ${top.sentence}`;
+      explanationEn = `Reordering the cards makes a complete sentence: ${top.sentence}`;
+    } else if (top.action === 'add-two-right') {
+      explanationJa = `手札の「${top.candidate}」「${top.candidate2}」を続けて置くと英文になります。候補: ${top.sentence}`;
+      explanationEn = `Adding "${top.candidate}" and "${top.candidate2}" makes a complete sentence: ${top.sentence}`;
+    }
+  } else {
+    explanationJa = `Strict Link Grammarでは完全な英文になりませんでした。現在の候補カードで、${checks}通りを試しましたが成立する最短経路は見つかりませんでした。`;
+    explanationEn = `Strict Link Grammar could not build a complete sentence. I tried ${checks} candidate paths but did not find a completing path.`;
+  }
+  return {
+    ok:true,
+    method:'strict-link-grammar-exploration-v32',
+    model:'none',
+    observedStructure: top ? 'nearest successful path found by strict Link Grammar exploration' : 'no successful path found in bounded exploration',
+    incompletePart: top ? top.action : 'unknown within candidate search budget',
+    explanationEn,
+    explanationJa,
+    confidence: top ? 0.95 : 0.65,
+    suggestions,
+    rawReason:{
+      exploration:true,
+      text:src,
+      words,
+      checks,
+      maxChecks,
+      handCandidates:hand,
+      deckCandidateCount:deck.length,
+      diagnostics:{ judgeSource:diagnostics.judgeSource || '', linkages:diagnostics.linkages || 0, linkGrammarOk:!!diagnostics.linkGrammarOk }
+    }
+  };
+}
+
+async function explainRejectedSentence(text, diagnostics = {}) {
+  // v32: AI/HF/手書き文法理由ではなく、実際に Strict Link Grammar が成立する最短経路を探索して理由にする。
+  return explainByExploration(text, diagnostics);
+}
+
 
 async function translateByGoogleGtx(text) {
   const q = normalizeText(text).replace(/[.!?]+$/, '');
@@ -692,8 +893,7 @@ async function checkSentence(text, withTranslate = false, reasonMeta = {}) {
   const proof = await proofreadEnglish(originalText);
   const checkedText = proof.corrected || originalText;
   const parsed = await runLinkParser(checkedText);
-
-  const acceptability = await judgeAcceptability(checkedText);
+  const acceptability = localAcceptabilityFromLinkParser(checkedText, parsed);
 
   if (!parsed.ok) {
     const type = acceptability.type || 'invalid';
@@ -708,7 +908,7 @@ async function checkSentence(text, withTranslate = false, reasonMeta = {}) {
     }
     return {
       originalText, text: checkedText, normalized: proof.normalized, appliedCorrections: proof.appliedCorrections || [],
-      ok: gameOk, gameOk, type, kind:'Link Grammar + HF Reason Job',
+      ok: gameOk, gameOk, type, kind:'Strict Link Grammar ONLY + Exploration Reason Queue',
       sentenceType: gameOk ? (acceptability.sentenceType || 'complete_sentence') : (acceptability.sentenceType || type),
       reason: gameOk ? '' : (reasonExplain?.explanationJa || reasonExplain?.explanationEn || ''),
       reasonSource: gameOk ? '' : (reasonExplain?.ok ? reasonExplain.method : 'reason-job-pending'),
@@ -729,12 +929,12 @@ async function checkSentence(text, withTranslate = false, reasonMeta = {}) {
   let reasonJob = null;
   if (gameOk && withTranslate) translation = await translateToJapanese(checkedText);
   if (!gameOk) {
-    reasonJob = enqueueReasonJob(checkedText, { judgeSource:'link-grammar-plus-hf-chat', linkGrammarOk:true, linkages:parsed.linkages, ...reasonMeta });
+    reasonJob = enqueueReasonJob(checkedText, { judgeSource:'link-grammar', linkGrammarOk:true, linkages:parsed.linkages, ...reasonMeta });
     if (reasonJob?.status === 'success') reasonExplain = reasonJob.result;
   }
   return {
     originalText, text: checkedText, normalized: proof.normalized, appliedCorrections: proof.appliedCorrections || [],
-    ok, gameOk, type, kind:'Link Grammar + HF Reason Job',
+    ok, gameOk, type, kind:'Strict Link Grammar ONLY + Exploration Reason Queue',
     sentenceType: gameOk ? (acceptability.sentenceType || 'complete_sentence') : (acceptability.sentenceType || type),
     reason: gameOk ? '' : (reasonExplain?.explanationJa || reasonExplain?.explanationEn || ''),
     reasonSource: gameOk ? '' : (reasonExplain?.ok ? reasonExplain.method : 'reason-job-pending'),
@@ -778,7 +978,7 @@ async function checkSentenceBatch(req) {
     while (next < items.length) {
       const item = items[next++];
       try {
-        const checked = await checkSentence(item.text, true, { reasonPriorityEpoch: j.reasonPriorityEpoch || j.reasonEpoch || Date.now(), reasonPrioritySeq: Number(item.id || 0) });
+        const checked = await checkSentence(item.text, true, { reasonPriorityEpoch: j.reasonPriorityEpoch || j.reasonEpoch || Date.now(), reasonPrioritySeq: Number(item.id || 0), words:item.words, reasonHandCandidates:j.reasonHandCandidates || j.handCandidates || [], reasonDeckCandidates:j.reasonDeckCandidates || j.reasonCandidates || j.deckCandidates || [] });
         const accept = checked.acceptability || {};
         const type = accept.type || (checked.gameOk ? 'complete_sentence' : (checked.fullParse ? 'fragment' : 'invalid'));
         const gameOk = !!(checked.ok && checked.gameOk && (accept.gameOk !== false) && type === 'complete_sentence');
@@ -1062,14 +1262,19 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-reason-job-v26-no-instant-terminal-reuse',
+        mode:'link-grammar-strict-only-v32-exploration-reasons',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
+        reasonProvider:'strict-link-grammar-exploration',
+        quotaFree:true,
+        hfDisabledForReason:true,
+        hfDisabledForAcceptability:true,
+        acceptanceGate:'strict-link-grammar-only',
         pixabayKeyPresent: !!PIXABAY_API_KEY,
         hfModelScanVersion: 'v2-no-generation-params-for-classifiers',
         hfModelScanModels: HF_SCAN_MODELS,
-        reasonJobs: { size: reasonJobs.size, running: reasonQueueRunning, maxAttempts: REASON_JOB_MAX_ATTEMPTS, rawMaxAttempts: REASON_JOB_MAX_ATTEMPTS_RAW, stats: reasonStats, successCacheSize: [...reasonJobs.values()].filter(j=>j.status==='success').length, pendingSize: [...reasonJobs.values()].filter(j=>!['success','failure','failed','error','cancelled','canceled'].includes(String(j.status||'').toLowerCase())).length }
+        reasonJobs: { size: reasonJobs.size, running: reasonQueueRunning, maxAttempts: REASON_JOB_MAX_ATTEMPTS, rawMaxAttempts: REASON_JOB_MAX_ATTEMPTS_RAW, stats: reasonStats, successCacheSize: [...reasonJobs.values()].filter(j=>j.status==='success').length, pendingSize: [...reasonJobs.values()].filter(j=>!['success','failure','failed','error','cancelled','canceled','unavailable'].includes(String(j.status||'').toLowerCase())).length }
       });
     }
     if (url.pathname === '/proof') {
@@ -1099,6 +1304,26 @@ const server = http.createServer(async (req, res) => {
       if (!text) return send(res, 400, { ok:false, error:'empty text' });
       return send(res, 200, { text, ...(await judgeAcceptability(text)) });
     }
+    if (url.pathname === '/reason-selftest') {
+      const text = normalizeText(url.searchParams.get('text') || 'I am');
+      const startedAt = Date.now();
+      const r = await explainRejectedSentence(text, { judgeSource:'manual-selftest' });
+      return send(res, 200, {
+        ok: !!(r?.ok && (String(r.explanationJa||'').trim() || String(r.explanationEn||'').trim())),
+        text,
+        elapsedMs: Date.now() - startedAt,
+        hfTokenPresent: !!HF_TOKEN,
+        reasonProvider:'strict-link-grammar-exploration',
+        quotaFree:true,
+        hfDisabledForReason:true,
+        hfDisabledForAcceptability:true,
+        acceptanceGate:'strict-link-grammar-only',
+        hfChatModel: HF_CHAT_MODEL,
+        hfChatUrl: HF_CHAT_URL,
+        result: r
+      });
+    }
+
     if (url.pathname === '/reason-job') {
       const text = await getTextFromReq(req, url);
       if (!text) return send(res, 400, { ok:false, error:'empty text' });
@@ -1124,6 +1349,25 @@ const server = http.createServer(async (req, res) => {
       if (job?.status === 'success') return send(res, 200, { text, ...job.result, reasonJobId:job.id, reasonStatus:'success' });
       return send(res, 200, { text, ok:false, reasonJobId:job?.id || '', reasonStatus:job?.status || 'pending', ...publicReasonJob(job) });
     }
+    if (url.pathname === '/link-test') {
+      const text = await getTextFromReq(req, url);
+      if (!text) return send(res, 400, { ok:false, error:'empty text' });
+      const parsed = await runLinkParser(text);
+      return send(res, 200, {
+        text: normalizeText(text),
+        ok: strictLinkGrammarGameOk(parsed),
+        gate: 'strict-link-grammar-only',
+        hfUsed: false,
+        fullParse: parsed.fullParse,
+        strictLinkGrammar: parsed.strictLinkGrammar,
+        linkages: parsed.linkages,
+        nullCount: parsed.nullCount,
+        stdout: parsed.stdout,
+        stderr: parsed.stderr,
+        code: parsed.code
+      });
+    }
+
     if (url.pathname === '/check-and-translate-batch') {
       if (req.method !== 'POST') return send(res, 405, { ok:false, error:'POST required' });
       return send(res, 200, await checkSentenceBatch(req));
@@ -1140,7 +1384,10 @@ const server = http.createServer(async (req, res) => {
       if (!text) return send(res, 400, { ok:false, error:'empty text' });
       const reasonMeta = {
         reasonPriorityEpoch: body.reasonPriorityEpoch || body.reasonEpoch || Number(url.searchParams.get('reasonPriorityEpoch') || 0),
-        reasonPrioritySeq: body.reasonPrioritySeq || body.reasonSeq || Number(url.searchParams.get('reasonPrioritySeq') || 0)
+        reasonPrioritySeq: body.reasonPrioritySeq || body.reasonSeq || Number(url.searchParams.get('reasonPrioritySeq') || 0),
+        words: Array.isArray(body.words) ? body.words : [],
+        reasonHandCandidates: body.reasonHandCandidates || body.handCandidates || [],
+        reasonDeckCandidates: body.reasonDeckCandidates || body.reasonCandidates || body.deckCandidates || []
       };
       return send(res, 200, await checkSentence(text, url.pathname === '/check-and-translate', reasonMeta));
     }
@@ -1150,4 +1397,4 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => console.log(`Link Grammar + HF Chat Acceptability API listening on ${PORT}`));
+server.listen(PORT, () => console.log(`Strict Link Grammar v32 Exploration API listening on ${PORT}`));
