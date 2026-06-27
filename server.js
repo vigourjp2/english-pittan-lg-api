@@ -16,6 +16,50 @@ const HF_CHAT_MODEL = process.env.HF_CHAT_MODEL || 'deepseek-ai/DeepSeek-R1:fast
 const HF_CHAT_URL = process.env.HF_CHAT_URL || 'https://router.huggingface.co/v1/chat/completions';
 const MYMEMORY_EMAIL = process.env.MYMEMORY_EMAIL || '';
 const translateCache = new Map();
+const hfAcceptabilityCache = new Map();
+const hfReasonCache = new Map();
+const HF_CHAT_RETRIES = Math.max(0, Math.min(Number(process.env.HF_CHAT_RETRIES || 2), 5));
+const HF_CHAT_RETRY_DELAY_MS = Number(process.env.HF_CHAT_RETRY_DELAY_MS || 900);
+let hfChatQueue = Promise.resolve();
+
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+function cacheSet(map, key, value, max = 500) {
+  map.set(key, value);
+  if (map.size > max) map.delete(map.keys().next().value);
+  return value;
+}
+function isTransientHfError(e) {
+  const status = Number(e?.status || 0);
+  const msg = String(e?.message || e || '').toLowerCase();
+  return !status || status === 408 || status === 409 || status === 425 || status === 429 || status >= 500 || /fetch failed|timeout|aborted|network|temporarily|overloaded|rate/.test(msg);
+}
+async function callHfChatQueued(payload, timeoutMs = HF_TIMEOUT_MS) {
+  const task = async () => {
+    let lastErr = null;
+    for (let attempt = 0; attempt <= HF_CHAT_RETRIES; attempt++) {
+      try {
+        return await fetchJsonWithTimeout(HF_CHAT_URL, {
+          method: 'POST',
+          headers: {
+            'authorization': `Bearer ${HF_TOKEN}`,
+            'content-type': 'application/json',
+            'accept': 'application/json'
+          },
+          body: JSON.stringify(payload)
+        }, timeoutMs);
+      } catch (e) {
+        lastErr = e;
+        if (attempt >= HF_CHAT_RETRIES || !isTransientHfError(e)) throw e;
+        await sleep(HF_CHAT_RETRY_DELAY_MS * (attempt + 1));
+      }
+    }
+    throw lastErr || new Error('HF chat unavailable');
+  };
+  // Serialize HF chat calls. Router/provider errors were happening when many candidate checks hit HF at once.
+  const p = hfChatQueue.then(task, task);
+  hfChatQueue = p.catch(() => {});
+  return p;
+}
 
 function send(res, code, obj) {
   res.writeHead(code, {
@@ -310,7 +354,10 @@ async function scanHfModels(text, modelFilter = '') {
 }
 
 async function judgeAcceptability(text) {
-  if (!HF_TOKEN) return { ok:false, method:'hf-chat', model:HF_CHAT_MODEL, reason:'HF_TOKEN is not set' };
+  const src = normalizeText(text);
+  const cacheKey = src.toLowerCase();
+  if (hfAcceptabilityCache.has(cacheKey)) return { ...hfAcceptabilityCache.get(cacheKey), cached:true };
+  if (!HF_TOKEN) return { ok:false, method:'hf-chat', model:HF_CHAT_MODEL, reason:'acceptability unavailable', infraError:true };
 
   const system = [
     'You are a strict English sentence acceptability judge for a children\'s word-order game.',
@@ -324,7 +371,7 @@ async function judgeAcceptability(text) {
     model: HF_CHAT_MODEL,
     messages: [
       { role: 'system', content: system },
-      { role: 'user', content: `INPUT: ${JSON.stringify(normalizeText(text))}` }
+      { role: 'user', content: `INPUT: ${JSON.stringify(src)}` }
     ],
     temperature: 0,
     max_tokens: 80,
@@ -332,21 +379,13 @@ async function judgeAcceptability(text) {
   };
 
   try {
-    const j = await fetchJsonWithTimeout(HF_CHAT_URL, {
-      method: 'POST',
-      headers: {
-        'authorization': `Bearer ${HF_TOKEN}`,
-        'content-type': 'application/json',
-        'accept': 'application/json'
-      },
-      body: JSON.stringify(payload)
-    }, HF_TIMEOUT_MS);
+    const j = await callHfChatQueued(payload, HF_TIMEOUT_MS);
     const content = j?.choices?.[0]?.message?.content || j?.choices?.[0]?.text || '';
     const parsed = tryExtractJson(content);
     if (!parsed || typeof parsed.ok !== 'boolean') {
       return { ok:false, method:'hf-chat', model:HF_CHAT_MODEL, reason:'HF chat returned non-JSON decision', raw:j, content };
     }
-    return {
+    return cacheSet(hfAcceptabilityCache, cacheKey, {
       ok: !!parsed.ok,
       gameOk: parsed.gameOk !== undefined ? !!parsed.gameOk : !!parsed.ok,
       type: String(parsed.type || (parsed.ok ? 'complete_sentence' : 'invalid')),
@@ -355,14 +394,17 @@ async function judgeAcceptability(text) {
       reason: parsed.ok ? '' : String(parsed.reason || 'rejected by acceptability judge'),
       sentenceType: String(parsed.sentenceType || (parsed.ok ? 'HF_CHAT_ACCEPTED' : 'HF_CHAT_REJECTED')),
       rawDecision: parsed
-    };
+    });
   } catch (e) {
     return {
       ok:false,
+      gameOk:false,
       method:'hf-chat',
       model:HF_CHAT_MODEL,
-      reason:'HF chat acceptability service failed',
-      error:{ message:String(e.message || e), status:e.status || null, body:e.body || null }
+      type:'unavailable',
+      reason:'acceptability unavailable',
+      infraError:true,
+      error:{ message:String(e.message || e), status:e.status || null }
     };
   }
 }
@@ -370,8 +412,10 @@ async function judgeAcceptability(text) {
 
 async function explainRejectedSentence(text, diagnostics = {}) {
   const src = normalizeText(text);
+  const cacheKey = src.toLowerCase();
+  if (hfReasonCache.has(cacheKey)) return { ...hfReasonCache.get(cacheKey), cached:true };
   if (!src) return { ok:false, method:'hf-chat-reason-only', model:HF_CHAT_MODEL, error:'empty text' };
-  if (!HF_TOKEN) return { ok:false, method:'hf-chat-reason-only', model:HF_CHAT_MODEL, error:'HF_TOKEN is not set' };
+  if (!HF_TOKEN) return { ok:false, method:'hf-chat-reason-only', model:HF_CHAT_MODEL, error:'reason explanation unavailable', infraError:true };
 
   const safeDiagnostics = {
     judgeSource: diagnostics.judgeSource || 'link-grammar',
@@ -407,15 +451,7 @@ async function explainRejectedSentence(text, diagnostics = {}) {
   };
 
   try {
-    const j = await fetchJsonWithTimeout(HF_CHAT_URL, {
-      method:'POST',
-      headers:{
-        'authorization': `Bearer ${HF_TOKEN}`,
-        'content-type': 'application/json',
-        'accept': 'application/json'
-      },
-      body: JSON.stringify(payload)
-    }, HF_TIMEOUT_MS);
+    const j = await callHfChatQueued(payload, HF_TIMEOUT_MS);
     const content = j?.choices?.[0]?.message?.content || j?.choices?.[0]?.text || '';
     const parsed = tryExtractJson(content) || {};
     const observedStructure = String(parsed.observedStructure || '').trim();
@@ -425,7 +461,7 @@ async function explainRejectedSentence(text, diagnostics = {}) {
     if (!explanationEn && !explanationJa) {
       return { ok:false, method:'hf-chat-reason-only', model:HF_CHAT_MODEL, error:'HF reason returned empty explanation', raw:j, content };
     }
-    return {
+    return cacheSet(hfReasonCache, cacheKey, {
       ok:true,
       method:'hf-chat-reason-only',
       model:HF_CHAT_MODEL,
@@ -435,9 +471,9 @@ async function explainRejectedSentence(text, diagnostics = {}) {
       explanationJa,
       confidence: parsed.confidence ?? null,
       rawReason: parsed
-    };
+    });
   } catch (e) {
-    return { ok:false, method:'hf-chat-reason-only', model:HF_CHAT_MODEL, error:String(e.message || e), status:e.status || null, body:e.body || null };
+    return { ok:false, method:'hf-chat-reason-only', model:HF_CHAT_MODEL, error:'reason explanation unavailable', infraError:true, status:e.status || null };
   }
 }
 
@@ -507,7 +543,7 @@ async function checkSentence(text, withTranslate = false) {
       originalText, text: checkedText, normalized: proof.normalized, appliedCorrections: proof.appliedCorrections || [],
       ok: gameOk, gameOk, type, kind:'Link Grammar + HF Chat Acceptability + HF Reason Explain',
       sentenceType: gameOk ? (acceptability.sentenceType || 'complete_sentence') : (acceptability.sentenceType || type),
-      reason: gameOk ? '' : (reasonExplain?.explanationJa || reasonExplain?.explanationEn || acceptability.reason || 'link grammar parse failed'),
+      reason: gameOk ? '' : (reasonExplain?.explanationJa || reasonExplain?.explanationEn || ''),
       reasonSource: gameOk ? '' : (reasonExplain?.ok ? reasonExplain.method : 'hf-chat-reason-only-failed'),
       reasonExplain, proof,
       fullParse: parsed.fullParse, strictLinkGrammar: parsed.strictLinkGrammar,
@@ -535,7 +571,7 @@ async function checkSentence(text, withTranslate = false) {
     originalText, text: checkedText, normalized: proof.normalized, appliedCorrections: proof.appliedCorrections || [],
     ok, gameOk, type, kind:'Link Grammar + HF Chat Acceptability + HF Reason Explain',
     sentenceType: gameOk ? (acceptability.sentenceType || 'complete_sentence') : (acceptability.sentenceType || type),
-    reason: gameOk ? '' : (reasonExplain?.explanationJa || reasonExplain?.explanationEn || acceptability.reason || 'acceptability rejected'),
+    reason: gameOk ? '' : (reasonExplain?.explanationJa || reasonExplain?.explanationEn || ''),
     reasonSource: gameOk ? '' : (reasonExplain?.ok ? reasonExplain.method : 'hf-chat-reason-only-failed'),
     reasonExplain, proof,
     fullParse: parsed.fullParse, strictLinkGrammar: parsed.strictLinkGrammar,
@@ -590,7 +626,7 @@ async function checkSentenceBatch(req) {
           type,
           sentenceType: checked.sentenceType || accept.sentenceType || type,
           kind: checked.kind || 'API判定',
-          reason: checked.reason || checked.reasonExplain?.explanationJa || checked.reasonExplain?.explanationEn || accept.reason || '',
+          reason: checked.reasonExplain?.explanationJa || checked.reasonExplain?.explanationEn || checked.reason || accept.reason || '',
           reasonSource: checked.reasonSource || checked.reasonExplain?.method || '',
           ja: gameOk ? (checked.ja || checked.translation?.ja || '') : '',
           fullParse: checked.fullParse,
@@ -619,12 +655,15 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-plus-hf-chat-acceptability-plus-hf-reason-explain-v3-structure-first',
+        mode:'link-grammar-plus-hf-chat-acceptability-plus-hf-reason-explain-v4-queued-retry-cache',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
         hfModelScanVersion: 'v2-no-generation-params-for-classifiers',
-        hfModelScanModels: HF_SCAN_MODELS
+        hfModelScanModels: HF_SCAN_MODELS,
+        hfChatRetries: HF_CHAT_RETRIES,
+        hfAcceptabilityCacheSize: hfAcceptabilityCache.size,
+        hfReasonCacheSize: hfReasonCache.size
       });
     }
     if (url.pathname === '/proof') {
