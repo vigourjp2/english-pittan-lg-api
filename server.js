@@ -190,21 +190,71 @@ function hfModelPath(model) {
   return String(model || '').split('/').map(encodeURIComponent).join('/');
 }
 
-function summarizeHfOutput(model, data) {
+const HF_GENERATION_MODEL_RE = /(t5|grammar-correction|grammar-checker|correction-model|text2text|bart|pegasus)/i;
+
+function hfModelKind(model) {
+  return HF_GENERATION_MODEL_RE.test(String(model || '')) ? 'text-generation' : 'classification';
+}
+
+function hfPayloadForModel(model, text, variant = 0) {
+  const src = normalizeText(text);
+  const kind = hfModelKind(model);
+  if (kind === 'classification') {
+    // Classification/CoLA models must NOT receive generation params such as max_new_tokens.
+    // That caused: PreTrainedTokenizerFast.__call__() got an unexpected keyword argument 'max_new_tokens'.
+    return {
+      kind,
+      inputUsed: src,
+      payload: {
+        inputs: src,
+        options: { wait_for_model: true }
+      }
+    };
+  }
+
+  // Text-to-text grammar correction models are inconsistent. Try plain input first, then a grammar prefix.
+  const inputUsed = variant === 1 ? `grammar: ${src}` : src;
+  return {
+    kind,
+    inputUsed,
+    payload: {
+      inputs: inputUsed,
+      options: { wait_for_model: true },
+      parameters: { max_new_tokens: 80 }
+    }
+  };
+}
+
+function summarizeHfOutput(model, data, meta = {}) {
   const raw = data;
   const flat = Array.isArray(data) && Array.isArray(data[0]) ? data[0] : data;
   const labels = [];
   if (Array.isArray(flat)) {
-    for (const x of flat.slice(0, 8)) {
+    for (const x of flat.slice(0, 12)) {
       if (x && typeof x === 'object') labels.push({ label: x.label, score: x.score });
     }
   }
   let generatedText = '';
   if (Array.isArray(data) && data[0]?.generated_text) generatedText = String(data[0].generated_text || '');
+  else if (Array.isArray(data) && data[0]?.summary_text) generatedText = String(data[0].summary_text || '');
   else if (data?.generated_text) generatedText = String(data.generated_text || '');
+  else if (data?.summary_text) generatedText = String(data.summary_text || '');
+
   const error = data?.error || data?.message || '';
   const top = labels.slice().sort((a,b)=>(Number(b.score)||0)-(Number(a.score)||0))[0] || null;
-  return { model, ok: !error, error, top, labels, generatedText, raw };
+  return { model, ok: !error, error, top, labels, generatedText, raw, ...meta };
+}
+
+async function postHfModelEndpoint(endpoint, payload) {
+  return fetchJsonWithTimeout(endpoint, {
+    method: 'POST',
+    headers: {
+      'authorization': `Bearer ${HF_TOKEN}`,
+      'content-type': 'application/json',
+      'accept': 'application/json'
+    },
+    body: JSON.stringify(payload)
+  }, HF_MODEL_SCAN_TIMEOUT_MS);
 }
 
 async function callHfInferenceModel(model, text) {
@@ -215,29 +265,31 @@ async function callHfInferenceModel(model, text) {
     `https://router.huggingface.co/hf-inference/models/${path}`,
     `https://api-inference.huggingface.co/models/${path}`
   ];
-  const payload = {
-    inputs: src,
-    options: { wait_for_model: true },
-    parameters: { max_new_tokens: 80, return_all_scores: true }
-  };
+  const kind = hfModelKind(model);
+  const variants = kind === 'text-generation' ? [0, 1] : [0];
   const attempts = [];
-  for (const endpoint of urls) {
-    try {
-      const data = await fetchJsonWithTimeout(endpoint, {
-        method: 'POST',
-        headers: {
-          'authorization': `Bearer ${HF_TOKEN}`,
-          'content-type': 'application/json',
-          'accept': 'application/json'
-        },
-        body: JSON.stringify(payload)
-      }, HF_MODEL_SCAN_TIMEOUT_MS);
-      return { provider:'hf-inference', endpoint, ...summarizeHfOutput(model, data) };
-    } catch (e) {
-      attempts.push({ endpoint, error:String(e.message || e), status:e.status || null, body:e.body || null });
+
+  for (const variant of variants) {
+    const { payload, inputUsed } = hfPayloadForModel(model, src, variant);
+    for (const endpoint of urls) {
+      try {
+        const data = await postHfModelEndpoint(endpoint, payload);
+        return { provider:'hf-inference', endpoint, ...summarizeHfOutput(model, data, { kind, inputUsed, variant }) };
+      } catch (e) {
+        attempts.push({
+          endpoint,
+          kind,
+          inputUsed,
+          variant,
+          payload,
+          error:String(e.message || e),
+          status:e.status || null,
+          body:e.body || null
+        });
+      }
     }
   }
-  return { model, ok:false, provider:'hf-inference', error:'all HF inference endpoints failed', attempts };
+  return { model, ok:false, kind, provider:'hf-inference', error:'all HF inference endpoints failed', attempts };
 }
 
 async function scanHfModels(text, modelFilter = '') {
@@ -247,7 +299,14 @@ async function scanHfModels(text, modelFilter = '') {
   for (const model of models) {
     results.push(await callHfInferenceModel(model, src));
   }
-  return { ok:true, text:src, count:results.length, models, results };
+  return {
+    ok:true,
+    version:'hf-model-scan-v2-no-generation-params-for-classifiers',
+    text:src,
+    count:results.length,
+    models,
+    results
+  };
 }
 
 async function judgeAcceptability(text) {
@@ -465,6 +524,7 @@ const server = http.createServer(async (req, res) => {
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
+        hfModelScanVersion: 'v2-no-generation-params-for-classifiers',
         hfModelScanModels: HF_SCAN_MODELS
       });
     }
@@ -479,7 +539,7 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { text, ...(await translateToJapanese(text)) });
     }
 
-    if (url.pathname === '/hf-model-scan') {
+    if (url.pathname === '/hf-model-scan' || url.pathname === '/hf-model-scan-v2') {
       const text = await getTextFromReq(req, url);
       if (!text) return send(res, 400, { ok:false, error:'empty text' });
       return send(res, 200, await scanHfModels(text, url.searchParams.get('model') || ''));
