@@ -6,7 +6,7 @@ const ALLOW_ORIGIN = process.env.ALLOW_ORIGIN || '*';
 const MAX_CHARS = Number(process.env.MAX_CHARS || 180);
 const LINK_TIMEOUT_MS = Number(process.env.LINK_TIMEOUT_MS || 3500);
 const LT_TIMEOUT_MS = Number(process.env.LT_TIMEOUT_MS || 5000);
-const HF_TIMEOUT_MS = Number(process.env.HF_TIMEOUT_MS || 25000);
+const HF_TIMEOUT_MS = Number(process.env.HF_TIMEOUT_MS || 35000);
 const HF_MODEL_SCAN_TIMEOUT_MS = Number(process.env.HF_MODEL_SCAN_TIMEOUT_MS || 20000);
 const HF_SCAN_MODELS = (process.env.HF_SCAN_MODELS || 'textattack/roberta-base-CoLA,cointegrated/roberta-large-cola-krishna2020,mrm8488/deberta-v3-small-finetuned-cola,EstherT/sentence-acceptability,nikolasmoya/c4-binary-english-grammar-checker,vennify/t5-base-grammar-correction,samadpls/t5-base-grammar-checker,hassaanik/grammar-correction-model').split(',').map(s => s.trim()).filter(Boolean);
 
@@ -18,8 +18,8 @@ const MYMEMORY_EMAIL = process.env.MYMEMORY_EMAIL || '';
 const translateCache = new Map();
 const hfAcceptabilityCache = new Map();
 const hfReasonCache = new Map();
-const HF_CHAT_RETRIES = Math.max(0, Math.min(Number(process.env.HF_CHAT_RETRIES || 2), 5));
-const HF_CHAT_RETRY_DELAY_MS = Number(process.env.HF_CHAT_RETRY_DELAY_MS || 900);
+const HF_CHAT_RETRIES = Math.max(0, Math.min(Number(process.env.HF_CHAT_RETRIES || 4), 8));
+const HF_CHAT_RETRY_DELAY_MS = Number(process.env.HF_CHAT_RETRY_DELAY_MS || 1200);
 let hfChatQueue = Promise.resolve();
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
@@ -409,13 +409,49 @@ async function judgeAcceptability(text) {
   }
 }
 
+function makeFallbackReason(text, diagnostics = {}, why = '') {
+  const src = normalizeText(text);
+  const words = src.split(/\s+/).filter(Boolean);
+  const quoted = src ? `「${src}」` : 'この入力';
+  let observedStructure = `tokens: ${words.join(' ')}`;
+  let incompletePart = 'complete standalone sentence structure could not be confirmed';
+  let explanationEn = `${quoted} could not be confirmed as a complete natural English sentence. Check how the existing words connect, and add or rearrange the information needed to make one complete sentence.`;
+  let explanationJa = `${quoted} は、完全で自然な英文としてのつながりを確認できませんでした。単語同士のつながりを見直し、1つの文として必要な情報を足すか、語順を整えてください。`;
+  // Very broad structural fallback only. This is not a word-specific game rule; it is a last-resort explanation when external reason generation is unavailable.
+  if (words.length === 1) {
+    incompletePart = 'more sentence elements are needed';
+    explanationEn = `${quoted} is only one word, so it does not yet form a complete standalone sentence. Add the words needed to say who or what is doing something, or what is being described.`;
+    explanationJa = `${quoted} は1語だけなので、まだ完全な英文になっていません。誰・何について述べるのか、何をする/どんな状態なのかが分かるように語を足してください。`;
+  } else if (words.length === 2) {
+    incompletePart = 'the relationship between the two words is not enough to form a complete standalone sentence';
+    explanationEn = `${quoted} has two words, but they do not provide enough structure or information for a complete standalone sentence. Add the missing information or adjust the word order so the sentence clearly says one complete idea.`;
+    explanationJa = `${quoted} は2語ありますが、それだけでは1つの自然な英文として十分な情報や構造になっていません。不足している情報を足すか、語順を整えて、1つの意味が完成する形にしてください。`;
+  } else if (words.length >= 5) {
+    incompletePart = 'the sequence appears to contain extra or disconnected parts';
+    explanationEn = `${quoted} contains several words, but the parts do not connect cleanly as one complete sentence. Split it into separate sentences, add a connector, or rearrange/remove extra words so the grammar is clear.`;
+    explanationJa = `${quoted} は複数の語が並んでいますが、1つの英文として自然につながっていません。文を分ける、接続語を足す、余っている語を減らす/並べ替えるなどして、文の構造をはっきりさせてください。`;
+  }
+  return {
+    ok: true,
+    method: 'fallback-structure-reason',
+    model: 'local-structural-fallback',
+    observedStructure,
+    incompletePart,
+    explanationEn,
+    explanationJa,
+    confidence: 'fallback',
+    fallback: true,
+    fallbackCause: String(why || diagnostics?.error || '')
+  };
+}
+
 
 async function explainRejectedSentence(text, diagnostics = {}) {
   const src = normalizeText(text);
   const cacheKey = src.toLowerCase();
   if (hfReasonCache.has(cacheKey)) return { ...hfReasonCache.get(cacheKey), cached:true };
   if (!src) return { ok:false, method:'hf-chat-reason-only', model:HF_CHAT_MODEL, error:'empty text' };
-  if (!HF_TOKEN) return { ok:false, method:'hf-chat-reason-only', model:HF_CHAT_MODEL, error:'reason explanation unavailable', infraError:true };
+  if (!HF_TOKEN) return makeFallbackReason(src, diagnostics, 'HF token missing');
 
   const safeDiagnostics = {
     judgeSource: diagnostics.judgeSource || 'link-grammar',
@@ -459,7 +495,7 @@ async function explainRejectedSentence(text, diagnostics = {}) {
     const explanationEn = String(parsed.explanationEn || '').trim();
     const explanationJa = String(parsed.explanationJa || '').trim();
     if (!explanationEn && !explanationJa) {
-      return { ok:false, method:'hf-chat-reason-only', model:HF_CHAT_MODEL, error:'HF reason returned empty explanation', raw:j, content };
+      return cacheSet(hfReasonCache, cacheKey, makeFallbackReason(src, diagnostics, 'HF reason returned empty explanation')); 
     }
     return cacheSet(hfReasonCache, cacheKey, {
       ok:true,
@@ -473,7 +509,7 @@ async function explainRejectedSentence(text, diagnostics = {}) {
       rawReason: parsed
     });
   } catch (e) {
-    return { ok:false, method:'hf-chat-reason-only', model:HF_CHAT_MODEL, error:'reason explanation unavailable', infraError:true, status:e.status || null };
+    return cacheSet(hfReasonCache, cacheKey, makeFallbackReason(src, { ...diagnostics, error:String(e.message || e), status:e.status || null }, 'HF reason request failed')); 
   }
 }
 
@@ -522,36 +558,35 @@ async function checkSentence(text, withTranslate = false) {
   const checkedText = proof.corrected || originalText;
   const parsed = await runLinkParser(checkedText);
 
-  const acceptability = await judgeAcceptability(checkedText);
-
+  // v7 root-cause fix:
+  // Link Grammar NG already decides the game result. The previous flow still called
+  // HF acceptability first, then reason-explain, so one rejected candidate could
+  // spend two HF chat calls. With several board candidates this caused queue buildup,
+  // timeouts, and `unavailable`/service-failed labels leaking into the UI.
+  // Correct flow: LG NG => game NG + reason-explain only. Do NOT skip the reason.
   if (!parsed.ok) {
-    const type = acceptability.type || 'invalid';
-    const gameOk = !!(acceptability.ok && acceptability.gameOk !== false && type === 'complete_sentence');
-    let translation = null;
-    let reasonExplain = null;
-    if (gameOk && withTranslate) translation = await translateToJapanese(checkedText);
-    if (!gameOk) {
-      reasonExplain = await explainRejectedSentence(checkedText, {
-        judgeSource:'link-grammar-plus-hf-chat',
-        linkGrammarOk:false,
-        linkages:parsed.linkages,
-        // Do not pass HF acceptability's terse/raw reason here.
-        // It can bias the reason-only model toward bad labels such as "missing verb".
-      });
-    }
+    const type = 'invalid';
+    const gameOk = false;
+    const reasonExplain = await explainRejectedSentence(checkedText, {
+      judgeSource:'link-grammar-direct-reason',
+      linkGrammarOk:false,
+      linkages:parsed.linkages
+    });
     return {
       originalText, text: checkedText, normalized: proof.normalized, appliedCorrections: proof.appliedCorrections || [],
-      ok: gameOk, gameOk, type, kind:'Link Grammar + HF Chat Acceptability + HF Reason Explain',
-      sentenceType: gameOk ? (acceptability.sentenceType || 'complete_sentence') : (acceptability.sentenceType || type),
-      reason: gameOk ? '' : (reasonExplain?.explanationJa || reasonExplain?.explanationEn || ''),
-      reasonSource: gameOk ? '' : (reasonExplain?.ok ? reasonExplain.method : 'hf-chat-reason-only-failed'),
+      ok:false, gameOk, type, kind:'Link Grammar NG + HF Reason Explain',
+      sentenceType:type,
+      reason: reasonExplain?.explanationJa || reasonExplain?.explanationEn || '',
+      reasonSource: reasonExplain?.ok ? reasonExplain.method : 'hf-chat-reason-only-failed',
       reasonExplain, proof,
       fullParse: parsed.fullParse, strictLinkGrammar: parsed.strictLinkGrammar,
       linkages: parsed.linkages, nullCount: parsed.nullCount, stdout: parsed.stdout, stderr: parsed.stderr, code: parsed.code,
-      acceptability, ja: translation?.ja || '', translation
+      acceptability:{ skipped:true, reason:'Link Grammar NG; HF acceptability skipped so HF capacity is reserved for reason explanation.' },
+      ja:'', translation:null
     };
   }
 
+  const acceptability = await judgeAcceptability(checkedText);
   const ok = !!acceptability.ok;
   const type = acceptability.type || (ok ? 'complete_sentence' : 'invalid');
   const gameOk = !!(ok && acceptability.gameOk !== false && type === 'complete_sentence');
@@ -569,7 +604,7 @@ async function checkSentence(text, withTranslate = false) {
   }
   return {
     originalText, text: checkedText, normalized: proof.normalized, appliedCorrections: proof.appliedCorrections || [],
-    ok, gameOk, type, kind:'Link Grammar + HF Chat Acceptability + HF Reason Explain',
+    ok, gameOk, type, kind:'Link Grammar OK + HF Acceptability + HF Reason Explain',
     sentenceType: gameOk ? (acceptability.sentenceType || 'complete_sentence') : (acceptability.sentenceType || type),
     reason: gameOk ? '' : (reasonExplain?.explanationJa || reasonExplain?.explanationEn || ''),
     reasonSource: gameOk ? '' : (reasonExplain?.ok ? reasonExplain.method : 'hf-chat-reason-only-failed'),
@@ -626,8 +661,9 @@ async function checkSentenceBatch(req) {
           type,
           sentenceType: checked.sentenceType || accept.sentenceType || type,
           kind: checked.kind || 'API判定',
-          reason: checked.reasonExplain?.explanationJa || checked.reasonExplain?.explanationEn || checked.reason || accept.reason || '',
+          reason: checked.reasonExplain?.explanationJa || checked.reasonExplain?.explanationEn || checked.reason || '',
           reasonSource: checked.reasonSource || checked.reasonExplain?.method || '',
+          reasonExplain: checked.reasonExplain || null,
           ja: gameOk ? (checked.ja || checked.translation?.ja || '') : '',
           fullParse: checked.fullParse,
           strictLinkGrammar: checked.strictLinkGrammar,
@@ -655,7 +691,7 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-plus-hf-chat-acceptability-plus-hf-reason-explain-v4-queued-retry-cache',
+        mode:'link-grammar-direct-reason-v7-root-cause-fixed',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
