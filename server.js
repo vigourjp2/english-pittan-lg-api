@@ -13,6 +13,9 @@ const HF_TOKEN = process.env.HF_TOKEN || '';
 const HF_CHAT_MODEL = process.env.HF_CHAT_MODEL || 'deepseek-ai/DeepSeek-R1:fastest';
 const HF_CHAT_URL = process.env.HF_CHAT_URL || 'https://router.huggingface.co/v1/chat/completions';
 const MYMEMORY_EMAIL = process.env.MYMEMORY_EMAIL || '';
+const SAPLING_API_KEY = process.env.SAPLING_API_KEY || '';
+const SAPLING_API_URL = process.env.SAPLING_API_URL || 'https://api.sapling.ai/api/v1/edits';
+const SAPLING_TIMEOUT_MS = Number(process.env.SAPLING_TIMEOUT_MS || 10000);
 const translateCache = new Map();
 
 function send(res, code, obj) {
@@ -241,6 +244,49 @@ async function judgeAcceptability(text) {
   }
 }
 
+
+async function explainWithSapling(text) {
+  const src = normalizeText(text);
+  if (!src) return { ok:false, provider:'sapling', text:src, error:'empty text' };
+  if (!SAPLING_API_KEY) {
+    return { ok:false, provider:'sapling', text:src, error:'SAPLING_API_KEY is not set' };
+  }
+
+  const payload = {
+    key: SAPLING_API_KEY,
+    text: src,
+    session_id: 'english-pittan-reason-test'
+  };
+
+  try {
+    const data = await fetchJsonWithTimeout(SAPLING_API_URL, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'accept': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    }, SAPLING_TIMEOUT_MS);
+
+    return {
+      ok: true,
+      provider: 'sapling',
+      text: src,
+      editsCount: Array.isArray(data?.edits) ? data.edits.length : 0,
+      data
+    };
+  } catch (e) {
+    return {
+      ok: false,
+      provider: 'sapling',
+      text: src,
+      error: String(e.message || e),
+      status: e.status || null,
+      body: e.body || null
+    };
+  }
+}
+
 async function translateByGoogleGtx(text) {
   const q = normalizeText(text).replace(/[.!?]+$/, '');
   const url = 'https://translate.googleapis.com/translate_a/single?' + new URLSearchParams({
@@ -398,13 +444,19 @@ const server = http.createServer(async (req, res) => {
         mode:'strict-link-grammar-hf-reason-only',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
-        hfTokenPresent: !!HF_TOKEN
+        hfTokenPresent: !!HF_TOKEN,
+        saplingKeyPresent: !!SAPLING_API_KEY
       });
     }
     if (url.pathname === '/proof') {
       const text = await getTextFromReq(req, url);
       if (!text) return send(res, 400, { ok:false, error:'empty text' });
       return send(res, 200, await proofreadEnglish(text));
+    }
+    if (url.pathname === '/explain-sapling') {
+      const text = await getTextFromReq(req, url);
+      if (!text) return send(res, 400, { ok:false, error:'empty text' });
+      return send(res, 200, await explainWithSapling(text));
     }
     if (url.pathname === '/translate') {
       const text = await getTextFromReq(req, url);
