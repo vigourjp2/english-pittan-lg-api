@@ -8,3 +8,7 @@
 
 ゲームURL例:
 https://game-aor.pages.dev/index-english.html?lgapi=https://english-pittan-lg-api.onrender.com&v=20260627c
+
+
+## v33
+StrictLG API only for scoring; exploration cleanup; no stale image panel.

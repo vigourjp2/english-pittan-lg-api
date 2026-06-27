@@ -662,8 +662,19 @@ function uniqueWordsFromArray(arr, max = 160) {
   }
   return out;
 }
+function canonicalGameWords(words) {
+  // v34: no grammar/case hardcoding. Do not lowercase, do not special-case I/am/is/etc.
+  // Use the exact card tokens/text supplied by the game and let Strict Link Grammar be the oracle.
+  return (words || [])
+    .map(x => normalizeText(String(x || '')).replace(/[.!?]+$/,'').trim())
+    .filter(Boolean);
+}
+function formatCandidateSentence(wordsOrText) {
+  const words = Array.isArray(wordsOrText) ? canonicalGameWords(wordsOrText) : canonicalGameWords(String(wordsOrText||'').split(/\s+/));
+  return words.join(' ');
+}
 function uniqueSentence(words) {
-  return normalizeText((words || []).join(' ')).replace(/[.!?]+$/,'');
+  return formatCandidateSentence(words).replace(/[.!?]+$/,'');
 }
 function limitedPermutations(arr, max = 120) {
   const a = (arr || []).slice();
@@ -692,7 +703,7 @@ function limitedPermutations(arr, max = 120) {
 
 async function explainByExploration(text, diagnostics = {}) {
   const src = normalizeText(text).replace(/[.!?]+$/,'');
-  const words = src.split(/\s+/).filter(Boolean);
+  const words = canonicalGameWords(src.split(/\s+/).filter(Boolean));
   const hand = uniqueWordsFromArray(diagnostics.reasonHandCandidates || diagnostics.handCandidates || [], 24);
   const deck = uniqueWordsFromArray(diagnostics.reasonDeckCandidates || diagnostics.reasonCandidates || diagnostics.deckCandidates || [], 140);
   const candidates = uniqueWordsFromArray([...hand, ...deck], 160);
@@ -822,7 +833,7 @@ async function explainByExploration(text, diagnostics = {}) {
   }
   return {
     ok:true,
-    method:'strict-link-grammar-exploration-v32',
+    method:'strict-link-grammar-oracle-exploration-v34',
     model:'none',
     observedStructure: top ? 'nearest successful path found by strict Link Grammar exploration' : 'no successful path found in bounded exploration',
     incompletePart: top ? top.action : 'unknown within candidate search budget',
@@ -844,7 +855,7 @@ async function explainByExploration(text, diagnostics = {}) {
 }
 
 async function explainRejectedSentence(text, diagnostics = {}) {
-  // v32: AI/HF/手書き文法理由ではなく、実際に Strict Link Grammar が成立する最短経路を探索して理由にする。
+  // v34: no local grammar templates/case hacks. Explore candidate paths and accept only actual Strict Link Grammar success.
   return explainByExploration(text, diagnostics);
 }
 
@@ -908,7 +919,7 @@ async function checkSentence(text, withTranslate = false, reasonMeta = {}) {
     }
     return {
       originalText, text: checkedText, normalized: proof.normalized, appliedCorrections: proof.appliedCorrections || [],
-      ok: gameOk, gameOk, type, kind:'Strict Link Grammar ONLY + Exploration Reason Queue',
+      ok: gameOk, gameOk, type, kind:'Strict Link Grammar ONLY + Exploration Reason Queue v33',
       sentenceType: gameOk ? (acceptability.sentenceType || 'complete_sentence') : (acceptability.sentenceType || type),
       reason: gameOk ? '' : (reasonExplain?.explanationJa || reasonExplain?.explanationEn || ''),
       reasonSource: gameOk ? '' : (reasonExplain?.ok ? reasonExplain.method : 'reason-job-pending'),
@@ -934,7 +945,7 @@ async function checkSentence(text, withTranslate = false, reasonMeta = {}) {
   }
   return {
     originalText, text: checkedText, normalized: proof.normalized, appliedCorrections: proof.appliedCorrections || [],
-    ok, gameOk, type, kind:'Strict Link Grammar ONLY + Exploration Reason Queue',
+    ok, gameOk, type, kind:'Strict Link Grammar ONLY + Exploration Reason Queue v33',
     sentenceType: gameOk ? (acceptability.sentenceType || 'complete_sentence') : (acceptability.sentenceType || type),
     reason: gameOk ? '' : (reasonExplain?.explanationJa || reasonExplain?.explanationEn || ''),
     reasonSource: gameOk ? '' : (reasonExplain?.ok ? reasonExplain.method : 'reason-job-pending'),
@@ -1262,11 +1273,11 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-strict-only-v32-exploration-reasons',
+        mode:'link-grammar-strict-only-v34-oracle-exploration-no-hardcode',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-exploration',
+        reasonProvider:'strict-link-grammar-oracle-exploration-no-hardcode',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:true,
@@ -1313,7 +1324,7 @@ const server = http.createServer(async (req, res) => {
         text,
         elapsedMs: Date.now() - startedAt,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-exploration',
+        reasonProvider:'strict-link-grammar-oracle-exploration-no-hardcode',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:true,
