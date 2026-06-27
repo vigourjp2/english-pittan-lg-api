@@ -16,6 +16,9 @@ const MYMEMORY_EMAIL = process.env.MYMEMORY_EMAIL || '';
 const SAPLING_API_KEY = process.env.SAPLING_API_KEY || '';
 const SAPLING_API_URL = process.env.SAPLING_API_URL || 'https://api.sapling.ai/api/v1/edits';
 const SAPLING_TIMEOUT_MS = Number(process.env.SAPLING_TIMEOUT_MS || 10000);
+const GRAMMARBOT_API_KEY = process.env.GRAMMARBOT_API_KEY || '';
+const GRAMMARBOT_API_URL = process.env.GRAMMARBOT_API_URL || 'https://neural.grammarbot.io/v1/check';
+const GRAMMARBOT_TIMEOUT_MS = Number(process.env.GRAMMARBOT_TIMEOUT_MS || 12000);
 const translateCache = new Map();
 
 function send(res, code, obj) {
@@ -287,6 +290,55 @@ async function explainWithSapling(text) {
   }
 }
 
+async function explainWithGrammarBot(text) {
+  const src = normalizeText(text);
+  if (!src) return { ok:false, provider:'grammarbot', text:src, error:'empty text' };
+
+  const payload = { text: src };
+  // GrammarBotはAPIキー無しでも低制限で動く可能性があるため、キー未設定でも検証する。
+  // キーがある場合だけ付ける。判定には使わず、理由候補の実測用。
+  if (GRAMMARBOT_API_KEY) payload.api_key = GRAMMARBOT_API_KEY;
+
+  try {
+    const data = await fetchJsonWithTimeout(GRAMMARBOT_API_URL, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'accept': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    }, GRAMMARBOT_TIMEOUT_MS);
+
+    const matches = Array.isArray(data?.matches) ? data.matches : [];
+    return {
+      ok: true,
+      provider: 'grammarbot',
+      text: src,
+      matchesCount: matches.length,
+      matches: matches.slice(0, 12).map(m => ({
+        message: m?.message || '',
+        shortMessage: m?.shortMessage || '',
+        offset: m?.offset ?? null,
+        length: m?.length ?? null,
+        ruleId: m?.rule?.id || '',
+        issueType: m?.rule?.issueType || '',
+        category: m?.rule?.category?.id || m?.rule?.category?.name || '',
+        replacements: Array.isArray(m?.replacements) ? m.replacements.slice(0, 5).map(r => r?.value || '').filter(Boolean) : []
+      })),
+      data
+    };
+  } catch (e) {
+    return {
+      ok: false,
+      provider: 'grammarbot',
+      text: src,
+      error: String(e.message || e),
+      status: e.status || null,
+      body: e.body || null
+    };
+  }
+}
+
 async function translateByGoogleGtx(text) {
   const q = normalizeText(text).replace(/[.!?]+$/, '');
   const url = 'https://translate.googleapis.com/translate_a/single?' + new URLSearchParams({
@@ -445,7 +497,8 @@ const server = http.createServer(async (req, res) => {
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
-        saplingKeyPresent: !!SAPLING_API_KEY
+        saplingKeyPresent: !!SAPLING_API_KEY,
+        grammarbotKeyPresent: !!GRAMMARBOT_API_KEY
       });
     }
     if (url.pathname === '/proof') {
@@ -457,6 +510,11 @@ const server = http.createServer(async (req, res) => {
       const text = await getTextFromReq(req, url);
       if (!text) return send(res, 400, { ok:false, error:'empty text' });
       return send(res, 200, await explainWithSapling(text));
+    }
+    if (url.pathname === '/explain-grammarbot') {
+      const text = await getTextFromReq(req, url);
+      if (!text) return send(res, 400, { ok:false, error:'empty text' });
+      return send(res, 200, await explainWithGrammarBot(text));
     }
     if (url.pathname === '/translate') {
       const text = await getTextFromReq(req, url);
