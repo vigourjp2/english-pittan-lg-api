@@ -21,13 +21,14 @@ const sentenceImageCache = new Map();
 const translateCache = new Map();
 
 const REASON_JOB_RETRY_DELAYS_MS = (process.env.REASON_JOB_RETRY_DELAYS_MS || '0,2000,4000,8000,15000,30000').split(',').map(x => Number(x.trim())).filter(Number.isFinite);
-const REASON_JOB_MAX_ATTEMPTS = Number(process.env.REASON_JOB_MAX_ATTEMPTS || 999999); // keep retrying while the service is alive
+const REASON_JOB_MAX_ATTEMPTS = Number(process.env.REASON_JOB_MAX_ATTEMPTS || 4); // v24: 無限リトライ禁止。詰まり防止
 const REASON_JOB_MAX_CACHE = Number(process.env.REASON_JOB_MAX_CACHE || 800);
 const reasonJobs = new Map();
 let reasonQueueRunning = false;
 let reasonQueueTimer = null;
 let reasonJobSeq = 1;
 let reasonStats = { created:0, success:0, retry:0, failure:0 };
+let reasonQueueRevision = 0;
 
 function reasonKey(text) {
   return normalizeText(text).toLowerCase().replace(/[.!?]+$/,'').replace(/\s+/g,' ');
@@ -39,8 +40,28 @@ function trimReasonJobs() {
     reasonJobs.delete(removable.shift()[0]);
   }
 }
+function activeReasonJobs() {
+  return [...reasonJobs.values()].filter(j => !['success','failure','failed','error','cancelled','canceled'].includes(String(j.status || '').toLowerCase()));
+}
+function waitingReasonJobs() {
+  return activeReasonJobs().filter(j => j.status !== 'running').sort(compareReasonJobs);
+}
+function runningReasonJob() {
+  return activeReasonJobs().find(j => j.status === 'running') || null;
+}
+function reasonQueueMeta(job) {
+  if (!job) return { queueRevision: reasonQueueRevision, queueRole:'missing', queueIndex:null, queueLabel:'' };
+  if (job.status === 'running') return { queueRevision: reasonQueueRevision, queueRole:'running', queueIndex:0, queueLabel:'理由解析中' };
+  if (['success','failure','failed','error'].includes(String(job.status || '').toLowerCase())) {
+    return { queueRevision: reasonQueueRevision, queueRole:job.status, queueIndex:null, queueLabel:'' };
+  }
+  const wait = waitingReasonJobs();
+  const idx = wait.findIndex(j => j.id === job.id);
+  const n = idx >= 0 ? idx + 1 : null;
+  return { queueRevision: reasonQueueRevision, queueRole:'waiting', queueIndex:n, queueLabel:n ? `理由解析待ち${n}` : '理由解析待ち' };
+}
 function publicReasonJob(job) {
-  if (!job) return { ok:false, status:'missing' };
+  if (!job) return { ok:false, status:'missing', ...reasonQueueMeta(null) };
   return {
     ok: job.status === 'success',
     id: job.id,
@@ -49,9 +70,43 @@ function publicReasonJob(job) {
     attempts: job.attempts,
     nextRetryAt: job.nextRetryAt || null,
     updatedAt: job.updatedAt,
+    priorityEpoch: job.priorityEpoch || 0,
+    prioritySeq: job.prioritySeq || 0,
     error: job.status === 'success' ? '' : (job.lastError || ''),
-    reasonExplain: job.status === 'success' ? job.result : null
+    reasonExplain: job.status === 'success' ? job.result : null,
+    runningJobId: runningReasonJob()?.id || '',
+    runningText: runningReasonJob()?.text || '',
+    ...reasonQueueMeta(job)
   };
+}
+function publicReasonQueue() {
+  const run = runningReasonJob();
+  const wait = waitingReasonJobs();
+  return {
+    ok:true,
+    queueRevision: reasonQueueRevision,
+    running: run ? publicReasonJob(run) : null,
+    waiting: wait.slice(0, 30).map(j => publicReasonJob(j)),
+    size: activeReasonJobs().length,
+    stats: reasonStats
+  };
+}
+function reasonPriorityFromDiagnostics(diagnostics = {}) {
+  const epoch = Number(diagnostics.reasonPriorityEpoch ?? diagnostics.priorityEpoch ?? diagnostics.reasonEpoch ?? 0);
+  const seq = Number(diagnostics.reasonPrioritySeq ?? diagnostics.prioritySeq ?? diagnostics.reasonSeq ?? 0);
+  return {
+    priorityEpoch: Number.isFinite(epoch) ? epoch : 0,
+    prioritySeq: Number.isFinite(seq) ? seq : 0
+  };
+}
+function compareReasonJobs(a, b) {
+  // v23: ユーザーが新しく置いたカード由来の経路を最優先。
+  // 同じ一手内では候補生成順。古い失敗リトライや古いlocalStorage由来のpendingを前に出さない。
+  const pe = (b.priorityEpoch || 0) - (a.priorityEpoch || 0);
+  if (pe) return pe;
+  const ps = (a.prioritySeq || 0) - (b.prioritySeq || 0);
+  if (ps) return ps;
+  return (a.nextRetryAt || 0) - (b.nextRetryAt || 0) || a.createdAt - b.createdAt;
 }
 function enqueueReasonJob(text, diagnostics = {}) {
   const src = normalizeText(text);
@@ -65,17 +120,26 @@ function enqueueReasonJob(text, diagnostics = {}) {
       diagnostics: { judgeSource: diagnostics.judgeSource || 'link-grammar', linkGrammarOk: !!diagnostics.linkGrammarOk, linkages: Number(diagnostics.linkages || 0) },
       status:'pending', attempts:0,
       createdAt: Date.now(), updatedAt: Date.now(), nextRetryAt: Date.now(),
+      ...reasonPriorityFromDiagnostics(diagnostics),
       lastError:'', result:null
     };
     reasonJobs.set(key, job);
     reasonStats.created++;
+    reasonQueueRevision++;
     trimReasonJobs();
   } else if (job.status !== 'success') {
-    // keep latest diagnostics but never reset attempts/result
+    // keep latest diagnostics but never reset attempts/result.
+    // v23: 同じ英文でも「新しく置いたカード由来」で再発生したら優先度だけは更新する。
     job.diagnostics = { ...job.diagnostics, ...diagnostics };
+    const pr = reasonPriorityFromDiagnostics(diagnostics);
+    if (pr.priorityEpoch > (job.priorityEpoch || 0) || (pr.priorityEpoch === (job.priorityEpoch || 0) && pr.prioritySeq < (job.prioritySeq || 0))) {
+      job.priorityEpoch = pr.priorityEpoch;
+      job.prioritySeq = pr.prioritySeq;
+    }
     if (job.status !== 'running') job.status = 'pending';
     if (!job.nextRetryAt || job.nextRetryAt > Date.now()) job.nextRetryAt = Date.now();
     job.updatedAt = Date.now();
+    reasonQueueRevision++;
   }
   scheduleReasonQueue(0);
   return job;
@@ -92,10 +156,11 @@ async function processReasonQueue() {
       const now = Date.now();
       const ready = [...reasonJobs.values()]
         .filter(j => j.status !== 'success' && j.status !== 'running' && (j.nextRetryAt || 0) <= now)
-        .sort((a,b)=>(a.nextRetryAt||0)-(b.nextRetryAt||0) || a.createdAt-b.createdAt)[0];
+        .sort(compareReasonJobs)[0];
       if (!ready) break;
       ready.status = 'running';
       ready.updatedAt = Date.now();
+      reasonQueueRevision++;
       try {
         const r = await explainRejectedSentence(ready.text, ready.diagnostics || {});
         const hasExplanation = !!(r?.ok && (String(r.explanationJa||'').trim() || String(r.explanationEn||'').trim()));
@@ -105,25 +170,30 @@ async function processReasonQueue() {
         ready.lastError = '';
         ready.updatedAt = Date.now();
         reasonStats.success++;
+        reasonQueueRevision++;
       } catch (e) {
         ready.attempts++;
         ready.lastError = String(e.message || e);
         ready.updatedAt = Date.now();
         reasonStats.retry++;
         if (ready.attempts >= REASON_JOB_MAX_ATTEMPTS) {
-          // In normal operation this should not happen because max is huge; keep retryable but record it.
-          ready.attempts = 0;
+          // v24: 古い失敗jobを無限に先頭へ戻さない。失敗として確定し、新しい一手を詰まらせない。
+          ready.status = 'failure';
+          ready.nextRetryAt = null;
           reasonStats.failure++;
+          reasonQueueRevision++;
+          continue;
         }
         const delay = REASON_JOB_RETRY_DELAYS_MS[Math.min(ready.attempts, REASON_JOB_RETRY_DELAYS_MS.length - 1)] ?? 30000;
         ready.status = 'pending';
         ready.nextRetryAt = Date.now() + delay;
+        reasonQueueRevision++;
       }
     }
   } finally {
     reasonQueueRunning = false;
   }
-  const next = [...reasonJobs.values()].filter(j => j.status !== 'success' && j.status !== 'running').sort((a,b)=>(a.nextRetryAt||0)-(b.nextRetryAt||0))[0];
+  const next = [...reasonJobs.values()].filter(j => j.status !== 'success' && j.status !== 'running').sort((a,b)=>(a.nextRetryAt||0)-(b.nextRetryAt||0) || compareReasonJobs(a,b))[0];
   if (next) scheduleReasonQueue(Math.max(0, (next.nextRetryAt || Date.now()) - Date.now()));
 }
 
@@ -478,10 +548,11 @@ async function judgeAcceptability(text) {
   }
 }
 
+
 async function explainRejectedSentence(text, diagnostics = {}) {
   const src = normalizeText(text);
   if (!src) return { ok:false, method:'hf-chat-reason-only', model:HF_CHAT_MODEL, error:'empty text' };
-  if (!HF_TOKEN) return { ok:false, method:'hf-chat-reason-only', model:HF_CHAT_MODEL, status:'unavailable', error:'HF_TOKEN is not set' };
+  if (!HF_TOKEN) return { ok:false, method:'hf-chat-reason-only', model:HF_CHAT_MODEL, error:'HF_TOKEN is not set' };
 
   const safeDiagnostics = {
     judgeSource: diagnostics.judgeSource || 'link-grammar',
@@ -547,7 +618,7 @@ async function explainRejectedSentence(text, diagnostics = {}) {
       rawReason: parsed
     };
   } catch (e) {
-    return { ok:false, method:'hf-chat-reason-only', model:HF_CHAT_MODEL, status:'failure', error:String(e.message || e), httpStatus:e.status || null };
+    return { ok:false, method:'hf-chat-reason-only', model:HF_CHAT_MODEL, error:String(e.message || e), status:e.status || null, body:e.body || null };
   }
 }
 
@@ -590,7 +661,7 @@ async function translateToJapanese(text) {
   return { ok:false, error:String(lastErr?.message || lastErr || 'translation failed') };
 }
 
-async function checkSentence(text, withTranslate = false) {
+async function checkSentence(text, withTranslate = false, reasonMeta = {}) {
   const originalText = normalizeText(text);
   const proof = await proofreadEnglish(originalText);
   const checkedText = proof.corrected || originalText;
@@ -605,10 +676,8 @@ async function checkSentence(text, withTranslate = false) {
     let reasonExplain = null;
     let reasonJob = null;
     if (gameOk && withTranslate) translation = await translateToJapanese(checkedText);
-    if (!gameOk && HF_TOKEN) {
-      // v20: 不成立理由は reason job に投入し、キューで順次処理する。
-      // 単語別ハードコーディングは使わず、成功した reason-explain だけを表示する。
-      reasonJob = enqueueReasonJob(checkedText, { judgeSource:'link-grammar', linkGrammarOk:false, linkages:parsed.linkages });
+    if (!gameOk) {
+      reasonJob = enqueueReasonJob(checkedText, { judgeSource:'link-grammar', linkGrammarOk:false, linkages:parsed.linkages, ...reasonMeta });
       if (reasonJob?.status === 'success') reasonExplain = reasonJob.result;
     }
     return {
@@ -616,8 +685,8 @@ async function checkSentence(text, withTranslate = false) {
       ok: gameOk, gameOk, type, kind:'Link Grammar + HF Reason Job',
       sentenceType: gameOk ? (acceptability.sentenceType || 'complete_sentence') : (acceptability.sentenceType || type),
       reason: gameOk ? '' : (reasonExplain?.explanationJa || reasonExplain?.explanationEn || ''),
-      reasonSource: gameOk ? '' : (reasonExplain?.ok ? reasonExplain.method : (reasonJob ? 'reason-job-pending' : 'reason-unavailable')),
-      reasonStatus: gameOk ? 'none' : (reasonExplain?.ok ? 'success' : (reasonJob?.status || 'unavailable')),
+      reasonSource: gameOk ? '' : (reasonExplain?.ok ? reasonExplain.method : 'reason-job-pending'),
+      reasonStatus: gameOk ? 'none' : (reasonJob?.status || 'pending'),
       reasonJobId: gameOk ? '' : (reasonJob?.id || ''),
       reasonExplain, proof,
       fullParse: parsed.fullParse, strictLinkGrammar: parsed.strictLinkGrammar,
@@ -633,10 +702,8 @@ async function checkSentence(text, withTranslate = false) {
   let reasonExplain = null;
   let reasonJob = null;
   if (gameOk && withTranslate) translation = await translateToJapanese(checkedText);
-  if (!gameOk && HF_TOKEN) {
-    // v20: 不成立理由は reason job に投入し、キューで順次処理する。
-    // 単語別ハードコーディングは使わず、成功した reason-explain だけを表示する。
-    reasonJob = enqueueReasonJob(checkedText, { judgeSource:'link-grammar-plus-hf-chat', linkGrammarOk:true, linkages:parsed.linkages });
+  if (!gameOk) {
+    reasonJob = enqueueReasonJob(checkedText, { judgeSource:'link-grammar-plus-hf-chat', linkGrammarOk:true, linkages:parsed.linkages, ...reasonMeta });
     if (reasonJob?.status === 'success') reasonExplain = reasonJob.result;
   }
   return {
@@ -645,7 +712,7 @@ async function checkSentence(text, withTranslate = false) {
     sentenceType: gameOk ? (acceptability.sentenceType || 'complete_sentence') : (acceptability.sentenceType || type),
     reason: gameOk ? '' : (reasonExplain?.explanationJa || reasonExplain?.explanationEn || ''),
     reasonSource: gameOk ? '' : (reasonExplain?.ok ? reasonExplain.method : 'reason-job-pending'),
-    reasonStatus: gameOk ? 'none' : (reasonExplain?.ok ? 'success' : (reasonJob?.status || 'pending')),
+    reasonStatus: gameOk ? 'none' : (reasonJob?.status || 'pending'),
     reasonJobId: gameOk ? '' : (reasonJob?.id || ''),
     reasonExplain, proof,
     fullParse: parsed.fullParse, strictLinkGrammar: parsed.strictLinkGrammar,
@@ -685,7 +752,7 @@ async function checkSentenceBatch(req) {
     while (next < items.length) {
       const item = items[next++];
       try {
-        const checked = await checkSentence(item.text, true);
+        const checked = await checkSentence(item.text, true, { reasonPriorityEpoch: j.reasonPriorityEpoch || j.reasonEpoch || Date.now(), reasonPrioritySeq: Number(item.id || 0) });
         const accept = checked.acceptability || {};
         const type = accept.type || (checked.gameOk ? 'complete_sentence' : (checked.fullParse ? 'fragment' : 'invalid'));
         const gameOk = !!(checked.ok && checked.gameOk && (accept.gameOk !== false) && type === 'complete_sentence');
@@ -969,7 +1036,7 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-reason-job-v21-queued-server',
+        mode:'link-grammar-reason-job-v24-visible-single-worker-queue',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
@@ -1012,6 +1079,9 @@ const server = http.createServer(async (req, res) => {
       const job = enqueueReasonJob(text, { judgeSource:'manual-reason-job' });
       return send(res, 200, { text, ...publicReasonJob(job) });
     }
+    if (url.pathname === '/reason-queue') {
+      return send(res, 200, publicReasonQueue());
+    }
     if (url.pathname === '/reason-result') {
       const text = await getTextFromReq(req, url);
       const id = url.searchParams.get('id') || '';
@@ -1026,16 +1096,27 @@ const server = http.createServer(async (req, res) => {
       if (!text) return send(res, 400, { ok:false, error:'empty text' });
       const job = enqueueReasonJob(text, { judgeSource:'manual-reason-explain' });
       if (job?.status === 'success') return send(res, 200, { text, ...job.result, reasonJobId:job.id, reasonStatus:'success' });
-      return send(res, 200, { text, ok:false, reasonJobId:job?.id || '', reasonStatus:job?.status || 'pending', status:job?.status || 'pending', attempts:job?.attempts || 0 });
+      return send(res, 200, { text, ok:false, reasonJobId:job?.id || '', reasonStatus:job?.status || 'pending', ...publicReasonJob(job) });
     }
     if (url.pathname === '/check-and-translate-batch') {
       if (req.method !== 'POST') return send(res, 405, { ok:false, error:'POST required' });
       return send(res, 200, await checkSentenceBatch(req));
     }
     if (url.pathname === '/check' || url.pathname === '/check-and-translate') {
-      const text = await getTextFromReq(req, url);
+      let text = url.searchParams.get('text') || '';
+      let body = {};
+      if (req.method === 'POST') {
+        const raw = await readBody(req);
+        try { body = JSON.parse(raw || '{}') || {}; text = body.text || (Array.isArray(body.words) ? body.words.join(' ') : text); }
+        catch { text = raw || text; }
+      }
+      text = normalizeText(text);
       if (!text) return send(res, 400, { ok:false, error:'empty text' });
-      return send(res, 200, await checkSentence(text, url.pathname === '/check-and-translate'));
+      const reasonMeta = {
+        reasonPriorityEpoch: body.reasonPriorityEpoch || body.reasonEpoch || Number(url.searchParams.get('reasonPriorityEpoch') || 0),
+        reasonPrioritySeq: body.reasonPrioritySeq || body.reasonSeq || Number(url.searchParams.get('reasonPrioritySeq') || 0)
+      };
+      return send(res, 200, await checkSentence(text, url.pathname === '/check-and-translate', reasonMeta));
     }
     return send(res, 404, { ok:false, error:'not found' });
   } catch (e) {
