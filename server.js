@@ -833,7 +833,7 @@ async function explainByExploration(text, diagnostics = {}) {
   }
   return {
     ok:true,
-    method:'strict-link-grammar-oracle-exploration-v34',
+    method:'strict-link-grammar-oracle-exploration-v35',
     model:'none',
     observedStructure: top ? 'nearest successful path found by strict Link Grammar exploration' : 'no successful path found in bounded exploration',
     incompletePart: top ? top.action : 'unknown within candidate search budget',
@@ -1273,7 +1273,7 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-strict-only-v34-oracle-exploration-no-hardcode',
+        mode:'link-grammar-strict-only-v35-judge-lock-ui-no-hardcode',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
@@ -1408,4 +1408,4 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => console.log(`Strict Link Grammar v32 Exploration API listening on ${PORT}`));
+server.listen(PORT, () => console.log(`Strict Link Grammar v35 Exploration API listening on ${PORT}`));
