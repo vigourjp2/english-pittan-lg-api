@@ -33,3 +33,16 @@
 Render側は `server.js` の再デプロイが必要。
 Cloudflare/GitHub Pages側は `index-english.html` の更新とブラウザキャッシュ更新が必要。
 URL末尾に `?v=17` などを付けると確認しやすい。
+
+
+## 追加修正 v18: 「理由解析中…」が残り続ける不具合
+
+### 原因
+- サーバー側の reason job が Hugging Face の応答失敗時に実質無限リトライする設定になっていた。
+- クライアント側は `reason-explain` の成功結果だけを表示する設計だったため、HF_TOKEN未設定・外部APIタイムアウト・一時障害時に「理由解析中…」から表示が進まなかった。
+
+### 対応
+- サーバー側に `localReasonExplanation()` を追加し、HF_TOKEN未設定/外部API失敗時でも学習者向けの暫定理由を返す。
+- reason job の既定リトライ回数を3回に変更し、上限到達時はローカル理由で success 扱いにして pending を残さない。
+- クライアント側にも12秒のフォールバック表示を追加し、旧サーバーや通信不安定時でも「理由解析中…」で固着しない。
+- キャッシュキーを `englishPittan.linkGrammarCache.v18.reasonNoStuck` に更新し、古い pending キャッシュを無効化。

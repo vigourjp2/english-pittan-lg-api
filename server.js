@@ -21,7 +21,7 @@ const sentenceImageCache = new Map();
 const translateCache = new Map();
 
 const REASON_JOB_RETRY_DELAYS_MS = (process.env.REASON_JOB_RETRY_DELAYS_MS || '0,2000,4000,8000,15000,30000').split(',').map(x => Number(x.trim())).filter(Number.isFinite);
-const REASON_JOB_MAX_ATTEMPTS = Number(process.env.REASON_JOB_MAX_ATTEMPTS || 999999); // keep retrying while the service is alive
+const REASON_JOB_MAX_ATTEMPTS = Number(process.env.REASON_JOB_MAX_ATTEMPTS || 3); // never leave learner-facing reason stuck forever
 const REASON_JOB_MAX_CACHE = Number(process.env.REASON_JOB_MAX_CACHE || 800);
 const reasonJobs = new Map();
 let reasonQueueRunning = false;
@@ -111,9 +111,12 @@ async function processReasonQueue() {
         ready.updatedAt = Date.now();
         reasonStats.retry++;
         if (ready.attempts >= REASON_JOB_MAX_ATTEMPTS) {
-          // In normal operation this should not happen because max is huge; keep retryable but record it.
-          ready.attempts = 0;
+          ready.status = 'success';
+          ready.result = localReasonExplanation(ready.text, ready.diagnostics || {}, ready.lastError || 'reason service retry limit');
+          ready.nextRetryAt = null;
           reasonStats.failure++;
+          reasonStats.success++;
+          continue;
         }
         const delay = REASON_JOB_RETRY_DELAYS_MS[Math.min(ready.attempts, REASON_JOB_RETRY_DELAYS_MS.length - 1)] ?? 30000;
         ready.status = 'pending';
@@ -146,6 +149,53 @@ function normalizeText(text) {
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, MAX_CHARS);
+}
+
+function localReasonExplanation(text, diagnostics = {}, cause = '') {
+  const src = normalizeText(text).replace(/[.!?]+$/,'');
+  const words = src.split(/\s+/).filter(Boolean);
+  const lower = words.map(w => w.toLowerCase());
+  const hasSubject = /^(i|you|he|she|we|they|it|this|that|there)$/i.test(words[0] || '');
+  const beWords = new Set(['am','is','are','was','were','be','been','being']);
+  const auxWords = new Set(['do','does','did','can','will','would','could','should','must','may','might','have','has','had']);
+  const commonVerbs = new Set(['like','likes','liked','love','loves','play','plays','played','go','goes','went','read','reads','reading','eat','eats','eating','run','runs','running','study','studies','studying','work','works','working']);
+  const hasFinite = lower.some(w => beWords.has(w) || auxWords.has(w) || commonVerbs.has(w));
+  let observed = words.length ? `入力は「${src}」です。` : '入力が空です。';
+  let missing = '英文として自然に完結するための語順または関係が不足しています。';
+  let ja = 'この候補は、英語の文として自然に完結していないため不成立です。主語・動詞・必要な補語や目的語のつながりを確認してください。';
+  let en = 'This candidate is not a complete natural English sentence yet. Check the subject, verb, and any required complement or object.';
+
+  if (!words.length) {
+    missing = '単語がありません。';
+    ja = '単語が置かれていないため、英文として判定できません。';
+    en = 'There are no words to judge as a sentence.';
+  } else if (words.length === 1) {
+    missing = '主語と動詞を含む文の形が不足しています。';
+    ja = `「${src}」だけでは単語または句で、文として完結していません。主語と動詞をそろえてください。`;
+    en = `“${src}” is only a word or phrase, not a complete sentence. Add a subject and a verb.`;
+  } else if (!hasSubject && !hasFinite) {
+    missing = 'だれが・何が、どうする/どうである、という文の中心が不足しています。';
+    ja = '主語と動詞の関係がはっきりしないため、英文として完結していません。';
+    en = 'The subject-verb relationship is unclear, so it is not a complete sentence.';
+  } else if (!hasSubject) {
+    missing = '文の主語が不足している可能性があります。';
+    ja = '動作や状態の主語がはっきりしないため、英文として不自然です。';
+    en = 'The subject of the action or state is unclear.';
+  } else if (!hasFinite) {
+    missing = '文を成立させる動詞が不足している可能性があります。';
+    ja = '主語はありますが、文を完成させる動詞が不足しているため不成立です。';
+    en = 'There is a subject, but no clear verb to complete the sentence.';
+  } else if (lower.length >= 2 && lower[0] === 'i' && lower[1] === 'am' && lower.length === 2) {
+    missing = 'am の後ろに状態・身分・動作などを表す語が必要です。';
+    ja = '「I am」だけでは「私は〜です」の「〜」が未完成です。am の後ろに状態や動作を足してください。';
+    en = '“I am” needs a word after “am” to say what or how the subject is.';
+  } else if (/\b(am|is|are|was|were)\s+\w+ing\b/i.test(src) && !hasSubject) {
+    missing = '進行形を支える主語が必要です。';
+    ja = '進行形の形はありますが、だれがその動作をしているかが不足しています。';
+    en = 'The progressive form needs a subject to show who is doing the action.';
+  }
+  if (cause) observed += `（自動理由生成: ${String(cause).slice(0,80)}）`;
+  return { ok:true, method:'local-reason-fallback', model:'local-rule', observedStructure:observed, incompletePart:missing, explanationEn:en, explanationJa:ja, confidence:0.55, fallback:true };
 }
 
 function terminalSentence(text) {
@@ -482,7 +532,7 @@ async function judgeAcceptability(text) {
 async function explainRejectedSentence(text, diagnostics = {}) {
   const src = normalizeText(text);
   if (!src) return { ok:false, method:'hf-chat-reason-only', model:HF_CHAT_MODEL, error:'empty text' };
-  if (!HF_TOKEN) return { ok:false, method:'hf-chat-reason-only', model:HF_CHAT_MODEL, error:'HF_TOKEN is not set' };
+  if (!HF_TOKEN) return localReasonExplanation(src, diagnostics, 'HF_TOKEN is not set');
 
   const safeDiagnostics = {
     judgeSource: diagnostics.judgeSource || 'link-grammar',
@@ -548,7 +598,7 @@ async function explainRejectedSentence(text, diagnostics = {}) {
       rawReason: parsed
     };
   } catch (e) {
-    return { ok:false, method:'hf-chat-reason-only', model:HF_CHAT_MODEL, error:String(e.message || e), status:e.status || null, body:e.body || null };
+    return localReasonExplanation(src, diagnostics, String(e.message || e));
   }
 }
 
@@ -966,7 +1016,7 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-reason-job-v14-placement-lock-stale-guard',
+        mode:'link-grammar-reason-job-v18-no-stuck-reason-fallback',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
