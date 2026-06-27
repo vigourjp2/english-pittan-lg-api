@@ -5,16 +5,13 @@ const PORT = Number(process.env.PORT || 8787);
 const ALLOW_ORIGIN = process.env.ALLOW_ORIGIN || '*';
 const MAX_CHARS = Number(process.env.MAX_CHARS || 180);
 const LINK_TIMEOUT_MS = Number(process.env.LINK_TIMEOUT_MS || 3500);
-const HF_TIMEOUT_MS = Number(process.env.HF_TIMEOUT_MS || 12000);
 const LT_TIMEOUT_MS = Number(process.env.LT_TIMEOUT_MS || 5000);
+const HF_TIMEOUT_MS = Number(process.env.HF_TIMEOUT_MS || 25000);
 
 const LANGUAGETOOL_URL = process.env.LANGUAGETOOL_URL || 'https://api.languagetool.org/v2/check';
 const HF_TOKEN = process.env.HF_TOKEN || '';
-const ACCEPTABILITY_MODEL = process.env.ACCEPTABILITY_MODEL || 'EstherT/sentence-acceptability';
-const ACCEPTABILITY_THRESHOLD = Number(process.env.ACCEPTABILITY_THRESHOLD || 0.72);
-const HF_PROVIDER = process.env.HF_PROVIDER || 'hf-inference';
-const HF_ZERO_SHOT_MODEL = process.env.HF_ZERO_SHOT_MODEL || 'facebook/bart-large-mnli';
-const HF_ZERO_SHOT_FALLBACK = String(process.env.HF_ZERO_SHOT_FALLBACK || '1') !== '0';
+const HF_CHAT_MODEL = process.env.HF_CHAT_MODEL || 'deepseek-ai/DeepSeek-R1:fastest';
+const HF_CHAT_URL = process.env.HF_CHAT_URL || 'https://router.huggingface.co/v1/chat/completions';
 const MYMEMORY_EMAIL = process.env.MYMEMORY_EMAIL || '';
 const translateCache = new Map();
 
@@ -69,25 +66,31 @@ async function getTextFromReq(req, url) {
   return normalizeText(text);
 }
 
-async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 10000) {
+async function fetchTextWithTimeout(url, options = {}, timeoutMs = 10000) {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), timeoutMs);
   try {
     const r = await fetch(url, { ...options, signal: ac.signal });
     const raw = await r.text();
-    let json = null;
-    try { json = raw ? JSON.parse(raw) : null; } catch { json = { raw }; }
     if (!r.ok) {
-      const msg = json?.error || json?.message || raw || `HTTP ${r.status}`;
+      let body = null;
+      try { body = raw ? JSON.parse(raw) : null; } catch { body = raw; }
+      const msg = body?.error?.message || body?.error || body?.message || raw || `HTTP ${r.status}`;
       const e = new Error(msg);
       e.status = r.status;
-      e.body = json;
+      e.body = body;
       throw e;
     }
-    return json;
+    return raw;
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 10000) {
+  const raw = await fetchTextWithTimeout(url, options, timeoutMs);
+  try { return raw ? JSON.parse(raw) : null; }
+  catch { return { raw }; }
 }
 
 function applyLanguageToolCorrections(text, matches = []) {
@@ -96,7 +99,6 @@ function applyLanguageToolCorrections(text, matches = []) {
     .filter(m => m?.replacements?.[0]?.value)
     .filter(m => {
       const id = String(m.rule?.id || '');
-      // 大文字開始やピリオドなど、カードゲーム上の表記に関係ないものは補正しない。
       return !['UPPERCASE_SENTENCE_START', 'MORFOLOGIK_RULE_EN_US'].includes(id);
     })
     .sort((a, b) => b.offset - a.offset);
@@ -172,130 +174,91 @@ function runLinkParser(text) {
   });
 }
 
-function hfHeaders() {
-  const h = { 'content-type': 'application/json', 'accept': 'application/json' };
-  if (HF_TOKEN) h.authorization = `Bearer ${HF_TOKEN}`;
-  return h;
-}
-
-function flattenClassificationOutput(output) {
-  if (Array.isArray(output) && Array.isArray(output[0])) return output[0];
-  if (Array.isArray(output)) return output;
-  if (output && Array.isArray(output.labels) && Array.isArray(output.scores)) {
-    return output.labels.map((label, i) => ({ label, score: output.scores[i] }));
-  }
-  return [];
-}
-
-function labelKind(label) {
-  const s = String(label || '').toLowerCase().replace(/[ _-]+/g, '');
-  if (!s) return 'unknown';
-  if (s.includes('unacceptable') || s.includes('ungrammatical') || s.includes('incorrect') || s.includes('notacceptable') || s === 'label0' || s === '0' || s === 'negative') return 'bad';
-  if (s.includes('acceptable') || s.includes('grammatical') || s.includes('correct') || s === 'label1' || s === '1' || s === 'positive') return 'good';
-  return 'unknown';
-}
-
-function interpretClassification(items, threshold) {
-  const rows = flattenClassificationOutput(items)
-    .map(x => ({ label: String(x.label ?? ''), score: Number(x.score ?? 0) }))
-    .filter(x => x.label && Number.isFinite(x.score))
-    .sort((a, b) => b.score - a.score);
-  const good = rows.find(r => labelKind(r.label) === 'good');
-  const bad = rows.find(r => labelKind(r.label) === 'bad');
-  const top = rows[0] || null;
-  let goodScore = good?.score ?? null;
-  let badScore = bad?.score ?? null;
-  let ok = false;
-  let reason = 'acceptability label not recognized';
-  if (good) {
-    ok = good.score >= threshold && (!bad || good.score >= bad.score);
-    reason = ok ? '' : `acceptability score below threshold: ${good.score}`;
-  } else if (top && labelKind(top.label) === 'good') {
-    goodScore = top.score;
-    ok = top.score >= threshold;
-    reason = ok ? '' : `acceptability score below threshold: ${top.score}`;
-  } else if (top && labelKind(top.label) === 'bad') {
-    badScore = top.score;
-    ok = false;
-    reason = `model predicted ${top.label}`;
-  }
-  return { ok, score: goodScore, badScore, threshold, top, labels: rows.slice(0, 8), reason };
-}
-
-async function callHfTextClassification(text, model) {
-  const apiUrl = `https://router.huggingface.co/${HF_PROVIDER}/models/${model}`;
-  const payload = {
-    inputs: terminalSentence(text),
-    parameters: { top_k: 5, function_to_apply: 'softmax' },
-    options: { wait_for_model: true }
-  };
-  const raw = await fetchJsonWithTimeout(apiUrl, {
-    method: 'POST',
-    headers: hfHeaders(),
-    body: JSON.stringify(payload)
-  }, HF_TIMEOUT_MS);
-  return { raw, apiUrl };
-}
-
-async function callHfZeroShot(text, model) {
-  const apiUrl = `https://router.huggingface.co/${HF_PROVIDER}/models/${model}`;
-  const payload = {
-    inputs: terminalSentence(text),
-    parameters: {
-      candidate_labels: ['grammatical English sentence', 'ungrammatical English word sequence'],
-      multi_label: false
-    },
-    options: { wait_for_model: true }
-  };
-  const raw = await fetchJsonWithTimeout(apiUrl, {
-    method: 'POST',
-    headers: hfHeaders(),
-    body: JSON.stringify(payload)
-  }, HF_TIMEOUT_MS);
-  const rows = flattenClassificationOutput(raw)
-    .map(x => ({ label: String(x.label ?? ''), score: Number(x.score ?? 0) }))
-    .filter(x => x.label && Number.isFinite(x.score))
-    .sort((a, b) => b.score - a.score);
-  const good = rows.find(r => /grammatical/i.test(r.label) && !/ungrammatical/i.test(r.label));
-  const bad = rows.find(r => /ungrammatical/i.test(r.label));
-  const score = good?.score ?? null;
-  const ok = !!good && score >= ACCEPTABILITY_THRESHOLD && (!bad || good.score >= bad.score);
-  return { ok, score, badScore: bad?.score ?? null, threshold: ACCEPTABILITY_THRESHOLD, top: rows[0] || null, labels: rows, raw, apiUrl, model, method: 'zero-shot', reason: ok ? '' : `zero-shot acceptability below threshold or ungrammatical top label` };
+function tryExtractJson(s) {
+  if (!s) return null;
+  const t = String(s).trim().replace(/^```(?:json)?/i, '').replace(/```$/,'').trim();
+  try { return JSON.parse(t); } catch {}
+  const m = t.match(/\{[\s\S]*\}/);
+  if (m) { try { return JSON.parse(m[0]); } catch {} }
+  return null;
 }
 
 async function judgeAcceptability(text) {
-  if (!HF_TOKEN) {
-    return { ok:false, method:'hf', model:ACCEPTABILITY_MODEL, reason:'HF_TOKEN is not set' };
-  }
+  if (!HF_TOKEN) return { ok:false, method:'hf-chat', model:HF_CHAT_MODEL, reason:'HF_TOKEN is not set' };
+
+  const system = [
+    'You are a strict English sentence acceptability judge for a children\'s word-order game.',
+    'Decide whether the input is one complete, natural, standalone Standard English sentence.',
+    'Reject word salad, fragments, run-ons, leftover extra verbs, unnatural word order, object-fronting/topicalization, or sequences that only parse by unusual poetic/elliptical readings.',
+    'Accept ordinary simple English sentences, including normal auxiliaries, adverbs, adjectives, objects, and prepositional phrases.',
+    'Return ONLY compact JSON: {"ok":true|false,"reason":"short reason","sentenceType":"short label"}.'
+  ].join(' ');
+
+  const payload = {
+    model: HF_CHAT_MODEL,
+    messages: [
+      { role: 'system', content: system },
+      { role: 'user', content: `INPUT: ${JSON.stringify(normalizeText(text))}` }
+    ],
+    temperature: 0,
+    max_tokens: 80,
+    response_format: { type: 'json_object' }
+  };
+
   try {
-    const { raw, apiUrl } = await callHfTextClassification(text, ACCEPTABILITY_MODEL);
-    const judged = interpretClassification(raw, ACCEPTABILITY_THRESHOLD);
-    return { ...judged, raw, apiUrl, model: ACCEPTABILITY_MODEL, method: 'text-classification' };
-  } catch (e) {
-    const primaryError = {
-      message: String(e.message || e),
-      status: e.status || null,
-      body: e.body || null,
-      model: ACCEPTABILITY_MODEL,
-      method: 'text-classification'
+    const j = await fetchJsonWithTimeout(HF_CHAT_URL, {
+      method: 'POST',
+      headers: {
+        'authorization': `Bearer ${HF_TOKEN}`,
+        'content-type': 'application/json',
+        'accept': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    }, HF_TIMEOUT_MS);
+    const content = j?.choices?.[0]?.message?.content || j?.choices?.[0]?.text || '';
+    const parsed = tryExtractJson(content);
+    if (!parsed || typeof parsed.ok !== 'boolean') {
+      return { ok:false, method:'hf-chat', model:HF_CHAT_MODEL, reason:'HF chat returned non-JSON decision', raw:j, content };
+    }
+    return {
+      ok: !!parsed.ok,
+      method:'hf-chat',
+      model:HF_CHAT_MODEL,
+      reason: parsed.ok ? '' : String(parsed.reason || 'rejected by acceptability judge'),
+      sentenceType: String(parsed.sentenceType || (parsed.ok ? 'HF_CHAT_ACCEPTED' : 'HF_CHAT_REJECTED')),
+      rawDecision: parsed
     };
-    if (!HF_ZERO_SHOT_FALLBACK) {
-      return { ok:false, model:ACCEPTABILITY_MODEL, method:'text-classification', reason:'acceptability service failed', error:primaryError };
-    }
-    try {
-      const z = await callHfZeroShot(text, HF_ZERO_SHOT_MODEL);
-      return { ...z, primaryError, fallbackUsed: true };
-    } catch (e2) {
-      return {
-        ok:false,
-        model: ACCEPTABILITY_MODEL,
-        method: 'text-classification',
-        reason:'acceptability service failed',
-        error: primaryError,
-        fallbackError: { message:String(e2.message || e2), status:e2.status || null, body:e2.body || null, model:HF_ZERO_SHOT_MODEL, method:'zero-shot' }
-      };
-    }
+  } catch (e) {
+    return {
+      ok:false,
+      method:'hf-chat',
+      model:HF_CHAT_MODEL,
+      reason:'HF chat acceptability service failed',
+      error:{ message:String(e.message || e), status:e.status || null, body:e.body || null }
+    };
   }
+}
+
+async function translateByGoogleGtx(text) {
+  const q = normalizeText(text).replace(/[.!?]+$/, '');
+  const url = 'https://translate.googleapis.com/translate_a/single?' + new URLSearchParams({
+    client:'gtx', sl:'en', tl:'ja', dt:'t', q
+  }).toString();
+  const j = await fetchJsonWithTimeout(url, { headers:{ accept:'application/json' } }, 7000);
+  const ja = Array.isArray(j?.[0]) ? j[0].map(x => x?.[0] || '').join('') : '';
+  if (!ja) throw new Error('empty google-gtx translation');
+  return { ok:true, ja, source:'google-gtx' };
+}
+
+async function translateByMyMemory(text) {
+  const q = normalizeText(text).replace(/[.!?]+$/, '');
+  const params = new URLSearchParams({ q, langpair:'en|ja' });
+  if (MYMEMORY_EMAIL) params.set('de', MYMEMORY_EMAIL);
+  const url = 'https://api.mymemory.translated.net/get?' + params.toString();
+  const j = await fetchJsonWithTimeout(url, { headers: { accept:'application/json' } }, 7000);
+  const ja = j?.responseData?.translatedText || '';
+  if (!ja) throw new Error('empty mymemory translation');
+  return { ok:true, ja, source:'mymemory', rawStatus:j?.responseStatus };
 }
 
 async function translateToJapanese(text) {
@@ -303,15 +266,16 @@ async function translateToJapanese(text) {
   if (!text) return { ok:false, error:'empty text' };
   const key = text.toLowerCase();
   if (translateCache.has(key)) return { ok:true, ja:translateCache.get(key), source:'cache' };
-  const params = new URLSearchParams({ q:text, langpair:'en|ja' });
-  if (MYMEMORY_EMAIL) params.set('de', MYMEMORY_EMAIL);
-  const url = 'https://api.mymemory.translated.net/get?' + params.toString();
-  const j = await fetchJsonWithTimeout(url, { headers: { accept:'application/json' } }, 7000);
-  const ja = j?.responseData?.translatedText || '';
-  if (!ja) throw new Error('empty translation');
-  translateCache.set(key, ja);
-  if (translateCache.size > 500) translateCache.delete(translateCache.keys().next().value);
-  return { ok:true, ja, source:'mymemory', rawStatus:j?.responseStatus };
+  let lastErr = null;
+  for (const fn of [translateByGoogleGtx, translateByMyMemory]) {
+    try {
+      const r = await fn(text);
+      translateCache.set(key, r.ja);
+      if (translateCache.size > 500) translateCache.delete(translateCache.keys().next().value);
+      return r;
+    } catch(e) { lastErr = e; }
+  }
+  return { ok:false, error:String(lastErr?.message || lastErr || 'translation failed') };
 }
 
 async function checkSentence(text, withTranslate = false) {
@@ -322,57 +286,27 @@ async function checkSentence(text, withTranslate = false) {
 
   if (!parsed.ok) {
     return {
-      originalText,
-      text: checkedText,
-      normalized: proof.normalized,
-      appliedCorrections: proof.appliedCorrections || [],
-      ok:false,
-      gameOk:false,
-      kind:'Link Grammar + HF Acceptability',
-      sentenceType:null,
-      reason:'link grammar parse failed',
-      proof,
-      fullParse: parsed.fullParse,
-      strictLinkGrammar: parsed.strictLinkGrammar,
-      linkages: parsed.linkages,
-      nullCount: parsed.nullCount,
-      stdout: parsed.stdout,
-      stderr: parsed.stderr,
-      code: parsed.code,
-      acceptability:null,
-      ja:'',
-      translation:null
+      originalText, text: checkedText, normalized: proof.normalized, appliedCorrections: proof.appliedCorrections || [],
+      ok:false, gameOk:false, kind:'Link Grammar + HF Chat Acceptability', sentenceType:null,
+      reason:'link grammar parse failed', proof,
+      fullParse: parsed.fullParse, strictLinkGrammar: parsed.strictLinkGrammar,
+      linkages: parsed.linkages, nullCount: parsed.nullCount, stdout: parsed.stdout, stderr: parsed.stderr, code: parsed.code,
+      acceptability:null, ja:'', translation:null
     };
   }
 
   const acceptability = await judgeAcceptability(checkedText);
   const ok = !!acceptability.ok;
   let translation = null;
-  if (ok && withTranslate) {
-    try { translation = await translateToJapanese(checkedText); }
-    catch (e) { translation = { ok:false, error:String(e.message || e) }; }
-  }
+  if (ok && withTranslate) translation = await translateToJapanese(checkedText);
   return {
-    originalText,
-    text: checkedText,
-    normalized: proof.normalized,
-    appliedCorrections: proof.appliedCorrections || [],
-    ok,
-    gameOk: ok,
-    kind:'Link Grammar + HF Acceptability',
-    sentenceType: ok ? 'LG_HF_ACCEPTED' : null,
-    reason: ok ? '' : (acceptability.reason || 'acceptability rejected'),
-    proof,
-    fullParse: parsed.fullParse,
-    strictLinkGrammar: parsed.strictLinkGrammar,
-    linkages: parsed.linkages,
-    nullCount: parsed.nullCount,
-    stdout: parsed.stdout,
-    stderr: parsed.stderr,
-    code: parsed.code,
-    acceptability,
-    ja: translation?.ja || '',
-    translation
+    originalText, text: checkedText, normalized: proof.normalized, appliedCorrections: proof.appliedCorrections || [],
+    ok, gameOk: ok, kind:'Link Grammar + HF Chat Acceptability',
+    sentenceType: ok ? (acceptability.sentenceType || 'LG_HF_CHAT_ACCEPTED') : null,
+    reason: ok ? '' : (acceptability.reason || 'acceptability rejected'), proof,
+    fullParse: parsed.fullParse, strictLinkGrammar: parsed.strictLinkGrammar,
+    linkages: parsed.linkages, nullCount: parsed.nullCount, stdout: parsed.stdout, stderr: parsed.stderr, code: parsed.code,
+    acceptability, ja: translation?.ja || '', translation
   };
 }
 
@@ -384,12 +318,9 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-plus-hf-acceptability-router',
-        acceptabilityModel: ACCEPTABILITY_MODEL,
-        acceptabilityThreshold: ACCEPTABILITY_THRESHOLD,
-        hfProvider: HF_PROVIDER,
-        zeroShotFallback: HF_ZERO_SHOT_FALLBACK,
-        zeroShotModel: HF_ZERO_SHOT_MODEL,
+        mode:'link-grammar-plus-hf-chat-acceptability',
+        hfChatModel: HF_CHAT_MODEL,
+        hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN
       });
     }
@@ -419,4 +350,4 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => console.log(`Link Grammar + HF Acceptability API listening on ${PORT}`));
+server.listen(PORT, () => console.log(`Link Grammar + HF Chat Acceptability API listening on ${PORT}`));
