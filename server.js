@@ -752,11 +752,6 @@ function buildSentenceImageQueries(sentence) {
   const modalWords = new Set(['can','will','would','could','should','must','may','might']);
 
   const subject = pronounSubject.has(first) ? 'child' : (pluralSubject.has(first) ? 'children' : first);
-  let i = 1;
-  while (i < words.length && (modalWords.has(words[i]) || beWords.has(words[i]))) i++;
-  const verb = words[i] || '';
-  const rest = words.slice(i + 1).filter(w => !['to','of','for','in','on','at'].includes(w) || words.length <= 4);
-  const restText = rest.join(' ');
   const originalNoArticles = words.join(' ');
 
   const queries = [];
@@ -769,7 +764,26 @@ function buildSentenceImageQueries(sentence) {
     if (q && !queries.includes(q)) queries.push(q);
   }
 
-  if (verb) {
+  // be + adjective/state sentence: do NOT treat the adjective as a verb.
+  // e.g. I am sad -> child sad face illustration, NOT child sadding illustration.
+  // Put the human subject first so Pixabay does not drift to unrelated happy/sad objects or animals.
+  if (words.length >= 3 && beWords.has(words[1])) {
+    const stateWords = words.slice(2).filter(w => !['very','today','now','everyday'].includes(w));
+    const stateText = stateWords.join(' ');
+    if (stateText) {
+      add([subject, stateText, 'face', 'illustration'].filter(Boolean).join(' '));
+      add([subject, stateText, 'emotion', 'illustration'].filter(Boolean).join(' '));
+      add([subject, stateText, 'cartoon', 'illustration'].filter(Boolean).join(' '));
+      add([stateText, subject, 'illustration'].filter(Boolean).join(' '));
+    }
+  }
+
+  let i = 1;
+  while (i < words.length && modalWords.has(words[i])) i++;
+  const verb = words[i] || '';
+  const rest = words.slice(i + 1).filter(w => !['to','of','for','in','on','at'].includes(w) || words.length <= 4);
+  const restText = rest.join(' ');
+  if (verb && !beWords.has(verb)) {
     const gerund = toPixabayGerund(verb);
     add([subject, gerund, restText, 'illustration'].filter(Boolean).join(' '));
     add([subject, verb, restText, 'illustration'].filter(Boolean).join(' '));
@@ -777,16 +791,18 @@ function buildSentenceImageQueries(sentence) {
   }
   add([subject, restText, 'illustration'].filter(Boolean).join(' '));
   add([originalNoArticles, 'illustration'].filter(Boolean).join(' '));
-  return queries.slice(0, 5);
+  return queries.slice(0, 6);
 }
 function scorePixabayHit(hit, query) {
   const text = sentenceImageNorm([hit?.tags, hit?.name, hit?.type].filter(Boolean).join(' '));
-  const qWords = sentenceImageWords(query).filter(w => !['illustration','image','picture'].includes(w));
+  const textWords = new Set(text.split(/\s+/).filter(Boolean));
+  const qWords = sentenceImageWords(query).filter(w => !['illustration','image','picture','cartoon','emotion'].includes(w));
   let score = 0;
+  let matchedCore = 0;
   for (const w of qWords) {
     if (!w) continue;
-    if (text.split(/\s+/).includes(w)) score += 8;
-    else if (text.includes(w)) score += 3;
+    if (textWords.has(w)) { score += 8; matchedCore++; }
+    else if (text.includes(w)) { score += 3; matchedCore += 0.4; }
   }
   if (String(hit?.type || '').includes('vector')) score += 8;
   if (String(hit?.type || '').includes('illustration')) score += 6;
@@ -794,19 +810,25 @@ function scorePixabayHit(hit, query) {
   if (hit?.isLowQuality === true) score -= 80;
   if (hit?.isAiGenerated === true) score -= 25;
   const tags = text;
-  if (/\b(child|kid|boy|girl|person|people|student|player)\b/.test(tags)) score += 8;
-  if (/\b(icon|symbol|background|pattern)\b/.test(tags)) score -= 10;
+  const humanWanted = qWords.some(w => ['child','children','boy','girl','person','people','student','player'].includes(w));
+  const humanHit = /\b(child|kid|boy|girl|person|people|student|player|teen|pupil|man|woman)\b/.test(tags);
+  if (humanHit) score += 8;
+  if (humanWanted && !humanHit) score -= 18;
+  if (humanWanted && /\b(elephant|animal|dog|cat|bird|horse|lion|bear|pet|mammal)\b/.test(tags)) score -= 26;
+  if (/\b(icon|symbol|background|pattern|wallpaper|texture)\b/.test(tags)) score -= 12;
+  if (matchedCore < 1.5) score -= 18;
   const w = Number(hit?.webformatWidth || hit?.imageWidth || 0);
   const h = Number(hit?.webformatHeight || hit?.imageHeight || 0);
   if (w && h) {
     const ratio = w / h;
-    if (ratio > 0.55 && ratio < 1.8) score += 4;
-    if (ratio < 0.35 || ratio > 2.6) score -= 10;
+    if (ratio > 0.45 && ratio < 1.9) score += 4;
+    if (ratio < 0.28 || ratio > 2.8) score -= 10;
   }
   score += Math.min(10, Number(hit?.likes || 0) / 12);
   score += Math.min(8, Number(hit?.downloads || 0) / 15000);
   return score;
 }
+
 async function searchPixabayImages(query) {
   const params = new URLSearchParams({
     key: PIXABAY_API_KEY,
