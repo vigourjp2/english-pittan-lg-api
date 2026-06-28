@@ -38,8 +38,8 @@ const REASON_JOB_RETRY_DELAYS_MS = (process.env.REASON_JOB_RETRY_DELAYS_MS || '3
 const REASON_JOB_MAX_ATTEMPTS_RAW = Number(process.env.REASON_JOB_MAX_ATTEMPTS || 3);
 const REASON_JOB_MAX_ATTEMPTS = Math.max(1, Math.min(5, Number.isFinite(REASON_JOB_MAX_ATTEMPTS_RAW) ? REASON_JOB_MAX_ATTEMPTS_RAW : 3)); // v26: Render環境変数が999999等でも強制クランプ、標準3回
 const REASON_JOB_MAX_CACHE = Number(process.env.REASON_JOB_MAX_CACHE || 800);
-const REASON_JOB_TIMEOUT_MS = Math.max(3000, Number(process.env.REASON_JOB_TIMEOUT_MS || 12000)); // v49: 1つの理由jobが固まって全体キューを塞がないための外部I/Oタイムアウト。候補探索の打ち切り上限ではない。
-const REASON_CANDIDATE_TIMEOUT_MS = Math.max(1000, Number(process.env.REASON_CANDIDATE_TIMEOUT_MS || 4500)); // v49: 候補1件ごとのAPI待ち防止。候補数上限ではない。
+const REASON_JOB_TIMEOUT_MS = Math.max(3000, Number(process.env.REASON_JOB_TIMEOUT_MS || 30000)); // v51: 理由job全体の安全弁。候補数の打ち切りではなく、外部I/Oハングでキューを塞がないため。
+const REASON_CANDIDATE_TIMEOUT_MS = Math.max(1000, Number(process.env.REASON_CANDIDATE_TIMEOUT_MS || 2500)); // v51: 候補1件ごとの軽量判定I/O安全弁。候補数上限ではない。
 const reasonJobs = new Map();
 let reasonQueueRunning = false;
 let reasonQueueTimer = null;
@@ -1183,15 +1183,17 @@ async function explainByExploration(text, diagnostics = {}) {
       return value;
     }
 
-    const ev = await withReasonTimeout(evaluateGameTextExact(t), REASON_CANDIDATE_TIMEOUT_MS, `reason final candidate ${t}`);
-    const ok = !!ev.gameOk;
+    // v51: reason探索ではHFネットワークを呼ばない。
+    // /check の本判定は引き続きHF込みだが、理由探索で候補ごとにHFを呼ぶと12秒超過でjob全体が落ちる。
+    // ここでは Strict Link Grammar + LanguageTool を「理由候補の軽量オラクル」として使い、
+    // 実際にカードを置いた時の最終成立判定は通常の /check(HF込み) に任せる。
     const value = {
-      ok,
-      stage: ok ? 'final-accepted' : 'final-rejected',
-      parsed:ev.parsed,
-      languageTool:ev.languageTool,
-      acceptability:ev.acceptability,
-      hfAcceptability:ev.hfAcceptability,
+      ok:true,
+      stage:'light-accepted-for-reason-hf-skipped',
+      parsed:light.parsed,
+      languageTool:light.languageTool,
+      acceptability:light.acceptability,
+      hfAcceptability:{ checked:false, skipped:true, reason:'HF network is intentionally not called inside reason exploration v51' },
       text:t
     };
     checked.set(k, value);
@@ -1313,8 +1315,12 @@ async function explainByExploration(text, diagnostics = {}) {
           fullParse: r.parsed.fullParse,
           strictLinkGrammar: r.parsed.strictLinkGrammar,
           languageToolBlocking: !!r.acceptability?.languageToolBlocking,
-          languageToolBlockingRuleId: r.acceptability?.blockingRuleId || ''
+          languageToolBlockingRuleId: r.acceptability?.blockingRuleId || '',
+          reasonCandidateStage: r.stage || ''
         });
+        // v51: 最短手数レベル内で成立候補を1件見つけたら即返す。
+        // 候補数上限ではなく、成功後に無意味な外部I/Oを続けないため。
+        return found;
       }
     }
     return found;
@@ -1359,12 +1365,12 @@ async function explainByExploration(text, diagnostics = {}) {
       explanationEn = `Adding "${top.candidate}" and "${top.candidate2}" before this makes a complete sentence: ${top.sentence}`;
     }
   } else {
-    explanationJa = `Strict Link Grammarでは完全な英文になりませんでした。現在渡された盤面・手札・候補カードを最短手数ごとに調べましたが、成立する経路は見つかりませんでした。`;
-    explanationEn = `Strict Link Grammar could not build a complete sentence. I checked the finite board/hand/candidate set by shortest edit distance with a light-first staged judgement and did not find a completing path.`;
+    explanationJa = `Strict Link Grammarでは完全な英文になりませんでした。現在渡された盤面・手札・候補カードを軽量判定で調べましたが、成立する経路は見つかりませんでした。`;
+    explanationEn = `Strict Link Grammar could not build a complete sentence. I checked the finite board/hand/candidate set by shortest edit distance with a fast light oracle and did not find a completing path.`;
   }
   return {
     ok:true,
-    method:'strict-link-grammar-oracle-exploration-v50-staged-timeout-isolated-browser-context',
+    method:'strict-link-grammar-oracle-exploration-v51-fast-light-oracle-no-hf-network-in-reason',
     model:'none',
     observedStructure: top ? 'nearest successful path found by staged light-first exploration' : 'no successful path found in staged finite candidate set',
     incompletePart: top ? top.action : 'not found in exhaustive finite candidate set',
@@ -1376,9 +1382,11 @@ async function explainByExploration(text, diagnostics = {}) {
       exploration:true,
       exhaustive:true,
       stagedReason:true,
+      fastFirstSuccess:true,
       timeoutIsolated:true,
       lightFirst:true,
-      hfOnlyAfterLightAccept:true,
+      hfOnlyAfterLightAccept:false,
+      hfNetworkSkippedInReason:true,
       noArbitraryCandidateBudget:true,
       text:src,
       words,
@@ -1810,11 +1818,11 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-plus-languagetool-error-gate-v50-browser-context-debug',
+        mode:'link-grammar-plus-languagetool-error-gate-v51-fast-reason-light-oracle',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v50-browser-context-debug',
+        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v51-fast-reason-light-oracle',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:!ACCEPTABILITY_HF_ENABLED,
@@ -1824,8 +1832,8 @@ const server = http.createServer(async (req, res) => {
         hfAcceptabilityStats,
         hfAcceptabilityCacheSize: hfAcceptabilityCache.size,
         hfAcceptabilityCacheKeyPolicy:'exact-text-case-sensitive-v45',
-        reasonExplorePolicy:'staged-light-first-with-timeout-isolation-plus-browser-query-context-v50',
-        browserQueryContext:true,
+        reasonExplorePolicy:'fast-light-oracle-for-reason-hf-not-called-in-reason-v51',
+        browserQueryContext:true, reasonHfNetworkDisabled:true,
         acceptanceGate:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate',
         pixabayKeyPresent: !!PIXABAY_API_KEY,
         hfModelScanVersion: 'v2-no-generation-params-for-classifiers',
@@ -1943,7 +1951,7 @@ const server = http.createServer(async (req, res) => {
         text,
         elapsedMs: Date.now() - startedAt,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v50-browser-context-debug',
+        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v51-fast-reason-light-oracle',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:!ACCEPTABILITY_HF_ENABLED,
@@ -1953,8 +1961,8 @@ const server = http.createServer(async (req, res) => {
         hfAcceptabilityStats,
         hfAcceptabilityCacheSize: hfAcceptabilityCache.size,
         hfAcceptabilityCacheKeyPolicy:'exact-text-case-sensitive-v45',
-        reasonExplorePolicy:'staged-light-first-with-timeout-isolation-plus-browser-query-context-v50',
-        browserQueryContext:true,
+        reasonExplorePolicy:'fast-light-oracle-for-reason-hf-not-called-in-reason-v51',
+        browserQueryContext:true, reasonHfNetworkDisabled:true,
         acceptanceGate:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
@@ -1966,7 +1974,7 @@ const server = http.createServer(async (req, res) => {
       const text = await getTextFromReq(req, url);
       if (!text) return send(res, 400, { ok:false, error:'empty text' });
       const diagnostics = {
-        judgeSource:'manual-browser-reason-context-test-v50',
+        judgeSource:'manual-browser-reason-context-test-v51',
         reasonBoardCandidates: wordsFromQuery(url, ['reasonBoardCandidates','boardCandidates','board','boardWords'], 80),
         reasonHandCandidates: wordsFromQuery(url, ['reasonHandCandidates','handCandidates','hand','handWords'], 80),
         reasonDeckCandidates: wordsFromQuery(url, ['reasonDeckCandidates','reasonCandidates','deckCandidates','deck','deckWords'], 220)
