@@ -1264,7 +1264,7 @@ function limitedPermutations(arr, max = 120) {
 function reasonLocalPrefilter(sentence) {
   // v58: 撤去済み。ローカルの助動詞/動詞リストで候補を捨てない。
   // 浅い候補可否は実績ある外部HF分類器だけに投げる。HF Chatは使わない。
-  return { ok:true, reason:'removed-v63-depth-timeslice-debug-fixed' };
+  return { ok:true, reason:'removed-v64-custom-model-benchmark' };
 }
 
 async function explainByExploration(text, diagnostics = {}) {
@@ -1638,7 +1638,7 @@ async function explainByExploration(text, diagnostics = {}) {
   }
   return {
     ok:true,
-    method:'strict-link-grammar-oracle-exploration-v63-depth-timeslice-debug-fixed',
+    method:'strict-link-grammar-oracle-exploration-v64-custom-model-benchmark',
     model:'none',
     observedStructure: top ? 'nearest successful path found and confirmed by final HF display filter' : 'no successful path found in staged finite candidate set',
     incompletePart: top ? top.action : 'not found in exhaustive finite candidate set',
@@ -1656,7 +1656,7 @@ async function explainByExploration(text, diagnostics = {}) {
       hfOnlyAfterLightAccept:true,
       hfNetworkSkippedInReason:false,
       hfFinalDisplayFilter:true,
-      externalShallowJudge:'hf-classifier-depth-timeslice-v63-debug-fixed',
+      externalShallowJudge:'hf-classifier-depth-timeslice-v64-custom-benchmark',
       localGrammarPrefilter:false,
       hfChatUsed:false,
       externalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH,
@@ -2105,11 +2105,11 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-plus-languagetool-error-gate-v63-depth-timeslice-debug-fixed',
+        mode:'link-grammar-plus-languagetool-error-gate-v64-custom-model-benchmark',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v63-depth-timeslice-debug-fixed',
+        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v64-custom-model-benchmark',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:!ACCEPTABILITY_HF_ENABLED,
@@ -2119,8 +2119,8 @@ const server = http.createServer(async (req, res) => {
         hfAcceptabilityStats,
         hfAcceptabilityCacheSize: hfAcceptabilityCache.size,
         hfAcceptabilityCacheKeyPolicy:'exact-text-case-sensitive-v45',
-        reasonExplorePolicy:'depth-timeslice-action-bucket-plus-external-classifier-v63-debug-fixed',
-        browserQueryContext:true, reasonHfNetworkDisabled:false, reasonDisplayHfFilter:true, reasonExternalShallowJudge:'hf-classifier-depth-timeslice-v63-debug-fixed', reasonLocalPrefilterEnabled:false, reasonFinalHfTimeoutMs:REASON_FINAL_HF_TIMEOUT_MS, reasonFinalHfParallel:REASON_FINAL_HF_PARALLEL, reasonExternalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH, reasonLightCandidateWindowPerDepth:REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH, reasonActionBucketQuota:REASON_ACTION_BUCKET_QUOTA, reasonStreamingSoftDeadlineMs:REASON_STREAMING_SOFT_DEADLINE_MS,
+        reasonExplorePolicy:'depth-timeslice-action-bucket-plus-external-classifier-v64-custom-benchmark',
+        browserQueryContext:true, reasonHfNetworkDisabled:false, reasonDisplayHfFilter:true, reasonExternalShallowJudge:'hf-classifier-depth-timeslice-v64-custom-benchmark', reasonLocalPrefilterEnabled:false, reasonFinalHfTimeoutMs:REASON_FINAL_HF_TIMEOUT_MS, reasonFinalHfParallel:REASON_FINAL_HF_PARALLEL, reasonExternalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH, reasonLightCandidateWindowPerDepth:REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH, reasonActionBucketQuota:REASON_ACTION_BUCKET_QUOTA, reasonStreamingSoftDeadlineMs:REASON_STREAMING_SOFT_DEADLINE_MS,
         acceptanceGate:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate',
         pixabayKeyPresent: !!PIXABAY_API_KEY,
         hfModelScanVersion: 'v2-no-generation-params-for-classifiers',
@@ -2177,6 +2177,74 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { text, ...(await translateToJapanese(text)) });
     }
 
+
+function parseBenchmarkSamples(url) {
+  const rawSamples = [];
+  for (const v of url.searchParams.getAll('sample')) rawSamples.push(v);
+  for (const v of url.searchParams.getAll('text')) rawSamples.push(v);
+  const joined = url.searchParams.get('samples') || '';
+  if (joined) {
+    for (const part of joined.split(/\s*\|\|\s*|\s*\n\s*/).map(x => x.trim()).filter(Boolean)) rawSamples.push(part);
+  }
+  const cleaned = [];
+  const seen = new Set();
+  for (const x of rawSamples) {
+    const t = normalizeText(x);
+    const k = t.toLowerCase();
+    if (!t || seen.has(k)) continue;
+    seen.add(k);
+    cleaned.push(t);
+    if (cleaned.length >= 24) break;
+  }
+  return cleaned;
+}
+
+async function diagnoseCustomBenchmark(url) {
+  const scanAll = url.searchParams.get('scan') === '1';
+  const model = url.searchParams.get('model') || '';
+  let samples = parseBenchmarkSamples(url);
+  if (samples.length === 0) {
+    samples = [
+      'I am happy today',
+      'I must be happy today',
+      'happy today he must',
+      'happy now should',
+      'should Japanese now',
+      'I am Japanese now',
+      'I like Japanese now',
+      'walking am happy',
+      'eating am happy',
+      'he am happy'
+    ];
+  }
+  const results = [];
+  for (const sample of samples) {
+    results.push(await diagnoseAcceptabilityWithModels(sample, model, scanAll));
+  }
+  const matrix = results.map(r => {
+    const judgements = r?.hfDiagnostic?.judgements || [];
+    return {
+      text: r.text,
+      baseGameOk: !!(r.baseGate?.ok && r.baseGate?.gameOk !== false && r.baseGate?.type === 'complete_sentence'),
+      languageToolBlocking: !!r.baseGate?.languageToolBlocking,
+      rejectedBy: judgements.filter(j => j.ok && j.acceptable === false).map(j => ({ model:j.model, confidence:j.confidence, reason:j.reason, top:j.top })).slice(0, 10),
+      acceptedBy: judgements.filter(j => j.ok && j.acceptable === true).map(j => ({ model:j.model, confidence:j.confidence, reason:j.reason, top:j.top })).slice(0, 10),
+      unavailable: judgements.filter(j => !j.ok || j.acceptable === null).map(j => ({ model:j.model, error:j.error || '', reason:j.reason || '' })).slice(0, 10)
+    };
+  });
+  return {
+    ok:true,
+    version:'v64-custom-model-benchmark-for-modal-inversion-cases',
+    note:'diagnostic only; /check is unchanged. Use scan=1 to compare all HF_SCAN_MODELS. Use sample=... repeatedly or samples=a||b||c for custom cases.',
+    model:model || (scanAll ? 'HF_SCAN_MODELS' : 'textattack/roberta-base-CoLA'),
+    scanAll,
+    samples,
+    matrix,
+    results
+  };
+}
+
+
     if (url.pathname === '/sentence-image') {
       const text = url.searchParams.get('q') || url.searchParams.get('text') || '';
       if (!text) return send(res, 400, { ok:false, error:'missing q' });
@@ -2188,7 +2256,14 @@ const server = http.createServer(async (req, res) => {
       if (!text) return send(res, 400, { ok:false, error:'empty text' });
       return send(res, 200, await diagnoseAcceptabilityWithModels(text, url.searchParams.get('model') || '', url.searchParams.get('scan') === '1'));
     }
+
+    if (url.pathname === '/diagnose-custom-benchmark' || url.pathname === '/diagnose-model-custom' || url.pathname === '/diagnose-modal-benchmark') {
+      return send(res, 200, await diagnoseCustomBenchmark(url));
+    }
     if (url.pathname === '/diagnose-model-benchmark') {
+      if (url.searchParams.has('text') || url.searchParams.has('sample') || url.searchParams.has('samples')) {
+        return send(res, 200, await diagnoseCustomBenchmark(url));
+      }
       const scanAll = url.searchParams.get('scan') === '1';
       const model = url.searchParams.get('model') || '';
       const samples = [
@@ -2238,7 +2313,7 @@ const server = http.createServer(async (req, res) => {
         text,
         elapsedMs: Date.now() - startedAt,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v63-depth-timeslice-debug-fixed',
+        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v64-custom-model-benchmark',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:!ACCEPTABILITY_HF_ENABLED,
@@ -2248,8 +2323,8 @@ const server = http.createServer(async (req, res) => {
         hfAcceptabilityStats,
         hfAcceptabilityCacheSize: hfAcceptabilityCache.size,
         hfAcceptabilityCacheKeyPolicy:'exact-text-case-sensitive-v45',
-        reasonExplorePolicy:'depth-timeslice-action-bucket-plus-external-classifier-v63-debug-fixed',
-        browserQueryContext:true, reasonHfNetworkDisabled:false, reasonDisplayHfFilter:true, reasonExternalShallowJudge:'hf-classifier-depth-timeslice-v63-debug-fixed', reasonLocalPrefilterEnabled:false, reasonFinalHfTimeoutMs:REASON_FINAL_HF_TIMEOUT_MS, reasonFinalHfParallel:REASON_FINAL_HF_PARALLEL, reasonExternalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH, reasonLightCandidateWindowPerDepth:REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH, reasonActionBucketQuota:REASON_ACTION_BUCKET_QUOTA, reasonStreamingSoftDeadlineMs:REASON_STREAMING_SOFT_DEADLINE_MS,
+        reasonExplorePolicy:'depth-timeslice-action-bucket-plus-external-classifier-v64-custom-benchmark',
+        browserQueryContext:true, reasonHfNetworkDisabled:false, reasonDisplayHfFilter:true, reasonExternalShallowJudge:'hf-classifier-depth-timeslice-v64-custom-benchmark', reasonLocalPrefilterEnabled:false, reasonFinalHfTimeoutMs:REASON_FINAL_HF_TIMEOUT_MS, reasonFinalHfParallel:REASON_FINAL_HF_PARALLEL, reasonExternalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH, reasonLightCandidateWindowPerDepth:REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH, reasonActionBucketQuota:REASON_ACTION_BUCKET_QUOTA, reasonStreamingSoftDeadlineMs:REASON_STREAMING_SOFT_DEADLINE_MS,
         acceptanceGate:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
