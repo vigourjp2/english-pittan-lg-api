@@ -13,7 +13,9 @@ const HF_MODEL_SCAN_TIMEOUT_MS = Number(process.env.HF_MODEL_SCAN_TIMEOUT_MS || 
 // Reason suggestions are verified with the same game gate and redundant time-adverb stacking is rejected.
 const HF_SCAN_MODELS = (process.env.HF_SCAN_MODELS || 'textattack/roberta-base-CoLA,abdulmatinomotoso/English_Grammar_Checker,agentlans/snowflake-arctic-xs-grammar-classifier,nikolasmoya/c4-binary-english-grammar-checker,pszemraj/electra-small-discriminator-CoLA,textattack/bert-base-uncased-CoLA,EstherT/sentence-acceptability').split(',').map(s => s.trim()).filter(Boolean);
 const ACCEPTABILITY_HF_ENABLED = !/^false|0|off$/i.test(String(process.env.ACCEPTABILITY_HF_ENABLED || 'true'));
-const ACCEPTABILITY_HF_GAME_GATE_ENABLED = !/^false|0|off$/i.test(String(process.env.ACCEPTABILITY_HF_GAME_GATE_ENABLED || 'true'));
+// v99: HF/CoLA系の外部acceptability分類器は短い初級文（例: be + adjective）をfalse rejectするため、
+// ゲーム成立のvetoには使わない。必要な場合だけ環境変数で明示ON。
+const ACCEPTABILITY_HF_GAME_GATE_ENABLED = /^true|1|on$/i.test(String(process.env.ACCEPTABILITY_HF_GAME_GATE_ENABLED || 'false'));
 const ACCEPTABILITY_HF_MODEL = process.env.ACCEPTABILITY_HF_MODEL || 'abdulmatinomotoso/English_Grammar_Checker';
 // v74: add a second external classifier gate that only rejects when it returns a clear unacceptable verdict.
 // This is not a sentence/word rule; it is an additional HF model vote.
@@ -129,7 +131,8 @@ function reasonContextSignature(diagnostics = {}) {
   const board = uniqueWordsFromArray(diagnostics.reasonBoardCandidates || diagnostics.boardCandidates || [], 80);
   const hand = uniqueWordsFromArray(diagnostics.reasonHandCandidates || diagnostics.handCandidates || [], 40);
   const deck = uniqueWordsFromArray(diagnostics.reasonDeckCandidates || diagnostics.reasonCandidates || diagnostics.deckCandidates || [], 220);
-  const sig = JSON.stringify({ board, hand, deck });
+  const wm = normalizeWordMetaList(diagnostics.reasonWordMetaMap || diagnostics.wordMetaMap || diagnostics.allWordMeta || []).map(m => [m.w, m.pos]).slice(0, 260);
+  const sig = JSON.stringify({ board, hand, deck, wm });
   let h = 2166136261;
   for (let i = 0; i < sig.length; i++) {
     h ^= sig.charCodeAt(i);
@@ -155,7 +158,8 @@ function reasonDiagnosticsForJob(diagnostics = {}) {
     linkages: Number(diagnostics.linkages || 0),
     reasonBoardCandidates: uniqueWordsFromArray(diagnostics.reasonBoardCandidates || diagnostics.boardCandidates || [], 80),
     reasonHandCandidates: uniqueWordsFromArray(diagnostics.reasonHandCandidates || diagnostics.handCandidates || [], 40),
-    reasonDeckCandidates: uniqueWordsFromArray(diagnostics.reasonDeckCandidates || diagnostics.reasonCandidates || diagnostics.deckCandidates || [], 220)
+    reasonDeckCandidates: uniqueWordsFromArray(diagnostics.reasonDeckCandidates || diagnostics.reasonCandidates || diagnostics.deckCandidates || [], 220),
+    reasonWordMetaMap: normalizeWordMetaList(diagnostics.reasonWordMetaMap || diagnostics.wordMetaMap || diagnostics.allWordMeta || [])
   };
 }
 function trimReasonJobs() {
@@ -600,30 +604,78 @@ function normalizeWordMetaList(wordMeta) {
     return { w, pos };
   }).filter(Boolean);
 }
+function normalizeReasonWordMetaMap(input) {
+  let src = input;
+  if (typeof src === 'string') {
+    try { src = JSON.parse(src); } catch { src = []; }
+  }
+  const list = Array.isArray(src) ? src : (src && typeof src === 'object' ? Object.values(src) : []);
+  const map = new Map();
+  for (const m of normalizeWordMetaList(list)) {
+    const k = m.w.toLowerCase();
+    if (!map.has(k) || (map.get(k).pos || []).length < m.pos.length) map.set(k, m);
+  }
+  return map;
+}
+function wordMetaFromMapForWords(words, diagnostics = {}) {
+  const map = normalizeReasonWordMetaMap(diagnostics.reasonWordMetaMap || diagnostics.wordMetaMap || diagnostics.allWordMeta || []);
+  if (!map.size) return normalizeWordMetaList(diagnostics.wordMeta || []);
+  return canonicalGameWords(words || []).map(w => {
+    const found = map.get(String(w).toLowerCase());
+    return found ? { w, pos:[...(found.pos || [])] } : { w, pos:[] };
+  }).filter(x => x.w);
+}
+function hasMetaPos(m, pos) { return Array.isArray(m?.pos) && m.pos.includes(pos); }
+function hasAnyMetaPos(m, poses) { return Array.isArray(m?.pos) && poses.some(p => m.pos.includes(p)); }
 function applyGameSemanticGate(text, acceptability, options = {}) {
   if (!(acceptability?.ok && acceptability?.gameOk !== false && acceptability?.type === 'complete_sentence')) return acceptability;
   const meta = normalizeWordMetaList(options.wordMeta);
   if (!meta.length) return acceptability;
+  const rejectByPos = (kind, displayKind, noteJa, noteEn) => ({
+    ok:false,
+    gameOk:false,
+    type:kind,
+    method:(acceptability.method || 'strict-link-grammar-plus-languagetool') + '+game-semantic-pos-gate',
+    reason:noteEn || noteJa || kind,
+    sentenceType:'not_complete_sentence',
+    utteranceType:kind,
+    displayKind,
+    jaHint:'',
+    noteJa,
+    noteEn,
+    gate:'game-semantic-pos-metadata-gate-v98',
+    hfUsed:false,
+    languageToolBlocking:false,
+    semanticGateSource:'client-word-pos-metadata',
+    baseAcceptability:acceptability
+  });
+
   const timeWords = meta.filter(m => m.pos.includes('advTime')).map(m => m.w);
   if (timeWords.length >= 2) {
-    return {
-      ok:false,
-      gameOk:false,
-      type:'semantic_overlap',
-      method:(acceptability.method || 'strict-link-grammar-plus-languagetool') + '+game-semantic-pos-gate',
-      reason:`redundant advTime cards: ${timeWords.join(', ')}`,
-      sentenceType:'not_complete_sentence',
-      utteranceType:'semantic_overlap',
-      displayKind:'時間表現の重複',
-      jaHint:'',
-      noteJa:`advTimeカード（${timeWords.join(' / ')}）が重複しています。ゲームの成立候補としては扱いません。`,
-      noteEn:`Redundant advTime cards: ${timeWords.join(', ')}`,
-      gate:'game-semantic-advtime-pos-overlap-v97',
-      hfUsed:false,
-      languageToolBlocking:false,
-      semanticGateSource:'client-word-pos-metadata',
-      baseAcceptability:acceptability
-    };
+    return rejectByPos(
+      'semantic_overlap',
+      '時間表現の重複',
+      `advTimeカード（${timeWords.join(' / ')}）が重複しています。ゲームの成立候補としては扱いません。`,
+      `Redundant advTime cards: ${timeWords.join(', ')}`
+    );
+  }
+
+  // v98: 単語名ではなくカードのposメタデータだけを見る。
+  // 先頭が ing/ving で、その後ろが独立した finite clause に見える候補は、
+  // 「eating I am hungry today」のような、補完候補として不自然な前置き断片を落とす。
+  // これは eating/hungry/I などの個別語ハードコードではない。
+  if (meta.length >= 3 && hasAnyMetaPos(meta[0], ['ving','ing'])) {
+    const tail = meta.slice(1);
+    const tailStartsWithSubject = hasAnyMetaPos(tail[0], ['subj','pron']);
+    const tailHasFinite = tail.slice(1).some(m => hasAnyMetaPos(m, ['be','bePast','modal','verb','verbWant']));
+    if (tailStartsWithSubject && tailHasFinite) {
+      return rejectByPos(
+        'dangling_ing_before_clause',
+        'ing断片の前置き',
+        'ingカードが、すでに主語＋定動詞を持つ文の前に断片として付いています。ゲームの成立候補としては扱いません。',
+        'A leading ing card is attached before an independent finite clause.'
+      );
+    }
   }
   return acceptability;
 }
@@ -809,27 +861,22 @@ function applyHfAcceptabilityToLocalAcceptability(baseAccept, hfGate) {
     return { ...baseAccept, method:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate', gate:'strict-link-grammar-languagetool-hf-unavailable-open-v96', hfUsed:false, hfAcceptability:hfGate };
   }
   if (hfGate?.ok === false) {
+    // v98: 外部acceptabilityモデルは短い初級文をfalse rejectすることがある。
+    // ゲームの確定NGは Link Grammar + LanguageTool + posメタデータゲートに任せ、
+    // HF reject は診断情報として保持するだけにする。文や単語の個別救済はしない。
     const msg = hfGate?.judgement?.reason || hfGate?.reason || 'External grammar classifier rejected this sentence.';
     return {
-      ok:false,
-      gameOk:false,
-      type:'grammar_error',
-      method:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate',
-      reason: msg,
-      sentenceType:'not_complete_sentence',
-      utteranceType:'grammar_error',
-      displayKind:'文法エラー',
-      jaHint:'',
-      noteJa:`文法判定モデル: ${msg}`,
-      noteEn:msg,
-      gate:'hf-grammar-classifier-rejected',
+      ...baseAccept,
+      method:'strict-link-grammar-plus-languagetool-plus-hf-advisory',
+      gate:'strict-link-grammar-languagetool-hf-advisory-reject-v98',
       hfUsed:true,
+      hfAdvisoryReject:true,
+      hfRejectMessage:msg,
       hfAcceptability:hfGate,
-      hfModel:hfGate?.model || ACCEPTABILITY_HF_MODEL,
-      languageToolBlocking:false
+      hfModel:hfGate?.model || ACCEPTABILITY_HF_MODEL
     };
   }
-  return { ...baseAccept, method:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate', gate:'strict-link-grammar-languagetool-hf-accepted', hfUsed:!!hfGate?.checked, hfAcceptability:hfGate, hfModel:hfGate?.model || ACCEPTABILITY_HF_MODEL };
+  return { ...baseAccept, method:'strict-link-grammar-plus-languagetool-plus-hf-accepted', gate:'strict-link-grammar-languagetool-hf-accepted', hfUsed:!!hfGate?.checked, hfAcceptability:hfGate, hfModel:hfGate?.model || ACCEPTABILITY_HF_MODEL };
 }
 
 async function evaluateGameTextExact(text, options = {}) {
@@ -839,7 +886,7 @@ async function evaluateGameTextExact(text, options = {}) {
   if (strictLinkGrammarGameOk(parsed)) ltGate = await languageToolErrorGate(src);
   let acceptability = applyGameSemanticGate(src, localAcceptabilityFromLinkParserAndLt(src, parsed, ltGate), options);
   let hfGate = null;
-  if ((ACCEPTABILITY_HF_GAME_GATE_ENABLED || options.strictGameGate === true || options.acceptabilityModelGate === true) && acceptability.ok && acceptability.gameOk !== false && acceptability.type === 'complete_sentence') {
+  if (ACCEPTABILITY_HF_GAME_GATE_ENABLED && acceptability.ok && acceptability.gameOk !== false && acceptability.type === 'complete_sentence') {
     hfGate = await hfAcceptabilityGate(src);
     acceptability = applyHfAcceptabilityToLocalAcceptability(acceptability, hfGate);
   }
@@ -1272,6 +1319,10 @@ function uniqueWordsFromArray(arr, max = 160) {
   return out;
 }
 
+function parseWordMetaQuery(raw) {
+  if (!raw) return [];
+  try { return normalizeWordMetaList(JSON.parse(String(raw))); } catch { return []; }
+}
 function wordsFromQuery(url, names, max = 160) {
   // v50: browser URL debug helper. This is not grammar logic.
   // It only lets a normal address-bar URL pass hand/board/deck context
@@ -1380,7 +1431,9 @@ async function explainByExploration(text, diagnostics = {}) {
     // v95: 理由補完候補は、採点と同じゲームAPIゲートで最終確認する。
     // v80はLink Grammar + LanguageToolだけのlight判定で候補を表示したため、
     // `I am Japanese need` のような変な補完が「英文になります」と出た。
-    const light = await withReasonTimeout(evaluateGameTextExact(t, { strictGameGate:true, acceptabilityModelGate:true }), REASON_CANDIDATE_TIMEOUT_MS + 4500, `reason game-gate candidate ${t}`);
+    const candidateWords = canonicalGameWords(t.split(/\s+/));
+    const candidateWordMeta = wordMetaFromMapForWords(candidateWords, diagnostics);
+    const light = await withReasonTimeout(evaluateGameTextExact(t, { strictGameGate:true, acceptabilityModelGate:true, wordMeta:candidateWordMeta }), REASON_CANDIDATE_TIMEOUT_MS + 4500, `reason game-gate candidate ${t}`);
     if (!light.gameOk) {
       const value = {
         ok:false,
@@ -1858,7 +1911,7 @@ async function checkSentence(text, withTranslate = false, reasonMeta = {}) {
   }
   return {
     originalText, text: checkedText, normalized: proof.normalized, appliedCorrections: proof.appliedCorrections || [],
-    ok, gameOk, type, kind: (ACCEPTABILITY_HF_GAME_GATE_ENABLED || reasonMeta.strictGameGate === true || reasonMeta.acceptabilityModelGate === true) ? 'Strict Link Grammar + LanguageTool + external acceptability API gate v93' : 'Strict Link Grammar + LanguageTool Gate v77' ,
+    ok, gameOk, type, kind: (ACCEPTABILITY_HF_GAME_GATE_ENABLED || reasonMeta.strictGameGate === true || reasonMeta.acceptabilityModelGate === true) ? 'Strict Link Grammar + LanguageTool + external acceptability API advisory v99' : 'Strict Link Grammar + LanguageTool Gate v99' ,
     sentenceType: gameOk ? (acceptability.sentenceType || 'complete_sentence') : (acceptability.sentenceType || type),
     reason: gameOk ? '' : (acceptability.noteJa || acceptability.reason || reasonExplain?.explanationJa || reasonExplain?.explanationEn || ''),
     reasonSource: gameOk ? '' : (reasonDisabled ? 'reason-job-disabled-for-bulk-scan' : (acceptability.languageToolBlocking ? 'languagetool-error-gate' : (acceptability.hfUsed ? 'hf-grammar-classifier-gate' : (reasonExplain?.ok ? reasonExplain.method : 'reason-job-pending')))),
@@ -2388,7 +2441,8 @@ async function diagnoseCustomBenchmark(url) {
         judgeSource:'manual-browser-reason-context-test-v53',
         reasonBoardCandidates: wordsFromQuery(url, ['reasonBoardCandidates','boardCandidates','board','boardWords'], 80),
         reasonHandCandidates: wordsFromQuery(url, ['reasonHandCandidates','handCandidates','hand','handWords'], 80),
-        reasonDeckCandidates: wordsFromQuery(url, ['reasonDeckCandidates','reasonCandidates','deckCandidates','deck','deckWords'], 220)
+        reasonDeckCandidates: wordsFromQuery(url, ['reasonDeckCandidates','reasonCandidates','deckCandidates','deck','deckWords'], 220),
+        reasonWordMetaMap: parseWordMetaQuery(url.searchParams.get('wordMetaMap') || url.searchParams.get('reasonWordMetaMap') || '')
       };
       const job = enqueueReasonJob(normalizeText(text), diagnostics);
       return send(res, 200, {
@@ -2409,7 +2463,8 @@ async function diagnoseCustomBenchmark(url) {
         acceptabilityModelGate: url.searchParams.get('acceptabilityModelGate') === '1',
         reasonBoardCandidates: wordsFromQuery(url, ['reasonBoardCandidates','boardCandidates','board','boardWords'], 80),
         reasonHandCandidates: wordsFromQuery(url, ['reasonHandCandidates','handCandidates','hand','handWords'], 80),
-        reasonDeckCandidates: wordsFromQuery(url, ['reasonDeckCandidates','reasonCandidates','deckCandidates','deck','deckWords'], 220)
+        reasonDeckCandidates: wordsFromQuery(url, ['reasonDeckCandidates','reasonCandidates','deckCandidates','deck','deckWords'], 220),
+        reasonWordMetaMap: parseWordMetaQuery(url.searchParams.get('wordMetaMap') || url.searchParams.get('reasonWordMetaMap') || '')
       };
       const job = enqueueReasonJob(normalizeText(text), diagnostics);
       return send(res, 200, { ok:true, text: normalizeText(text), contextReceived: diagnostics, next:`/reason-result?id=${job?.id || ''}`, ...publicReasonJob(job) });
@@ -2480,6 +2535,7 @@ async function diagnoseCustomBenchmark(url) {
         reasonPrioritySeq: body.reasonPrioritySeq || body.reasonSeq || Number(url.searchParams.get('reasonPrioritySeq') || 0),
         words: Array.isArray(body.words) ? body.words : wordsFromQuery(url, ['words'], 80),
         wordMeta: Array.isArray(body.wordMeta) ? body.wordMeta : [],
+        reasonWordMetaMap: Array.isArray(body.reasonWordMetaMap) ? body.reasonWordMetaMap : (Array.isArray(body.wordMetaMap) ? body.wordMetaMap : parseWordMetaQuery(url.searchParams.get('wordMetaMap') || url.searchParams.get('reasonWordMetaMap') || '')),
         reasonBoardCandidates: body.reasonBoardCandidates || body.boardCandidates || queryBoardCandidates,
         reasonHandCandidates: body.reasonHandCandidates || body.handCandidates || queryHandCandidates,
         reasonDeckCandidates: body.reasonDeckCandidates || body.reasonCandidates || body.deckCandidates || queryDeckCandidates,
