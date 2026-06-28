@@ -1563,42 +1563,18 @@ async function explainByExploration(text, diagnostics = {}) {
     async function verifyAcceptedLight(item, light) {
       const candidateText = normalizeText(light?.text || item?.sentence || '').replace(/[.!?]+$/,'');
       if (finalHfCandidateTexts.length < 80) finalHfCandidateTexts.push(candidateText);
-      const linkGrammarOk = !!(light?.acceptability?.ok && light?.acceptability?.gameOk !== false && light?.acceptability?.type === 'complete_sentence');
-      if (!linkGrammarOk) {
+      const finalOk = !!(light?.acceptability?.ok && light?.acceptability?.gameOk !== false && light?.acceptability?.type === 'complete_sentence');
+      if (!finalOk) {
         finalHfRejected++;
         if (finalHfRejectedTexts.length < 80) finalHfRejectedTexts.push(candidateText);
         return null;
       }
-
-      // v83: Strict Link Grammar is a parser, not a complete learner-facing grammar oracle.
-      // It can full-parse bad candidate completions such as "I like they".
-      // Do not show a positive "put this card after it" suggestion unless an external
-      // acceptability classifier also returns a clear acceptable verdict. This is not a
-      // sentence-specific rule and does not hardcode pronouns/verbs. If HF is unavailable,
-      // fail closed for the reason suggestion only; the game judgement path is unchanged.
-      let hfGate = null;
-      try {
-        if (!HF_TOKEN) {
-          hfGate = { checked:false, available:false, ok:false, reason:'HF_TOKEN is not set; reason suggestion fail-closed v83' };
-        } else {
-          hfGate = await withReasonTimeout(hfAcceptabilityGate(candidateText), REASON_FINAL_HF_TIMEOUT_MS, `reason final acceptability ${candidateText}`);
-        }
-      } catch (e) {
-        hfGate = { checked:true, available:false, ok:false, reason:String(e?.message || e), error:String(e?.message || e) };
-      }
-      finalHfChecks++;
-      if (!hfGate || hfGate.ok !== true || hfGate.available === false) {
-        finalHfRejected++;
-        if (finalHfRejectedTexts.length < 80) finalHfRejectedTexts.push(candidateText);
-        return null;
-      }
-
       const final = {
         ...light,
         text:candidateText,
         ok:true,
-        stage:'strict-link-grammar-plus-external-acceptability-accepted-for-reason-display-v83',
-        hfAcceptability:hfGate
+        stage:'strict-link-grammar-accepted-for-reason-display-v80',
+        hfAcceptability:{ checked:false, skipped:true, reason:'reason display uses strict Link Grammar API result only v80' }
       };
       if (finalHfAcceptedTexts.length < 80) finalHfAcceptedTexts.push(candidateText);
       return makeSuggestionFromFinal(item.op, final);
@@ -1669,7 +1645,7 @@ async function explainByExploration(text, diagnostics = {}) {
       status:'no_verified_suggestion',
       retryable:false,
       error:'reason exploration found no verified completing path',
-      method:'strict-link-grammar-oracle-exploration-v83-external-final-gate-no-local-fallback',
+      method:'strict-link-grammar-oracle-exploration-v80-right-first-no-hf-no-local-fallback',
       suggestions:[],
       rawReason:{
         exploration:true,
@@ -1691,7 +1667,7 @@ async function explainByExploration(text, diagnostics = {}) {
   }
   return {
     ok:true,
-    method:'strict-link-grammar-oracle-exploration-v83-external-final-gate-no-local-fallback',
+    method:'strict-link-grammar-oracle-exploration-v80-right-first-no-hf-no-local-fallback',
     model:'none',
     observedStructure: top ? 'nearest successful path found by strict Link Grammar API exploration' : 'no successful path found in staged finite candidate set',
     incompletePart: top ? top.action : 'not found in exhaustive finite candidate set',
@@ -1706,10 +1682,10 @@ async function explainByExploration(text, diagnostics = {}) {
       fastFirstSuccess:true,
       timeoutIsolated:true,
       lightFirst:true,
-      hfOnlyAfterLightAccept:true,
-      hfNetworkSkippedInReason:false,
-      hfFinalDisplayFilter:true,
-      externalShallowJudge:'final-reason-suggestion-requires-hf-acceptability-v83',
+      hfOnlyAfterLightAccept:false,
+      hfNetworkSkippedInReason:true,
+      hfFinalDisplayFilter:false,
+      externalShallowJudge:'disabled-reason-uses-strict-link-grammar-api-only-v80',
       localGrammarPrefilter:false,
       hfChatUsed:false,
       externalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH,
@@ -1870,13 +1846,13 @@ async function checkSentenceBatch(req) {
   }
   const items = [...seen.values()];
   const results = [];
-  const concurrency = Math.max(1, Math.min(Number(process.env.BATCH_CONCURRENCY || 8), 12));
+  const concurrency = Math.max(1, Math.min(Number(process.env.BATCH_CONCURRENCY || 4), 8));
   let next = 0;
   async function worker() {
     while (next < items.length) {
       const item = items[next++];
       try {
-        const checked = await checkSentence(item.text, !(j.withTranslate===false || j.translate===false), { reasonPriorityEpoch: j.reasonPriorityEpoch || j.reasonEpoch || Date.now(), reasonPrioritySeq: Number(item.id || 0), words:item.words, reasonBoardCandidates:j.reasonBoardCandidates || j.boardCandidates || [], reasonHandCandidates:j.reasonHandCandidates || j.handCandidates || [], reasonDeckCandidates:j.reasonDeckCandidates || j.reasonCandidates || j.deckCandidates || [], reasonDisabled: j.reasonDisabled===true || j.disableReasonJob===true || j.reasonMode==='none' });
+        const checked = await checkSentence(item.text, true, { reasonPriorityEpoch: j.reasonPriorityEpoch || j.reasonEpoch || Date.now(), reasonPrioritySeq: Number(item.id || 0), words:item.words, reasonBoardCandidates:j.reasonBoardCandidates || j.boardCandidates || [], reasonHandCandidates:j.reasonHandCandidates || j.handCandidates || [], reasonDeckCandidates:j.reasonDeckCandidates || j.reasonCandidates || j.deckCandidates || [], reasonDisabled: j.reasonDisabled===true || j.disableReasonJob===true || j.reasonMode==='none' });
         const accept = checked.acceptability || {};
         const type = accept.type || (checked.gameOk ? 'complete_sentence' : (checked.fullParse ? 'fragment' : 'invalid'));
         const gameOk = !!(checked.ok && checked.gameOk && (accept.gameOk !== false) && type === 'complete_sentence');
