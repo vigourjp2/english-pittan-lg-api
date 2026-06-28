@@ -614,6 +614,24 @@ async function evaluateGameTextExact(text) {
   return { text:src, parsed, languageTool:ltGate, hfAcceptability:hfGate, acceptability, ok:!!acceptability.ok, gameOk:!!(acceptability.ok && acceptability.gameOk !== false && acceptability.type === 'complete_sentence') };
 }
 
+async function evaluateGameTextLightForReason(text) {
+  const src = normalizeText(text);
+  const parsed = await runLinkParser(src);
+  let ltGate = null;
+  if (strictLinkGrammarGameOk(parsed)) ltGate = await languageToolErrorGate(src);
+  const acceptability = localAcceptabilityFromLinkParserAndLt(src, parsed, ltGate);
+  return {
+    text: src,
+    parsed,
+    languageTool: ltGate,
+    hfAcceptability: null,
+    acceptability,
+    ok: !!acceptability.ok,
+    gameOk: !!(acceptability.ok && acceptability.gameOk !== false && acceptability.type === 'complete_sentence'),
+    lightOnly: true
+  };
+}
+
 function runLinkParser(text) {
   return new Promise((resolve) => {
     const args = ['en', '-batch', '-verbosity=0', '-graphics=0', '-null=0', '-islands-ok=0', '-spell=0', '-timeout=3'];
@@ -1060,10 +1078,10 @@ async function explainByExploration(text, diagnostics = {}) {
   const words = canonicalGameWords(src.split(/\s+/).filter(Boolean));
   const wordSet = new Set(words.map(w => w.toLowerCase()));
 
-  // v47: 探索上限・時間上限・順序依存を廃止。
-  // 「前から試したから後ろに足す候補まで届かない」のようなイタチごっこをやめる。
-  // 1手で到達できる候補を全列挙して全部判定し、1手で無ければ2手候補へ進む。
-  // これは特定英文をOKにする処理ではなく、有限な候補空間を最短編集距離で総当たりする探索。
+  // v48: 候補順の調整でも、無制限に /check(HF込み) を叩く方式でもない。
+  // 1手候補を全列挙し、まず LG+LanguageTool の軽い判定でふるいにかける。
+  // HF 文法分類は軽い判定を通った候補だけに使う。
+  // これは特定英文をOKにする処理ではなく、判定コストを段階化した最短距離探索。
   const boardRaw = uniqueWordsFromArray(diagnostics.reasonBoardCandidates || diagnostics.boardCandidates || [], 1000000);
   const board = boardRaw.filter(w => !wordSet.has(String(w).toLowerCase()));
   const hand = uniqueWordsFromArray(diagnostics.reasonHandCandidates || diagnostics.handCandidates || [], 1000000);
@@ -1083,10 +1101,38 @@ async function explainByExploration(text, diagnostics = {}) {
     if (!t || k === originalKey) return false;
     if (checked.has(k)) return checked.get(k);
     checks++;
+
+    // v48: 理由探索では、候補全部にいきなり /check 相当(HF込み)をかけない。
+    // まず軽い LG + LanguageTool だけで全候補をふるいにかける。
+    // HF 文法分類は、軽い判定を通った「成立しそうな候補」にだけ最後にかける。
+    const light = await evaluateGameTextLightForReason(t);
+    if (!light.gameOk) {
+      const value = {
+        ok:false,
+        stage:'light-rejected',
+        parsed:light.parsed,
+        languageTool:light.languageTool,
+        acceptability:light.acceptability,
+        hfAcceptability:null,
+        text:t
+      };
+      checked.set(k, value);
+      return value;
+    }
+
     const ev = await evaluateGameTextExact(t);
     const ok = !!ev.gameOk;
-    checked.set(k, { ok, parsed:ev.parsed, languageTool:ev.languageTool, acceptability:ev.acceptability, text:t });
-    return checked.get(k);
+    const value = {
+      ok,
+      stage: ok ? 'final-accepted' : 'final-rejected',
+      parsed:ev.parsed,
+      languageTool:ev.languageTool,
+      acceptability:ev.acceptability,
+      hfAcceptability:ev.hfAcceptability,
+      text:t
+    };
+    checked.set(k, value);
+    return value;
   }
 
   function opSentence(op) { return uniqueSentence(op.words); }
@@ -1244,14 +1290,14 @@ async function explainByExploration(text, diagnostics = {}) {
       explanationEn = `Adding "${top.candidate}" and "${top.candidate2}" before this makes a complete sentence: ${top.sentence}`;
     }
   } else {
-    explanationJa = `Strict Link Grammarでは完全な英文になりませんでした。現在渡された盤面・手札・候補カードを、上限なしで最短手数ごとに総当たりしましたが、成立する経路は見つかりませんでした。`;
-    explanationEn = `Strict Link Grammar could not build a complete sentence. I exhaustively checked the finite board/hand/candidate set by shortest edit distance and did not find a completing path.`;
+    explanationJa = `Strict Link Grammarでは完全な英文になりませんでした。現在渡された盤面・手札・候補カードを最短手数ごとに調べましたが、成立する経路は見つかりませんでした。`;
+    explanationEn = `Strict Link Grammar could not build a complete sentence. I checked the finite board/hand/candidate set by shortest edit distance with a light-first staged judgement and did not find a completing path.`;
   }
   return {
     ok:true,
-    method:'strict-link-grammar-oracle-exploration-v47-exhaustive-shortest-distance',
+    method:'strict-link-grammar-oracle-exploration-v48-staged-light-first',
     model:'none',
-    observedStructure: top ? 'nearest successful path found by exhaustive shortest-distance Link Grammar exploration' : 'no successful path found in exhaustive finite candidate set',
+    observedStructure: top ? 'nearest successful path found by staged light-first exploration' : 'no successful path found in staged finite candidate set',
     incompletePart: top ? top.action : 'not found in exhaustive finite candidate set',
     explanationEn,
     explanationJa,
@@ -1260,7 +1306,10 @@ async function explainByExploration(text, diagnostics = {}) {
     rawReason:{
       exploration:true,
       exhaustive:true,
-      noSearchBudget:true,
+      stagedReason:true,
+      lightFirst:true,
+      hfOnlyAfterLightAccept:true,
+      noArbitraryCandidateBudget:true,
       text:src,
       words,
       checks,
@@ -1363,7 +1412,7 @@ async function checkSentence(text, withTranslate = false, reasonMeta = {}) {
   }
   return {
     originalText, text: checkedText, normalized: proof.normalized, appliedCorrections: proof.appliedCorrections || [],
-    ok, gameOk, type, kind:'Strict Link Grammar + LanguageTool + HF Grammar Classifier Gate v47',
+    ok, gameOk, type, kind:'Strict Link Grammar + LanguageTool + HF Grammar Classifier Gate v48',
     sentenceType: gameOk ? (acceptability.sentenceType || 'complete_sentence') : (acceptability.sentenceType || type),
     reason: gameOk ? '' : (acceptability.noteJa || acceptability.reason || reasonExplain?.explanationJa || reasonExplain?.explanationEn || ''),
     reasonSource: gameOk ? '' : (acceptability.languageToolBlocking ? 'languagetool-error-gate' : (acceptability.hfUsed ? 'hf-grammar-classifier-gate' : (reasonExplain?.ok ? reasonExplain.method : 'reason-job-pending'))),
@@ -1691,11 +1740,11 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-plus-languagetool-error-gate-v47-exhaustive-reason-exploration',
+        mode:'link-grammar-plus-languagetool-error-gate-v48-staged-reason-exploration',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v47-exhaustive-reason-exploration',
+        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v48-staged-reason-exploration',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:!ACCEPTABILITY_HF_ENABLED,
@@ -1705,7 +1754,7 @@ const server = http.createServer(async (req, res) => {
         hfAcceptabilityStats,
         hfAcceptabilityCacheSize: hfAcceptabilityCache.size,
         hfAcceptabilityCacheKeyPolicy:'exact-text-case-sensitive-v45',
-        reasonExplorePolicy:'exhaustive-shortest-distance-no-search-budget-v47',
+        reasonExplorePolicy:'staged-light-first-final-hf-only-on-promising-candidates-v48',
         acceptanceGate:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate',
         pixabayKeyPresent: !!PIXABAY_API_KEY,
         hfModelScanVersion: 'v2-no-generation-params-for-classifiers',
@@ -1823,7 +1872,7 @@ const server = http.createServer(async (req, res) => {
         text,
         elapsedMs: Date.now() - startedAt,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v47-exhaustive-reason-exploration',
+        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v48-staged-reason-exploration',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:!ACCEPTABILITY_HF_ENABLED,
@@ -1833,7 +1882,7 @@ const server = http.createServer(async (req, res) => {
         hfAcceptabilityStats,
         hfAcceptabilityCacheSize: hfAcceptabilityCache.size,
         hfAcceptabilityCacheKeyPolicy:'exact-text-case-sensitive-v45',
-        reasonExplorePolicy:'exhaustive-shortest-distance-no-search-budget-v47',
+        reasonExplorePolicy:'staged-light-first-final-hf-only-on-promising-candidates-v48',
         acceptanceGate:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
