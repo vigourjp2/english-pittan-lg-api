@@ -40,8 +40,9 @@ const REASON_JOB_MAX_ATTEMPTS = Math.max(1, Math.min(5, Number.isFinite(REASON_J
 const REASON_JOB_MAX_CACHE = Number(process.env.REASON_JOB_MAX_CACHE || 800);
 const REASON_JOB_TIMEOUT_MS = Math.max(3000, Number(process.env.REASON_JOB_TIMEOUT_MS || 30000)); // v51/v53: 理由job全体の安全弁。候補数の打ち切りではなく、外部I/Oハングでキューを塞がないため。
 const REASON_CANDIDATE_TIMEOUT_MS = Math.max(1000, Number(process.env.REASON_CANDIDATE_TIMEOUT_MS || 2500)); // v51/v53: 候補1件ごとの軽量判定I/O安全弁。候補数上限ではない。
-const REASON_FINAL_HF_TIMEOUT_MS = Math.max(2500, Number(process.env.REASON_FINAL_HF_TIMEOUT_MS || 12000)); // v56: 理由表示候補はローカル文法リストでは削らず、外部HF分類器へbatch投入して浅い表示可否を判定する。
-const REASON_FINAL_HF_PARALLEL = Math.max(1, Math.min(32, Number(process.env.REASON_FINAL_HF_PARALLEL || 12))); // v56: 1回の外部HF batchにまとめる候補数。候補を捨てる上限ではなくI/Oをまとめる粒度。
+const REASON_FINAL_HF_TIMEOUT_MS = Math.max(2500, Number(process.env.REASON_FINAL_HF_TIMEOUT_MS || 6500)); // v58: 理由表示候補の外部HF分類器1件ごとの安全弁。HF Chatは使わない。
+const REASON_FINAL_HF_PARALLEL = Math.max(1, Math.min(12, Number(process.env.REASON_FINAL_HF_PARALLEL || 8))); // v58: 表示候補確認の同時実行数。成立判定上限ではなく外部I/O隔離の粒度。
+const REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH = Math.max(1, Math.min(24, Number(process.env.REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH || 8))); // v58: 各手数depthで外部分類器に出す表示候補窓。ローカル文法ジャッジではなく、HFに投げる順番を制御する。
 const reasonJobs = new Map();
 let reasonQueueRunning = false;
 let reasonQueueTimer = null;
@@ -1258,9 +1259,9 @@ function limitedPermutations(arr, max = 120) {
 
 
 function reasonLocalPrefilter(sentence) {
-  // v56: 撤去済み。ローカルの助動詞/動詞リストで候補を捨てない。
-  // 浅い候補可否は外部HF分類器のbatch判定へ投げる。
-  return { ok:true, reason:'removed-v56-external-batch-shallow-judge' };
+  // v58: 撤去済み。ローカルの助動詞/動詞リストで候補を捨てない。
+  // 浅い候補可否は実績ある外部HF分類器だけに投げる。HF Chatは使わない。
+  return { ok:true, reason:'removed-v58-external-classifier-display-window' };
 }
 
 async function explainByExploration(text, diagnostics = {}) {
@@ -1466,39 +1467,13 @@ async function explainByExploration(text, diagnostics = {}) {
   }
 
   async function runLevel(ops) {
-    // v55: v55は「全候補を軽量判定 → 全light候補をHF確認」だったため、
-    // depth1に大量の断片/should系があると、depth2の正解に行く前に30秒で落ちた。
-    // ここでは候補を流しながら、light通過候補が一定数たまった時点でHF表示フィルタにかける。
-    // 候補数の打ち切りではなく、探索パイプラインのI/O滞留をなくす処理。
-    let pendingForHf = [];
-
-    async function flushPending() {
-      if (!pendingForHf.length) return [];
-      const chunk = pendingForHf.splice(0, pendingForHf.length);
-      finalHfChecks += chunk.length;
-      let gates = [];
-      try {
-        gates = await withReasonTimeout(hfAcceptabilityGateBatch(chunk.map(item => item.light.text)), REASON_FINAL_HF_TIMEOUT_MS, 'reason external shallow HF batch');
-      } catch (e) {
-        gates = chunk.map(() => ({ checked:true, ok:false, available:false, enabled:true, model:ACCEPTABILITY_HF_MODEL, reason:String(e?.message || e), failOpen:false, batch:true }));
-      }
-      const finals = chunk.map((item, idx) => {
-        const hfGate = gates[idx] || { checked:true, ok:false, available:false, enabled:true, model:ACCEPTABILITY_HF_MODEL, reason:'missing batch judgement', failOpen:false, batch:true };
-        const finalAcceptability = applyHfAcceptabilityToLocalAcceptability(item.light.acceptability, hfGate);
-        const finalOk = !!(finalAcceptability?.ok && finalAcceptability?.gameOk !== false && finalAcceptability?.type === 'complete_sentence');
-        const final = finalOk
-          ? { ...item.light, ok:true, stage:'external-hf-batch-accepted-for-reason-display-v56', acceptability:finalAcceptability, hfAcceptability:hfGate }
-          : { ...item.light, ok:false, stage:hfGate.ok === false ? 'external-hf-batch-rejected-for-reason-display-v56' : 'external-hf-batch-unavailable-suppressed-v56', acceptability:finalAcceptability, hfAcceptability:hfGate };
-        if (!final.ok) {
-          if (hfGate.ok === false) finalHfRejected++;
-          else finalHfSuppressed++;
-        }
-        return { ...item, final };
-      });
-      const accepted = finals.find(x => x.final && x.final.ok);
-      if (accepted) return [makeSuggestionFromFinal(accepted.op, accepted.final)];
-      return [];
-    }
+    // v58:
+    // - ローカルの助動詞/動詞リストでは候補を捨てない。
+    // - HF Chat は使わない。リミット/JSONブレがあるため。
+    // - Link Grammar + LanguageTool を通った「表示候補」だけ、実績あるHF分類器へ投げる。
+    // - v56の配列batchはこのモデル/Routerでは詰まったため使わない。
+    // - 各depthで、表示候補窓だけ外部分類器に並列投入し、失敗/遅延候補は非表示にして次depthへ進む。
+    const lightCandidates = [];
 
     for (const op of ops) {
       let r = null;
@@ -1508,14 +1483,57 @@ async function explainByExploration(text, diagnostics = {}) {
         r = { ok:false, stage:'candidate-error', text:op.sentence || uniqueSentence(op.words), error:String(e?.message || e) };
       }
       if (r && r.ok) {
-        pendingForHf.push({ op, light:r });
-        if (pendingForHf.length >= REASON_FINAL_HF_PARALLEL) {
-          const accepted = await flushPending();
-          if (accepted.length) return accepted;
-        }
+        lightCandidates.push({ op, light:r });
       }
     }
-    return flushPending();
+
+    if (!lightCandidates.length) return [];
+
+    // 候補の成否はここでは決めない。あくまで外部HF分類器に出す順序を安定化するだけ。
+    // sourceは手札を優先（ユーザーが次に置けるカードなので理由表示として自然）、同depth内で重複を除く。
+    const sourceRank = { hand:0, board:1, deck:2 };
+    const actionRank = { 'add-left':0, 'add-right':0, 'add-two-left':0, 'add-two-right':0, replace:1, reorder:2, delete:3 };
+    const ranked = lightCandidates
+      .map((x, i) => ({ ...x, originalIndex:i }))
+      .sort((a,b) =>
+        (sourceRank[a.op.source] ?? 9) - (sourceRank[b.op.source] ?? 9) ||
+        (actionRank[a.op.action] ?? 9) - (actionRank[b.op.action] ?? 9) ||
+        Math.abs(String(a.light.text || '').split(/\s+/).filter(Boolean).length - 4) - Math.abs(String(b.light.text || '').split(/\s+/).filter(Boolean).length - 4) ||
+        a.originalIndex - b.originalIndex
+      );
+
+    const verifyWindow = ranked.slice(0, REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH);
+    finalHfChecks += verifyWindow.length;
+
+    async function verifyOne(item) {
+      try {
+        const hfGate = await withReasonTimeout(hfAcceptabilityGate(item.light.text), REASON_FINAL_HF_TIMEOUT_MS, `reason v58 external classifier ${item.light.text}`);
+        const finalAcceptability = applyHfAcceptabilityToLocalAcceptability(item.light.acceptability, hfGate);
+        const finalOk = !!(finalAcceptability?.ok && finalAcceptability?.gameOk !== false && finalAcceptability?.type === 'complete_sentence');
+        const final = finalOk
+          ? { ...item.light, ok:true, stage:'external-hf-classifier-accepted-for-reason-display-v58', acceptability:finalAcceptability, hfAcceptability:hfGate }
+          : { ...item.light, ok:false, stage:hfGate.ok === false ? 'external-hf-classifier-rejected-for-reason-display-v58' : 'external-hf-classifier-unavailable-suppressed-v58', acceptability:finalAcceptability, hfAcceptability:hfGate };
+        if (!final.ok) {
+          if (hfGate.ok === false) finalHfRejected++;
+          else finalHfSuppressed++;
+        }
+        return { ...item, final };
+      } catch (e) {
+        finalHfSuppressed++;
+        return { ...item, final:{ ...item.light, ok:false, stage:'external-hf-classifier-timeout-suppressed-v58', error:String(e?.message || e), hfAcceptability:{ checked:false, ok:false, available:false, reason:String(e?.message || e), model:ACCEPTABILITY_HF_MODEL } } };
+      }
+    }
+
+    const results = [];
+    for (let i = 0; i < verifyWindow.length; i += REASON_FINAL_HF_PARALLEL) {
+      const chunk = verifyWindow.slice(i, i + REASON_FINAL_HF_PARALLEL);
+      const done = await Promise.all(chunk.map(verifyOne));
+      results.push(...done);
+      const accepted = results.find(x => x.final && x.final.ok);
+      if (accepted) return [makeSuggestionFromFinal(accepted.op, accepted.final)];
+    }
+
+    return [];
   }
 
   const oneStepOps = buildOneStepOps();
@@ -1562,7 +1580,7 @@ async function explainByExploration(text, diagnostics = {}) {
   }
   return {
     ok:true,
-    method:'strict-link-grammar-oracle-exploration-v56-external-batch-shallow-hf-display-filter',
+    method:'strict-link-grammar-oracle-exploration-v58-external-classifier-display-window',
     model:'none',
     observedStructure: top ? 'nearest successful path found and confirmed by final HF display filter' : 'no successful path found in staged finite candidate set',
     incompletePart: top ? top.action : 'not found in exhaustive finite candidate set',
@@ -1580,8 +1598,11 @@ async function explainByExploration(text, diagnostics = {}) {
       hfOnlyAfterLightAccept:true,
       hfNetworkSkippedInReason:false,
       hfFinalDisplayFilter:true,
-      externalShallowJudge:'hf-batch-classifier-v56',
+      externalShallowJudge:'hf-classifier-display-window-v58',
       localGrammarPrefilter:false,
+      hfChatUsed:false,
+      externalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH,
+      externalVerifyParallel:REASON_FINAL_HF_PARALLEL,
       finalHfChecks,
       finalHfRejected,
       finalHfSuppressed,
@@ -2016,11 +2037,11 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-plus-languagetool-error-gate-v56-external-batch-shallow-reason-display-filter',
+        mode:'link-grammar-plus-languagetool-error-gate-v58-external-classifier-display-window',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v56-external-batch-shallow-reason-display-filter',
+        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v58-external-classifier-display-window',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:!ACCEPTABILITY_HF_ENABLED,
@@ -2030,8 +2051,8 @@ const server = http.createServer(async (req, res) => {
         hfAcceptabilityStats,
         hfAcceptabilityCacheSize: hfAcceptabilityCache.size,
         hfAcceptabilityCacheKeyPolicy:'exact-text-case-sensitive-v45',
-        reasonExplorePolicy:'light-first-reason-plus-parallel-final-hf-display-filter-v55',
-        browserQueryContext:true, reasonHfNetworkDisabled:false, reasonDisplayHfFilter:true, reasonExternalShallowJudge:'hf-batch-classifier-v56', reasonLocalPrefilterEnabled:false, reasonFinalHfTimeoutMs:REASON_FINAL_HF_TIMEOUT_MS, reasonFinalHfBatchSize:REASON_FINAL_HF_PARALLEL,
+        reasonExplorePolicy:'light-first-reason-plus-external-classifier-display-window-v58',
+        browserQueryContext:true, reasonHfNetworkDisabled:false, reasonDisplayHfFilter:true, reasonExternalShallowJudge:'hf-classifier-display-window-v58', reasonLocalPrefilterEnabled:false, reasonFinalHfTimeoutMs:REASON_FINAL_HF_TIMEOUT_MS, reasonFinalHfParallel:REASON_FINAL_HF_PARALLEL, reasonExternalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH,
         acceptanceGate:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate',
         pixabayKeyPresent: !!PIXABAY_API_KEY,
         hfModelScanVersion: 'v2-no-generation-params-for-classifiers',
@@ -2149,7 +2170,7 @@ const server = http.createServer(async (req, res) => {
         text,
         elapsedMs: Date.now() - startedAt,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v56-external-batch-shallow-reason-display-filter',
+        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v58-external-classifier-display-window',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:!ACCEPTABILITY_HF_ENABLED,
@@ -2159,8 +2180,8 @@ const server = http.createServer(async (req, res) => {
         hfAcceptabilityStats,
         hfAcceptabilityCacheSize: hfAcceptabilityCache.size,
         hfAcceptabilityCacheKeyPolicy:'exact-text-case-sensitive-v45',
-        reasonExplorePolicy:'light-first-reason-plus-parallel-final-hf-display-filter-v55',
-        browserQueryContext:true, reasonHfNetworkDisabled:false, reasonDisplayHfFilter:true, reasonExternalShallowJudge:'hf-batch-classifier-v56', reasonLocalPrefilterEnabled:false, reasonFinalHfTimeoutMs:REASON_FINAL_HF_TIMEOUT_MS, reasonFinalHfBatchSize:REASON_FINAL_HF_PARALLEL,
+        reasonExplorePolicy:'light-first-reason-plus-external-classifier-display-window-v58',
+        browserQueryContext:true, reasonHfNetworkDisabled:false, reasonDisplayHfFilter:true, reasonExternalShallowJudge:'hf-classifier-display-window-v58', reasonLocalPrefilterEnabled:false, reasonFinalHfTimeoutMs:REASON_FINAL_HF_TIMEOUT_MS, reasonFinalHfParallel:REASON_FINAL_HF_PARALLEL, reasonExternalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH,
         acceptanceGate:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
