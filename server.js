@@ -8,11 +8,12 @@ const LINK_TIMEOUT_MS = Number(process.env.LINK_TIMEOUT_MS || 3500);
 const LT_TIMEOUT_MS = Number(process.env.LT_TIMEOUT_MS || 5000);
 const HF_TIMEOUT_MS = Number(process.env.HF_TIMEOUT_MS || 25000);
 const HF_MODEL_SCAN_TIMEOUT_MS = Number(process.env.HF_MODEL_SCAN_TIMEOUT_MS || 20000);
-// v74: production gate adds external HF grammar classifiers only after Link Grammar + LanguageTool pass.
-// No sentence-specific or word-specific accept/reject rules are used in the game gate.
-// /diagnose-acceptability remains available for model inspection. /check uses the configured HF gates when enabled.
+// v77: game acceptability must be deterministic.
+// HF grammar classifiers are kept for diagnostics/reason exploration, but they are NOT used as the default /check game gate.
+// Set ACCEPTABILITY_HF_GAME_GATE_ENABLED=true only when intentionally testing the external veto gate.
 const HF_SCAN_MODELS = (process.env.HF_SCAN_MODELS || 'textattack/roberta-base-CoLA,abdulmatinomotoso/English_Grammar_Checker,agentlans/snowflake-arctic-xs-grammar-classifier,nikolasmoya/c4-binary-english-grammar-checker,pszemraj/electra-small-discriminator-CoLA,textattack/bert-base-uncased-CoLA,EstherT/sentence-acceptability').split(',').map(s => s.trim()).filter(Boolean);
 const ACCEPTABILITY_HF_ENABLED = !/^false|0|off$/i.test(String(process.env.ACCEPTABILITY_HF_ENABLED || 'true'));
+const ACCEPTABILITY_HF_GAME_GATE_ENABLED = /^true|1|on$/i.test(String(process.env.ACCEPTABILITY_HF_GAME_GATE_ENABLED || 'false'));
 const ACCEPTABILITY_HF_MODEL = process.env.ACCEPTABILITY_HF_MODEL || 'abdulmatinomotoso/English_Grammar_Checker';
 // v74: add a second external classifier gate that only rejects when it returns a clear unacceptable verdict.
 // This is not a sentence/word rule; it is an additional HF model vote.
@@ -791,7 +792,7 @@ async function evaluateGameTextExact(text) {
   if (strictLinkGrammarGameOk(parsed)) ltGate = await languageToolErrorGate(src);
   let acceptability = localAcceptabilityFromLinkParserAndLt(src, parsed, ltGate);
   let hfGate = null;
-  if (acceptability.ok && acceptability.gameOk !== false && acceptability.type === 'complete_sentence') {
+  if (ACCEPTABILITY_HF_GAME_GATE_ENABLED && acceptability.ok && acceptability.gameOk !== false && acceptability.type === 'complete_sentence') {
     hfGate = await hfAcceptabilityGate(src);
     acceptability = applyHfAcceptabilityToLocalAcceptability(acceptability, hfGate);
   }
@@ -1839,7 +1840,7 @@ async function checkSentence(text, withTranslate = false, reasonMeta = {}) {
   }
   return {
     originalText, text: checkedText, normalized: proof.normalized, appliedCorrections: proof.appliedCorrections || [],
-    ok, gameOk, type, kind:'Strict Link Grammar + LanguageTool + HF Grammar Classifier Gate v49',
+    ok, gameOk, type, kind: ACCEPTABILITY_HF_GAME_GATE_ENABLED ? 'Strict Link Grammar + LanguageTool + HF Grammar Classifier Gate v77' : 'Strict Link Grammar + LanguageTool Gate v77' ,
     sentenceType: gameOk ? (acceptability.sentenceType || 'complete_sentence') : (acceptability.sentenceType || type),
     reason: gameOk ? '' : (acceptability.noteJa || acceptability.reason || reasonExplain?.explanationJa || reasonExplain?.explanationEn || ''),
     reasonSource: gameOk ? '' : (reasonDisabled ? 'reason-job-disabled-for-bulk-scan' : (acceptability.languageToolBlocking ? 'languagetool-error-gate' : (acceptability.hfUsed ? 'hf-grammar-classifier-gate' : (reasonExplain?.ok ? reasonExplain.method : 'reason-job-pending')))),
@@ -2175,6 +2176,7 @@ const server = http.createServer(async (req, res) => {
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:!ACCEPTABILITY_HF_ENABLED,
+        hfAcceptabilityGameGateEnabled: ACCEPTABILITY_HF_GAME_GATE_ENABLED,
         hfAcceptabilityModel: ACCEPTABILITY_HF_MODEL,
         hfAcceptabilitySecondaryEnabled: ACCEPTABILITY_HF_SECONDARY_ENABLED,
         hfAcceptabilitySecondaryModel: ACCEPTABILITY_HF_SECONDARY_MODEL,
@@ -2186,7 +2188,7 @@ const server = http.createServer(async (req, res) => {
         hfAcceptabilityCacheKeyPolicy:'exact-text-case-sensitive-v45',
         reasonExplorePolicy:'depth-timeslice-action-bucket-plus-external-classifier-v65-dual-hf-gate',
         browserQueryContext:true, reasonHfNetworkDisabled:false, reasonDisplayHfFilter:true, reasonExternalShallowJudge:'hf-classifier-depth-timeslice-v65-dual-hf-gate', reasonLocalPrefilterEnabled:false, reasonFinalHfTimeoutMs:REASON_FINAL_HF_TIMEOUT_MS, reasonFinalHfParallel:REASON_FINAL_HF_PARALLEL, reasonExternalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH, reasonLightCandidateWindowPerDepth:REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH, reasonActionBucketQuota:REASON_ACTION_BUCKET_QUOTA, reasonStreamingSoftDeadlineMs:REASON_STREAMING_SOFT_DEADLINE_MS,
-        acceptanceGate:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate',
+        acceptanceGate: ACCEPTABILITY_HF_GAME_GATE_ENABLED ? 'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate' : 'strict-link-grammar-plus-languagetool-only-game-gate',
         pixabayKeyPresent: !!PIXABAY_API_KEY,
         hfModelScanVersion: 'v2-no-generation-params-for-classifiers',
         hfModelScanModels: HF_SCAN_MODELS,
@@ -2342,6 +2344,7 @@ async function diagnoseCustomBenchmark(url) {
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:!ACCEPTABILITY_HF_ENABLED,
+        hfAcceptabilityGameGateEnabled: ACCEPTABILITY_HF_GAME_GATE_ENABLED,
         hfAcceptabilityModel: ACCEPTABILITY_HF_MODEL,
         hfAcceptabilitySecondaryEnabled: ACCEPTABILITY_HF_SECONDARY_ENABLED,
         hfAcceptabilitySecondaryModel: ACCEPTABILITY_HF_SECONDARY_MODEL,
@@ -2353,7 +2356,7 @@ async function diagnoseCustomBenchmark(url) {
         hfAcceptabilityCacheKeyPolicy:'exact-text-case-sensitive-v45',
         reasonExplorePolicy:'depth-timeslice-action-bucket-plus-external-classifier-v65-dual-hf-gate',
         browserQueryContext:true, reasonHfNetworkDisabled:false, reasonDisplayHfFilter:true, reasonExternalShallowJudge:'hf-classifier-depth-timeslice-v65-dual-hf-gate', reasonLocalPrefilterEnabled:false, reasonFinalHfTimeoutMs:REASON_FINAL_HF_TIMEOUT_MS, reasonFinalHfParallel:REASON_FINAL_HF_PARALLEL, reasonExternalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH, reasonLightCandidateWindowPerDepth:REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH, reasonActionBucketQuota:REASON_ACTION_BUCKET_QUOTA, reasonStreamingSoftDeadlineMs:REASON_STREAMING_SOFT_DEADLINE_MS,
-        acceptanceGate:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate',
+        acceptanceGate: ACCEPTABILITY_HF_GAME_GATE_ENABLED ? 'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate' : 'strict-link-grammar-plus-languagetool-only-game-gate',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         result: r

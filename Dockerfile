@@ -8,7 +8,7 @@ WORKDIR /app
 COPY package.json ./
 RUN npm install --omit=dev
 COPY server.js ./
-COPY README.md ./
+COPY README*.md ./
 
 ENV NODE_ENV=production
 CMD ["npm", "start"]
