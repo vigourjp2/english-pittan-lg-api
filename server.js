@@ -15,14 +15,15 @@ const HF_SCAN_MODELS = (process.env.HF_SCAN_MODELS || 'textattack/roberta-base-C
 const ACCEPTABILITY_HF_ENABLED = !/^false|0|off$/i.test(String(process.env.ACCEPTABILITY_HF_ENABLED || 'true'));
 // v99: HF/CoLA系の外部acceptability分類器は短い初級文（例: be + adjective）をfalse rejectするため、
 // ゲーム成立のvetoには使わない。必要な場合だけ環境変数で明示ON。
-const ACCEPTABILITY_HF_GAME_GATE_ENABLED = /^true|1|on$/i.test(String(process.env.ACCEPTABILITY_HF_GAME_GATE_ENABLED || 'false'));
+const ACCEPTABILITY_HF_GAME_GATE_ENABLED = !/^false|0|off$/i.test(String(process.env.ACCEPTABILITY_HF_GAME_GATE_ENABLED || 'true')); // v103: external acceptability API is the game veto by default; no local sentence-shape hardcoding
 const ACCEPTABILITY_HF_MODEL = process.env.ACCEPTABILITY_HF_MODEL || 'abdulmatinomotoso/English_Grammar_Checker';
 // v74: add a second external classifier gate that only rejects when it returns a clear unacceptable verdict.
 // This is not a sentence/word rule; it is an additional HF model vote.
 const ACCEPTABILITY_HF_SECONDARY_ENABLED = !/^false|0|off$/i.test(String(process.env.ACCEPTABILITY_HF_SECONDARY_ENABLED || 'true'));
 const ACCEPTABILITY_HF_SECONDARY_MODEL = process.env.ACCEPTABILITY_HF_SECONDARY_MODEL || 'textattack/roberta-base-CoLA';
 const ACCEPTABILITY_HF_SECONDARY_REJECT_MIN_CONF = Math.max(0, Math.min(1, Number(process.env.ACCEPTABILITY_HF_SECONDARY_REJECT_MIN_CONF || 0.70)));
-const ACCEPTABILITY_HF_FAIL_CLOSED = /^true|1|on$/i.test(String(process.env.ACCEPTABILITY_HF_FAIL_CLOSED || 'false')); // v95: unavailable external model fails open; explicit true only for tests
+const ACCEPTABILITY_HF_FAIL_CLOSED = /^true|1|on$/i.test(String(process.env.ACCEPTABILITY_HF_FAIL_CLOSED || 'false')); // unavailable external model fails open unless explicitly requested
+const LOCAL_POS_SEMANTIC_GATE_ENABLED = /^true|1|on$/i.test(String(process.env.LOCAL_POS_SEMANTIC_GATE_ENABLED || 'false')); // v103: default off. Do not reject sentences by hand-written JS/POS patterns.
 const ACCEPTABILITY_HF_DAILY_MAX = Math.max(0, Number(process.env.ACCEPTABILITY_HF_DAILY_MAX || 80));
 const ACCEPTABILITY_HF_CACHE_MAX = Math.max(100, Number(process.env.ACCEPTABILITY_HF_CACHE_MAX || 2000));
 
@@ -628,6 +629,10 @@ function wordMetaFromMapForWords(words, diagnostics = {}) {
 function hasMetaPos(m, pos) { return Array.isArray(m?.pos) && m.pos.includes(pos); }
 function hasAnyMetaPos(m, poses) { return Array.isArray(m?.pos) && poses.some(p => m.pos.includes(p)); }
 function applyGameSemanticGate(text, acceptability, options = {}) {
+  // v103: Do not use hand-written JS/POS grammar rules as the game judge.
+  // The final game gate is Link Grammar + LanguageTool + external acceptability API.
+  // This hook remains only for explicit local debugging when LOCAL_POS_SEMANTIC_GATE_ENABLED=true.
+  if (!LOCAL_POS_SEMANTIC_GATE_ENABLED) return acceptability;
   if (!(acceptability?.ok && acceptability?.gameOk !== false && acceptability?.type === 'complete_sentence')) return acceptability;
   const meta = normalizeWordMetaList(options.wordMeta);
   if (!meta.length) return acceptability;
@@ -861,19 +866,26 @@ function applyHfAcceptabilityToLocalAcceptability(baseAccept, hfGate) {
     return { ...baseAccept, method:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate', gate:'strict-link-grammar-languagetool-hf-unavailable-open-v96', hfUsed:false, hfAcceptability:hfGate };
   }
   if (hfGate?.ok === false) {
-    // v98: 外部acceptabilityモデルは短い初級文をfalse rejectすることがある。
-    // ゲームの確定NGは Link Grammar + LanguageTool + posメタデータゲートに任せ、
-    // HF reject は診断情報として保持するだけにする。文や単語の個別救済はしない。
+    // v103: available external acceptability API rejection is a real game veto.
+    // No sentence-specific or POS-pattern hardcoding is used here.
     const msg = hfGate?.judgement?.reason || hfGate?.reason || 'External grammar classifier rejected this sentence.';
     return {
-      ...baseAccept,
-      method:'strict-link-grammar-plus-languagetool-plus-hf-advisory',
-      gate:'strict-link-grammar-languagetool-hf-advisory-reject-v98',
+      ok:false,
+      gameOk:false,
+      type:'external_acceptability_rejected',
+      method:'strict-link-grammar-plus-languagetool-plus-external-acceptability-veto',
+      reason:msg,
+      sentenceType:'not_complete_sentence',
+      utteranceType:'external_acceptability_rejected',
+      displayKind:'外部API判定NG',
+      jaHint:'',
+      noteJa:`外部英文判定APIがNGにしました: ${msg}`,
+      noteEn:msg,
+      gate:'strict-link-grammar-languagetool-external-acceptability-veto-v103',
       hfUsed:true,
-      hfAdvisoryReject:true,
-      hfRejectMessage:msg,
       hfAcceptability:hfGate,
-      hfModel:hfGate?.model || ACCEPTABILITY_HF_MODEL
+      hfModel:hfGate?.model || ACCEPTABILITY_HF_MODEL,
+      baseAcceptability:baseAccept
     };
   }
   return { ...baseAccept, method:'strict-link-grammar-plus-languagetool-plus-hf-accepted', gate:'strict-link-grammar-languagetool-hf-accepted', hfUsed:!!hfGate?.checked, hfAcceptability:hfGate, hfModel:hfGate?.model || ACCEPTABILITY_HF_MODEL };
@@ -1911,7 +1923,7 @@ async function checkSentence(text, withTranslate = false, reasonMeta = {}) {
   }
   return {
     originalText, text: checkedText, normalized: proof.normalized, appliedCorrections: proof.appliedCorrections || [],
-    ok, gameOk, type, kind: (ACCEPTABILITY_HF_GAME_GATE_ENABLED || reasonMeta.strictGameGate === true || reasonMeta.acceptabilityModelGate === true) ? 'Strict Link Grammar + LanguageTool + external acceptability API advisory v99' : 'Strict Link Grammar + LanguageTool Gate v99' ,
+    ok, gameOk, type, kind: (ACCEPTABILITY_HF_GAME_GATE_ENABLED || reasonMeta.strictGameGate === true || reasonMeta.acceptabilityModelGate === true) ? 'Strict Link Grammar + LanguageTool + external acceptability API gate v103' : 'Strict Link Grammar + LanguageTool Gate v103' ,
     sentenceType: gameOk ? (acceptability.sentenceType || 'complete_sentence') : (acceptability.sentenceType || type),
     reason: gameOk ? '' : (acceptability.noteJa || acceptability.reason || reasonExplain?.explanationJa || reasonExplain?.explanationEn || ''),
     reasonSource: gameOk ? '' : (reasonDisabled ? 'reason-job-disabled-for-bulk-scan' : (acceptability.languageToolBlocking ? 'languagetool-error-gate' : (acceptability.hfUsed ? 'hf-grammar-classifier-gate' : (reasonExplain?.ok ? reasonExplain.method : 'reason-job-pending')))),
