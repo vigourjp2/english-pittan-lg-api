@@ -42,8 +42,9 @@ const REASON_JOB_TIMEOUT_MS = Math.max(3000, Number(process.env.REASON_JOB_TIMEO
 const REASON_CANDIDATE_TIMEOUT_MS = Math.max(1000, Number(process.env.REASON_CANDIDATE_TIMEOUT_MS || 2500)); // v51/v53: 候補1件ごとの軽量判定I/O安全弁。候補数上限ではない。
 const REASON_FINAL_HF_TIMEOUT_MS = Math.max(2500, Number(process.env.REASON_FINAL_HF_TIMEOUT_MS || 6500)); // v58: 理由表示候補の外部HF分類器1件ごとの安全弁。HF Chatは使わない。
 const REASON_FINAL_HF_PARALLEL = Math.max(1, Math.min(12, Number(process.env.REASON_FINAL_HF_PARALLEL || 8))); // v58: 表示候補確認の同時実行数。成立判定上限ではなく外部I/O隔離の粒度。
-const REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH = Math.max(1, Math.min(24, Number(process.env.REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH || 8))); // v59: 各手数depthで外部分類器に出す表示候補窓。ローカル文法ジャッジではなく、HFに投げる順番を制御する。
-const REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH = Math.max(1, Math.min(32, Number(process.env.REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH || 12))); // v59: LG/LTへ投げる探索窓。文法判定ではなく、最短手数・手札優先・生成順の表示候補窓。
+const REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH = Math.max(1, Math.min(24, Number(process.env.REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH || 12))); // v59: 各手数depthで外部分類器に出す表示候補窓。ローカル文法ジャッジではなく、HFに投げる順番を制御する。
+const REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH = Math.max(1, Math.min(64, Number(process.env.REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH || 24))); // v60: LG/LTへ投げる探索窓。文法判定ではなく、action種別ごとに公平に外部判定へ回す窓。
+const REASON_ACTION_BUCKET_QUOTA = Math.max(1, Math.min(12, Number(process.env.REASON_ACTION_BUCKET_QUOTA || 4))); // v60: add-left/add-right/add-two-left/add-two-right等のactionごとに最低限確保する件数。
 const reasonJobs = new Map();
 let reasonQueueRunning = false;
 let reasonQueueTimer = null;
@@ -1262,7 +1263,7 @@ function limitedPermutations(arr, max = 120) {
 function reasonLocalPrefilter(sentence) {
   // v58: 撤去済み。ローカルの助動詞/動詞リストで候補を捨てない。
   // 浅い候補可否は実績ある外部HF分類器だけに投げる。HF Chatは使わない。
-  return { ok:true, reason:'removed-v59-bounded-external-classifier-window' };
+  return { ok:true, reason:'removed-v60-action-bucket-external-classifier-window' };
 }
 
 async function explainByExploration(text, diagnostics = {}) {
@@ -1481,12 +1482,53 @@ async function explainByExploration(text, diagnostics = {}) {
       .filter(x => x.sentence && x.sentence.toLowerCase() !== originalKey)
       .sort((a,b) =>
         (sourceRank[a.op.source] ?? 9) - (sourceRank[b.op.source] ?? 9) ||
-        (actionRank[a.op.action] ?? 9) - (actionRank[b.op.action] ?? 9) ||
         Math.abs(String(a.sentence || '').split(/\s+/).filter(Boolean).length - 4) - Math.abs(String(b.sentence || '').split(/\s+/).filter(Boolean).length - 4) ||
         a.originalIndex - b.originalIndex
       );
 
-    const candidateWindow = rankedOps.slice(0, REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH);
+    // v60:
+    // v59の問題は「上位N件固定」だと、特定action（add-two-right等）や生成順だけで窓が埋まり、
+    // add-left / add-two-left などの補完候補が外部判定まで届かないこと。
+    // ここでは文法判断はしない。action/sourceごとに候補窓を公平に確保するだけ。
+    const bucketOrder = [
+      'hand:add-left', 'hand:add-right',
+      'hand:add-two-left', 'hand:add-two-right',
+      'hand:replace', 'hand:reorder',
+      'board:add-left', 'board:add-right',
+      'deck:add-left', 'deck:add-right',
+      'deck:replace', 'board:replace',
+      'any:reorder', 'any:delete'
+    ];
+    const buckets = new Map();
+    for (const item of rankedOps) {
+      const key = `${item.op.source || 'any'}:${item.op.action || 'other'}`;
+      if (!buckets.has(key)) buckets.set(key, []);
+      buckets.get(key).push(item);
+      const anyKey = `any:${item.op.action || 'other'}`;
+      if (!buckets.has(anyKey)) buckets.set(anyKey, []);
+      buckets.get(anyKey).push(item);
+    }
+    const picked = [];
+    const pickedKeys = new Set();
+    function pick(item) {
+      const k = String(item.sentence || '').toLowerCase();
+      if (!k || pickedKeys.has(k) || picked.length >= REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH) return false;
+      pickedKeys.add(k); picked.push(item); return true;
+    }
+    for (const key of bucketOrder) {
+      const arr = buckets.get(key) || [];
+      let n = 0;
+      for (const item of arr) {
+        if (pick(item)) n++;
+        if (n >= REASON_ACTION_BUCKET_QUOTA || picked.length >= REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH) break;
+      }
+      if (picked.length >= REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH) break;
+    }
+    for (const item of rankedOps) {
+      if (picked.length >= REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH) break;
+      pick(item);
+    }
+    const candidateWindow = picked;
     lightWindowChecks += candidateWindow.length;
 
     async function checkLight(item) {
@@ -1524,12 +1566,12 @@ async function explainByExploration(text, diagnostics = {}) {
 
     async function verifyOne(item) {
       try {
-        const hfGate = await withReasonTimeout(hfAcceptabilityGate(item.light.text), REASON_FINAL_HF_TIMEOUT_MS, `reason v59 external classifier ${item.light.text}`);
+        const hfGate = await withReasonTimeout(hfAcceptabilityGate(item.light.text), REASON_FINAL_HF_TIMEOUT_MS, `reason v60 external classifier ${item.light.text}`);
         const finalAcceptability = applyHfAcceptabilityToLocalAcceptability(item.light.acceptability, hfGate);
         const finalOk = !!(finalAcceptability?.ok && finalAcceptability?.gameOk !== false && finalAcceptability?.type === 'complete_sentence');
         const final = finalOk
-          ? { ...item.light, ok:true, stage:'external-hf-classifier-accepted-for-reason-display-v59', acceptability:finalAcceptability, hfAcceptability:hfGate }
-          : { ...item.light, ok:false, stage:hfGate.ok === false ? 'external-hf-classifier-rejected-for-reason-display-v59' : 'external-hf-classifier-unavailable-suppressed-v59', acceptability:finalAcceptability, hfAcceptability:hfGate };
+          ? { ...item.light, ok:true, stage:'external-hf-classifier-accepted-for-reason-display-v60', acceptability:finalAcceptability, hfAcceptability:hfGate }
+          : { ...item.light, ok:false, stage:hfGate.ok === false ? 'external-hf-classifier-rejected-for-reason-display-v60' : 'external-hf-classifier-unavailable-suppressed-v60', acceptability:finalAcceptability, hfAcceptability:hfGate };
         if (!final.ok) {
           if (hfGate.ok === false) finalHfRejected++;
           else finalHfSuppressed++;
@@ -1537,7 +1579,7 @@ async function explainByExploration(text, diagnostics = {}) {
         return { ...item, final };
       } catch (e) {
         finalHfSuppressed++;
-        return { ...item, final:{ ...item.light, ok:false, stage:'external-hf-classifier-timeout-suppressed-v59', error:String(e?.message || e), hfAcceptability:{ checked:false, ok:false, available:false, reason:String(e?.message || e), model:ACCEPTABILITY_HF_MODEL } } };
+        return { ...item, final:{ ...item.light, ok:false, stage:'external-hf-classifier-timeout-suppressed-v60', error:String(e?.message || e), hfAcceptability:{ checked:false, ok:false, available:false, reason:String(e?.message || e), model:ACCEPTABILITY_HF_MODEL } } };
       }
     }
 
@@ -1597,7 +1639,7 @@ async function explainByExploration(text, diagnostics = {}) {
   }
   return {
     ok:true,
-    method:'strict-link-grammar-oracle-exploration-v59-bounded-external-classifier-window',
+    method:'strict-link-grammar-oracle-exploration-v60-action-bucket-external-classifier-window',
     model:'none',
     observedStructure: top ? 'nearest successful path found and confirmed by final HF display filter' : 'no successful path found in staged finite candidate set',
     incompletePart: top ? top.action : 'not found in exhaustive finite candidate set',
@@ -1615,11 +1657,11 @@ async function explainByExploration(text, diagnostics = {}) {
       hfOnlyAfterLightAccept:true,
       hfNetworkSkippedInReason:false,
       hfFinalDisplayFilter:true,
-      externalShallowJudge:'hf-classifier-bounded-display-window-v59',
+      externalShallowJudge:'hf-classifier-action-bucket-display-window-v60',
       localGrammarPrefilter:false,
       hfChatUsed:false,
       externalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH,
-      lightCandidateWindowPerDepth:REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH,
+      lightCandidateWindowPerDepth:REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH, actionBucketQuota:REASON_ACTION_BUCKET_QUOTA,
       lightWindowChecks,
       externalVerifyParallel:REASON_FINAL_HF_PARALLEL,
       finalHfChecks,
@@ -2056,11 +2098,11 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-plus-languagetool-error-gate-v59-bounded-external-classifier-window',
+        mode:'link-grammar-plus-languagetool-error-gate-v60-action-bucket-external-classifier-window',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v59-bounded-external-classifier-window',
+        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v60-action-bucket-external-classifier-window',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:!ACCEPTABILITY_HF_ENABLED,
@@ -2070,8 +2112,8 @@ const server = http.createServer(async (req, res) => {
         hfAcceptabilityStats,
         hfAcceptabilityCacheSize: hfAcceptabilityCache.size,
         hfAcceptabilityCacheKeyPolicy:'exact-text-case-sensitive-v45',
-        reasonExplorePolicy:'bounded-light-window-plus-external-classifier-display-window-v59',
-        browserQueryContext:true, reasonHfNetworkDisabled:false, reasonDisplayHfFilter:true, reasonExternalShallowJudge:'hf-classifier-bounded-display-window-v59', reasonLocalPrefilterEnabled:false, reasonFinalHfTimeoutMs:REASON_FINAL_HF_TIMEOUT_MS, reasonFinalHfParallel:REASON_FINAL_HF_PARALLEL, reasonExternalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH, reasonLightCandidateWindowPerDepth:REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH,
+        reasonExplorePolicy:'action-bucket-light-window-plus-external-classifier-display-window-v60',
+        browserQueryContext:true, reasonHfNetworkDisabled:false, reasonDisplayHfFilter:true, reasonExternalShallowJudge:'hf-classifier-action-bucket-display-window-v60', reasonLocalPrefilterEnabled:false, reasonFinalHfTimeoutMs:REASON_FINAL_HF_TIMEOUT_MS, reasonFinalHfParallel:REASON_FINAL_HF_PARALLEL, reasonExternalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH, reasonLightCandidateWindowPerDepth:REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH, reasonActionBucketQuota:REASON_ACTION_BUCKET_QUOTA,
         acceptanceGate:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate',
         pixabayKeyPresent: !!PIXABAY_API_KEY,
         hfModelScanVersion: 'v2-no-generation-params-for-classifiers',
@@ -2189,7 +2231,7 @@ const server = http.createServer(async (req, res) => {
         text,
         elapsedMs: Date.now() - startedAt,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v59-bounded-external-classifier-window',
+        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v60-action-bucket-external-classifier-window',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:!ACCEPTABILITY_HF_ENABLED,
@@ -2199,8 +2241,8 @@ const server = http.createServer(async (req, res) => {
         hfAcceptabilityStats,
         hfAcceptabilityCacheSize: hfAcceptabilityCache.size,
         hfAcceptabilityCacheKeyPolicy:'exact-text-case-sensitive-v45',
-        reasonExplorePolicy:'bounded-light-window-plus-external-classifier-display-window-v59',
-        browserQueryContext:true, reasonHfNetworkDisabled:false, reasonDisplayHfFilter:true, reasonExternalShallowJudge:'hf-classifier-bounded-display-window-v59', reasonLocalPrefilterEnabled:false, reasonFinalHfTimeoutMs:REASON_FINAL_HF_TIMEOUT_MS, reasonFinalHfParallel:REASON_FINAL_HF_PARALLEL, reasonExternalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH, reasonLightCandidateWindowPerDepth:REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH,
+        reasonExplorePolicy:'action-bucket-light-window-plus-external-classifier-display-window-v60',
+        browserQueryContext:true, reasonHfNetworkDisabled:false, reasonDisplayHfFilter:true, reasonExternalShallowJudge:'hf-classifier-action-bucket-display-window-v60', reasonLocalPrefilterEnabled:false, reasonFinalHfTimeoutMs:REASON_FINAL_HF_TIMEOUT_MS, reasonFinalHfParallel:REASON_FINAL_HF_PARALLEL, reasonExternalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH, reasonLightCandidateWindowPerDepth:REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH, reasonActionBucketQuota:REASON_ACTION_BUCKET_QUOTA,
         acceptanceGate:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
