@@ -40,7 +40,8 @@ const REASON_JOB_MAX_ATTEMPTS = Math.max(1, Math.min(5, Number.isFinite(REASON_J
 const REASON_JOB_MAX_CACHE = Number(process.env.REASON_JOB_MAX_CACHE || 800);
 const REASON_JOB_TIMEOUT_MS = Math.max(3000, Number(process.env.REASON_JOB_TIMEOUT_MS || 30000)); // v51/v53: 理由job全体の安全弁。候補数の打ち切りではなく、外部I/Oハングでキューを塞がないため。
 const REASON_CANDIDATE_TIMEOUT_MS = Math.max(1000, Number(process.env.REASON_CANDIDATE_TIMEOUT_MS || 2500)); // v51/v53: 候補1件ごとの軽量判定I/O安全弁。候補数上限ではない。
-const REASON_FINAL_HF_TIMEOUT_MS = Math.max(2500, Number(process.env.REASON_FINAL_HF_TIMEOUT_MS || 7000)); // v53: 理由表示に出す候補だけ、/check本判定と同じHF文法ゲートで最終確認する。
+const REASON_FINAL_HF_TIMEOUT_MS = Math.max(2500, Number(process.env.REASON_FINAL_HF_TIMEOUT_MS || 7000)); // v54: 理由表示に出す候補だけ、/check本判定と同じHF文法ゲートで最終確認する。並列chunkで逐次タイムアウト連鎖を避ける。
+const REASON_FINAL_HF_PARALLEL = Math.max(1, Math.min(12, Number(process.env.REASON_FINAL_HF_PARALLEL || 6))); // v54: HF最終確認の並列数。候補数の打ち切りではなくI/O詰まり回避。
 const reasonJobs = new Map();
 let reasonQueueRunning = false;
 let reasonQueueTimer = null;
@@ -1187,15 +1188,15 @@ async function explainByExploration(text, diagnostics = {}) {
       return value;
     }
 
-    // v53: ここではまだ「候補発見」だけ。表示確定は runLevel 側でHF文法ゲートに通す。
+    // v54: ここではまだ「候補発見」だけ。表示確定は runLevel 側でHF文法ゲートに通す。
     // 候補全部にHFをかけず、LG+LanguageToolを通った候補だけ最終確認する。
     const value = {
       ok:true,
-      stage:'light-accepted-awaiting-hf-display-filter-v53',
+      stage:'light-accepted-awaiting-hf-display-filter-v54',
       parsed:light.parsed,
       languageTool:light.languageTool,
       acceptability:light.acceptability,
-      hfAcceptability:{ checked:false, skipped:true, reason:'HF is deferred until the candidate is about to be displayed v53' },
+      hfAcceptability:{ checked:false, skipped:true, reason:'HF is deferred until the candidate is about to be displayed v54' },
       text:t
     };
     checked.set(k, value);
@@ -1211,7 +1212,7 @@ async function explainByExploration(text, diagnostics = {}) {
       const finalOk = !!(finalAcceptability?.ok && finalAcceptability?.gameOk !== false && finalAcceptability?.type === 'complete_sentence');
       return {
         ok: finalOk,
-        stage: finalOk ? 'light-and-hf-accepted-for-reason-display-v53' : 'hf-rejected-for-reason-display-v53',
+        stage: finalOk ? 'light-and-hf-accepted-for-reason-display-v54' : 'hf-rejected-for-reason-display-v54',
         text:t,
         parsed:lightResult.parsed,
         languageTool:lightResult.languageTool,
@@ -1219,8 +1220,8 @@ async function explainByExploration(text, diagnostics = {}) {
         hfAcceptability:hfGate
       };
     } catch (e) {
-      // v53: HFが遅い/失敗した候補は「仮候補」として表示しない。間違った候補を出すより安全側に倒す。
-      return { ok:false, stage:'hf-unavailable-suppressed-for-reason-display-v53', text:t, error:String(e?.message || e), parsed:lightResult.parsed, languageTool:lightResult.languageTool, acceptability:lightResult.acceptability, hfAcceptability:{ checked:false, ok:false, available:false, reason:String(e?.message || e) } };
+      // v54: HFが遅い/失敗した候補は「仮候補」として表示しない。間違った候補を出すより安全側に倒す。
+      return { ok:false, stage:'hf-unavailable-suppressed-for-reason-display-v54', text:t, error:String(e?.message || e), parsed:lightResult.parsed, languageTool:lightResult.languageTool, acceptability:lightResult.acceptability, hfAcceptability:{ checked:false, ok:false, available:false, reason:String(e?.message || e) } };
     }
   }
 
@@ -1314,51 +1315,63 @@ async function explainByExploration(text, diagnostics = {}) {
     return ops;
   }
 
+  function makeSuggestionFromFinal(op, final) {
+    return {
+      action: op.action,
+      source: op.source || 'deck',
+      depth: op.depth || 1,
+      candidate: op.candidate || '',
+      candidate2: op.candidate2 || '',
+      from: op.from || '',
+      to: op.to || '',
+      remove: op.remove || '',
+      sentence: final.text,
+      linkages: final.parsed.linkages,
+      fullParse: final.parsed.fullParse,
+      strictLinkGrammar: final.parsed.strictLinkGrammar,
+      languageToolBlocking: !!final.acceptability?.languageToolBlocking,
+      languageToolBlockingRuleId: final.acceptability?.blockingRuleId || '',
+      reasonCandidateStage: final.stage || '',
+      hfReasonDisplayChecked: !!final.hfAcceptability?.checked,
+      hfReasonDisplayAccepted: final.hfAcceptability?.ok === true,
+      hfReasonDisplayModel: final.hfAcceptability?.model || ACCEPTABILITY_HF_MODEL,
+      hfReasonDisplayConfidence: final.hfAcceptability?.judgement?.confidence ?? null
+    };
+  }
+
   async function runLevel(ops) {
-    const found = [];
+    const lightAccepted = [];
+
+    // v54: まず全候補を軽量判定だけでふるいにかける。
+    // ここではHFを呼ばないので、Link Grammarが通した変な候補があっても表示確定しない。
     for (const op of ops) {
       let r = null;
       try {
         r = await isGood(op.sentence || uniqueSentence(op.words));
       } catch (e) {
-        // v49: 候補1件の外部I/O詰まりで理由job全体・後続jobを止めない。
         r = { ok:false, stage:'candidate-error', text:op.sentence || uniqueSentence(op.words), error:String(e?.message || e) };
       }
-      if (r && r.ok) {
-        finalHfChecks++;
-        const final = await verifyReasonDisplayCandidate(r);
-        if (!final.ok) {
-          if (final.stage === 'hf-rejected-for-reason-display-v53') finalHfRejected++;
-          else finalHfSuppressed++;
-          continue;
-        }
-        found.push({
-          action: op.action,
-          source: op.source || 'deck',
-          depth: op.depth || 1,
-          candidate: op.candidate || '',
-          candidate2: op.candidate2 || '',
-          from: op.from || '',
-          to: op.to || '',
-          remove: op.remove || '',
-          sentence: final.text,
-          linkages: final.parsed.linkages,
-          fullParse: final.parsed.fullParse,
-          strictLinkGrammar: final.parsed.strictLinkGrammar,
-          languageToolBlocking: !!final.acceptability?.languageToolBlocking,
-          languageToolBlockingRuleId: final.acceptability?.blockingRuleId || '',
-          reasonCandidateStage: final.stage || '',
-          hfReasonDisplayChecked: !!final.hfAcceptability?.checked,
-          hfReasonDisplayAccepted: final.hfAcceptability?.ok === true,
-          hfReasonDisplayModel: final.hfAcceptability?.model || ACCEPTABILITY_HF_MODEL,
-          hfReasonDisplayConfidence: final.hfAcceptability?.judgement?.confidence ?? null
-        });
-        // v53: 表示してよい候補(HF最終確認済み)が見つかったら返す。
-        // 軽量判定だけで見つかった候補は、HFで落ちた場合は表示せず次候補へ進む。
-        return found;
-      }
+      if (r && r.ok) lightAccepted.push({ op, light:r });
     }
-    return found;
+
+    // v54: v53の失敗原因は「軽量候補を1件ずつHF確認して、NG/遅延候補が積み上がり30秒超過」したこと。
+    // そのため、表示直前HF確認は候補数を削るのではなく、chunk並列で行う。
+    // 先に見つかった成立候補だけ返す。HFでNGの候補は表示しない。
+    for (let i = 0; i < lightAccepted.length; i += REASON_FINAL_HF_PARALLEL) {
+      const chunk = lightAccepted.slice(i, i + REASON_FINAL_HF_PARALLEL);
+      const finals = await Promise.all(chunk.map(async item => {
+        finalHfChecks++;
+        const final = await verifyReasonDisplayCandidate(item.light);
+        if (!final.ok) {
+          if (final.stage === 'hf-rejected-for-reason-display-v54' || final.stage === 'hf-rejected-for-reason-display-v54') finalHfRejected++;
+          else finalHfSuppressed++;
+        }
+        return { ...item, final };
+      }));
+      const accepted = finals.find(x => x.final && x.final.ok);
+      if (accepted) return [makeSuggestionFromFinal(accepted.op, accepted.final)];
+    }
+    return [];
   }
 
   const oneStepOps = buildOneStepOps();
@@ -1857,11 +1870,11 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-plus-languagetool-error-gate-v53-reason-display-hf-filter',
+        mode:'link-grammar-plus-languagetool-error-gate-v54-parallel-reason-display-hf-filter',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v53-reason-display-hf-filter',
+        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v54-parallel-reason-display-hf-filter',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:!ACCEPTABILITY_HF_ENABLED,
@@ -1871,8 +1884,8 @@ const server = http.createServer(async (req, res) => {
         hfAcceptabilityStats,
         hfAcceptabilityCacheSize: hfAcceptabilityCache.size,
         hfAcceptabilityCacheKeyPolicy:'exact-text-case-sensitive-v45',
-        reasonExplorePolicy:'light-first-reason-plus-final-hf-display-filter-v53',
-        browserQueryContext:true, reasonHfNetworkDisabled:false, reasonDisplayHfFilter:true, reasonFinalHfTimeoutMs:REASON_FINAL_HF_TIMEOUT_MS,
+        reasonExplorePolicy:'light-first-reason-plus-parallel-final-hf-display-filter-v54',
+        browserQueryContext:true, reasonHfNetworkDisabled:false, reasonDisplayHfFilter:true, reasonFinalHfTimeoutMs:REASON_FINAL_HF_TIMEOUT_MS, reasonFinalHfParallel:REASON_FINAL_HF_PARALLEL,
         acceptanceGate:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate',
         pixabayKeyPresent: !!PIXABAY_API_KEY,
         hfModelScanVersion: 'v2-no-generation-params-for-classifiers',
@@ -1990,7 +2003,7 @@ const server = http.createServer(async (req, res) => {
         text,
         elapsedMs: Date.now() - startedAt,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v53-reason-display-hf-filter',
+        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v54-parallel-reason-display-hf-filter',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:!ACCEPTABILITY_HF_ENABLED,
@@ -2000,8 +2013,8 @@ const server = http.createServer(async (req, res) => {
         hfAcceptabilityStats,
         hfAcceptabilityCacheSize: hfAcceptabilityCache.size,
         hfAcceptabilityCacheKeyPolicy:'exact-text-case-sensitive-v45',
-        reasonExplorePolicy:'light-first-reason-plus-final-hf-display-filter-v53',
-        browserQueryContext:true, reasonHfNetworkDisabled:false, reasonDisplayHfFilter:true, reasonFinalHfTimeoutMs:REASON_FINAL_HF_TIMEOUT_MS,
+        reasonExplorePolicy:'light-first-reason-plus-parallel-final-hf-display-filter-v54',
+        browserQueryContext:true, reasonHfNetworkDisabled:false, reasonDisplayHfFilter:true, reasonFinalHfTimeoutMs:REASON_FINAL_HF_TIMEOUT_MS, reasonFinalHfParallel:REASON_FINAL_HF_PARALLEL,
         acceptanceGate:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
