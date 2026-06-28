@@ -43,9 +43,9 @@ const REASON_CANDIDATE_TIMEOUT_MS = Math.max(1000, Number(process.env.REASON_CAN
 const REASON_FINAL_HF_TIMEOUT_MS = Math.max(2500, Number(process.env.REASON_FINAL_HF_TIMEOUT_MS || 6500)); // v58: 理由表示候補の外部HF分類器1件ごとの安全弁。HF Chatは使わない。
 const REASON_FINAL_HF_PARALLEL = Math.max(1, Math.min(12, Number(process.env.REASON_FINAL_HF_PARALLEL || 8))); // v58: 表示候補確認の同時実行数。成立判定上限ではなく外部I/O隔離の粒度。
 const REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH = Math.max(1, Math.min(24, Number(process.env.REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH || 12))); // v59: 各手数depthで外部分類器に出す表示候補窓。ローカル文法ジャッジではなく、HFに投げる順番を制御する。
-const REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH = Math.max(1, Math.min(64, Number(process.env.REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH || 28))); // v62: streamingで見る最大候補数。文法判定ではなく、外部判定へ回す探索量の安全弁。
-const REASON_ACTION_BUCKET_QUOTA = Math.max(1, Math.min(12, Number(process.env.REASON_ACTION_BUCKET_QUOTA || 6))); // v62: action/source別に順番を見る件数。文法判定ではなく外部判定順序の公平性確保。
-const REASON_STREAMING_SOFT_DEADLINE_MS = Math.max(5000, Math.min(26000, Number(process.env.REASON_STREAMING_SOFT_DEADLINE_MS || 23500))); // v62: job全体30秒タイムアウト前に理由結果を安全に返すためのsoft deadline。
+const REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH = Math.max(1, Math.min(64, Number(process.env.REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH || 28))); // v63: streamingで見る最大候補数。文法判定ではなく、外部判定へ回す探索量の安全弁。
+const REASON_ACTION_BUCKET_QUOTA = Math.max(1, Math.min(12, Number(process.env.REASON_ACTION_BUCKET_QUOTA || 6))); // v63: action/source別に順番を見る件数。文法判定ではなく外部判定順序の公平性確保。
+const REASON_STREAMING_SOFT_DEADLINE_MS = Math.max(5000, Math.min(26000, Number(process.env.REASON_STREAMING_SOFT_DEADLINE_MS || 23500))); // v63: job全体30秒タイムアウト前に理由結果を安全に返すためのsoft deadline。
 const reasonJobs = new Map();
 let reasonQueueRunning = false;
 let reasonQueueTimer = null;
@@ -1264,7 +1264,7 @@ function limitedPermutations(arr, max = 120) {
 function reasonLocalPrefilter(sentence) {
   // v58: 撤去済み。ローカルの助動詞/動詞リストで候補を捨てない。
   // 浅い候補可否は実績ある外部HF分類器だけに投げる。HF Chatは使わない。
-  return { ok:true, reason:'removed-v62-depth-timeslice-external-classifier' };
+  return { ok:true, reason:'removed-v63-depth-timeslice-debug-fixed' };
 }
 
 async function explainByExploration(text, diagnostics = {}) {
@@ -1479,9 +1479,9 @@ async function explainByExploration(text, diagnostics = {}) {
   }
 
   async function runLevel(ops, depthLabel = 1, opts = {}) {
-    // v62:
+    // v63:
     // - v61はdepth1を先にstreamingし続けたため、depth2候補(I am Japanese now 等)に入る前にsoft deadline近くまで消費した。
-    // - v62はdepth1に小さいtime sliceを持たせ、depth2補完へ必ず進む。
+    // - v63はdepth1に小さいtime sliceを持たせ、depth2補完へ必ず進む。
     // - ローカル文法判定・助動詞リスト判定・特定文accept/rejectは使わない。
     // - 判定は引き続き Link Grammar + LanguageTool + HF分類器。
     const sourceRank = { hand:0, board:1, deck:2 };
@@ -1550,24 +1550,25 @@ async function explainByExploration(text, diagnostics = {}) {
 
     async function verifyAcceptedLight(item, light) {
       finalHfChecks++;
-      if (finalHfCandidateTexts.length < 80) finalHfCandidateTexts.push(t);
+      const candidateText = normalizeText(light?.text || item?.sentence || '').replace(/[.!?]+$/,'');
+      if (finalHfCandidateTexts.length < 80) finalHfCandidateTexts.push(candidateText);
       try {
-        const hfGate = await withReasonTimeout(hfAcceptabilityGate(light.text), REASON_FINAL_HF_TIMEOUT_MS, `reason v62 external classifier ${light.text}`);
+        const hfGate = await withReasonTimeout(hfAcceptabilityGate(candidateText), REASON_FINAL_HF_TIMEOUT_MS, `reason v63 external classifier ${candidateText}`);
         const finalAcceptability = applyHfAcceptabilityToLocalAcceptability(light.acceptability, hfGate);
         const finalOk = !!(finalAcceptability?.ok && finalAcceptability?.gameOk !== false && finalAcceptability?.type === 'complete_sentence');
         const final = finalOk
-          ? { ...light, ok:true, stage:'external-hf-classifier-accepted-for-reason-display-v62', acceptability:finalAcceptability, hfAcceptability:hfGate }
-          : { ...light, ok:false, stage:hfGate.ok === false ? 'external-hf-classifier-rejected-for-reason-display-v62' : 'external-hf-classifier-unavailable-suppressed-v62', acceptability:finalAcceptability, hfAcceptability:hfGate };
+          ? { ...light, text:candidateText, ok:true, stage:'external-hf-classifier-accepted-for-reason-display-v63', acceptability:finalAcceptability, hfAcceptability:hfGate }
+          : { ...light, text:candidateText, ok:false, stage:hfGate.ok === false ? 'external-hf-classifier-rejected-for-reason-display-v63' : 'external-hf-classifier-unavailable-suppressed-v63', acceptability:finalAcceptability, hfAcceptability:hfGate };
         if (!final.ok) {
-          if (hfGate.ok === false) { finalHfRejected++; if (finalHfRejectedTexts.length < 80) finalHfRejectedTexts.push(t); }
-          else { finalHfSuppressed++; if (finalHfSuppressedTexts.length < 80) finalHfSuppressedTexts.push(t); }
+          if (hfGate.ok === false) { finalHfRejected++; if (finalHfRejectedTexts.length < 80) finalHfRejectedTexts.push(candidateText); }
+          else { finalHfSuppressed++; if (finalHfSuppressedTexts.length < 80) finalHfSuppressedTexts.push(candidateText); }
           return null;
         }
-        if (finalHfAcceptedTexts.length < 80) finalHfAcceptedTexts.push(t);
+        if (finalHfAcceptedTexts.length < 80) finalHfAcceptedTexts.push(candidateText);
         return makeSuggestionFromFinal(item.op, final);
       } catch (e) {
         finalHfSuppressed++;
-        if (finalHfSuppressedTexts.length < 80) finalHfSuppressedTexts.push(t);
+        if (finalHfSuppressedTexts.length < 80) finalHfSuppressedTexts.push(candidateText);
         return null;
       }
     }
@@ -1593,7 +1594,7 @@ async function explainByExploration(text, diagnostics = {}) {
   }
 
   const oneStepOps = buildOneStepOps();
-  // v62: depth1だけで時間を使い切らない。まず少量だけ見て、depth2補完へ進める。
+  // v63: depth1だけで時間を使い切らない。まず少量だけ見て、depth2補完へ進める。
   let suggestions = await runLevel(oneStepOps, 1, { timeBudgetMs: 6500, checkBudget: 8 });
   let exploredDepth = 1;
   let twoStepOpsCount = 0;
@@ -1637,7 +1638,7 @@ async function explainByExploration(text, diagnostics = {}) {
   }
   return {
     ok:true,
-    method:'strict-link-grammar-oracle-exploration-v62-depth-timeslice-external-classifier',
+    method:'strict-link-grammar-oracle-exploration-v63-depth-timeslice-debug-fixed',
     model:'none',
     observedStructure: top ? 'nearest successful path found and confirmed by final HF display filter' : 'no successful path found in staged finite candidate set',
     incompletePart: top ? top.action : 'not found in exhaustive finite candidate set',
@@ -1655,7 +1656,7 @@ async function explainByExploration(text, diagnostics = {}) {
       hfOnlyAfterLightAccept:true,
       hfNetworkSkippedInReason:false,
       hfFinalDisplayFilter:true,
-      externalShallowJudge:'hf-classifier-depth-timeslice-v62',
+      externalShallowJudge:'hf-classifier-depth-timeslice-v63-debug-fixed',
       localGrammarPrefilter:false,
       hfChatUsed:false,
       externalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH,
@@ -2104,11 +2105,11 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-plus-languagetool-error-gate-v62-depth-timeslice-external-classifier',
+        mode:'link-grammar-plus-languagetool-error-gate-v63-depth-timeslice-debug-fixed',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v62-depth-timeslice-external-classifier',
+        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v63-depth-timeslice-debug-fixed',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:!ACCEPTABILITY_HF_ENABLED,
@@ -2118,8 +2119,8 @@ const server = http.createServer(async (req, res) => {
         hfAcceptabilityStats,
         hfAcceptabilityCacheSize: hfAcceptabilityCache.size,
         hfAcceptabilityCacheKeyPolicy:'exact-text-case-sensitive-v45',
-        reasonExplorePolicy:'depth-timeslice-action-bucket-plus-external-classifier-v62',
-        browserQueryContext:true, reasonHfNetworkDisabled:false, reasonDisplayHfFilter:true, reasonExternalShallowJudge:'hf-classifier-depth-timeslice-v62', reasonLocalPrefilterEnabled:false, reasonFinalHfTimeoutMs:REASON_FINAL_HF_TIMEOUT_MS, reasonFinalHfParallel:REASON_FINAL_HF_PARALLEL, reasonExternalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH, reasonLightCandidateWindowPerDepth:REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH, reasonActionBucketQuota:REASON_ACTION_BUCKET_QUOTA, reasonStreamingSoftDeadlineMs:REASON_STREAMING_SOFT_DEADLINE_MS,
+        reasonExplorePolicy:'depth-timeslice-action-bucket-plus-external-classifier-v63-debug-fixed',
+        browserQueryContext:true, reasonHfNetworkDisabled:false, reasonDisplayHfFilter:true, reasonExternalShallowJudge:'hf-classifier-depth-timeslice-v63-debug-fixed', reasonLocalPrefilterEnabled:false, reasonFinalHfTimeoutMs:REASON_FINAL_HF_TIMEOUT_MS, reasonFinalHfParallel:REASON_FINAL_HF_PARALLEL, reasonExternalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH, reasonLightCandidateWindowPerDepth:REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH, reasonActionBucketQuota:REASON_ACTION_BUCKET_QUOTA, reasonStreamingSoftDeadlineMs:REASON_STREAMING_SOFT_DEADLINE_MS,
         acceptanceGate:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate',
         pixabayKeyPresent: !!PIXABAY_API_KEY,
         hfModelScanVersion: 'v2-no-generation-params-for-classifiers',
@@ -2237,7 +2238,7 @@ const server = http.createServer(async (req, res) => {
         text,
         elapsedMs: Date.now() - startedAt,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v62-depth-timeslice-external-classifier',
+        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v63-depth-timeslice-debug-fixed',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:!ACCEPTABILITY_HF_ENABLED,
@@ -2247,8 +2248,8 @@ const server = http.createServer(async (req, res) => {
         hfAcceptabilityStats,
         hfAcceptabilityCacheSize: hfAcceptabilityCache.size,
         hfAcceptabilityCacheKeyPolicy:'exact-text-case-sensitive-v45',
-        reasonExplorePolicy:'depth-timeslice-action-bucket-plus-external-classifier-v62',
-        browserQueryContext:true, reasonHfNetworkDisabled:false, reasonDisplayHfFilter:true, reasonExternalShallowJudge:'hf-classifier-depth-timeslice-v62', reasonLocalPrefilterEnabled:false, reasonFinalHfTimeoutMs:REASON_FINAL_HF_TIMEOUT_MS, reasonFinalHfParallel:REASON_FINAL_HF_PARALLEL, reasonExternalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH, reasonLightCandidateWindowPerDepth:REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH, reasonActionBucketQuota:REASON_ACTION_BUCKET_QUOTA, reasonStreamingSoftDeadlineMs:REASON_STREAMING_SOFT_DEADLINE_MS,
+        reasonExplorePolicy:'depth-timeslice-action-bucket-plus-external-classifier-v63-debug-fixed',
+        browserQueryContext:true, reasonHfNetworkDisabled:false, reasonDisplayHfFilter:true, reasonExternalShallowJudge:'hf-classifier-depth-timeslice-v63-debug-fixed', reasonLocalPrefilterEnabled:false, reasonFinalHfTimeoutMs:REASON_FINAL_HF_TIMEOUT_MS, reasonFinalHfParallel:REASON_FINAL_HF_PARALLEL, reasonExternalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH, reasonLightCandidateWindowPerDepth:REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH, reasonActionBucketQuota:REASON_ACTION_BUCKET_QUOTA, reasonStreamingSoftDeadlineMs:REASON_STREAMING_SOFT_DEADLINE_MS,
         acceptanceGate:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
