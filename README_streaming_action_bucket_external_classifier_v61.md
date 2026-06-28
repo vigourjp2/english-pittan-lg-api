@@ -1,8 +1,8 @@
-# v61 streaming action-bucket external classifier
+# v62 streaming action-bucket external classifier
 
 目的: v60 で action bucket による候補窓確保は入ったが、窓内候補をまとめて LG/LT → HF に流した結果、再び 30 秒 timeout になった。
 
-v61 の変更:
+v62 の変更:
 
 - HF Chat は使わない。
 - ローカルの助動詞/be動詞/動詞リスト判定は使わない。
@@ -15,9 +15,9 @@ v61 の変更:
 
 期待 health:
 
-- mode: `link-grammar-plus-languagetool-error-gate-v61-streaming-action-bucket-external-classifier`
-- reasonExplorePolicy: `streaming-action-bucket-light-plus-external-classifier-v61`
-- reasonExternalShallowJudge: `hf-classifier-streaming-action-bucket-v61`
+- mode: `link-grammar-plus-languagetool-error-gate-v62-streaming-interleaved-depth-external-classifier`
+- reasonExplorePolicy: `streaming-interleaved-depth-plus-external-classifier-v62`
+- reasonExternalShallowJudge: `hf-classifier-streaming-interleaved-depth-v62`
 - reasonLocalPrefilterEnabled: `false`
 - reasonStreamingSoftDeadlineMs: `23500`
 
