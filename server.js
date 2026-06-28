@@ -43,8 +43,9 @@ const REASON_CANDIDATE_TIMEOUT_MS = Math.max(1000, Number(process.env.REASON_CAN
 const REASON_FINAL_HF_TIMEOUT_MS = Math.max(2500, Number(process.env.REASON_FINAL_HF_TIMEOUT_MS || 6500)); // v58: 理由表示候補の外部HF分類器1件ごとの安全弁。HF Chatは使わない。
 const REASON_FINAL_HF_PARALLEL = Math.max(1, Math.min(12, Number(process.env.REASON_FINAL_HF_PARALLEL || 8))); // v58: 表示候補確認の同時実行数。成立判定上限ではなく外部I/O隔離の粒度。
 const REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH = Math.max(1, Math.min(24, Number(process.env.REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH || 12))); // v59: 各手数depthで外部分類器に出す表示候補窓。ローカル文法ジャッジではなく、HFに投げる順番を制御する。
-const REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH = Math.max(1, Math.min(64, Number(process.env.REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH || 24))); // v60: LG/LTへ投げる探索窓。文法判定ではなく、action種別ごとに公平に外部判定へ回す窓。
-const REASON_ACTION_BUCKET_QUOTA = Math.max(1, Math.min(12, Number(process.env.REASON_ACTION_BUCKET_QUOTA || 4))); // v60: add-left/add-right/add-two-left/add-two-right等のactionごとに最低限確保する件数。
+const REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH = Math.max(1, Math.min(64, Number(process.env.REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH || 28))); // v61: streamingで見る最大候補数。文法判定ではなく、外部判定へ回す探索量の安全弁。
+const REASON_ACTION_BUCKET_QUOTA = Math.max(1, Math.min(12, Number(process.env.REASON_ACTION_BUCKET_QUOTA || 6))); // v61: action/source別に順番を見る件数。文法判定ではなく外部判定順序の公平性確保。
+const REASON_STREAMING_SOFT_DEADLINE_MS = Math.max(5000, Math.min(26000, Number(process.env.REASON_STREAMING_SOFT_DEADLINE_MS || 23500))); // v61: job全体30秒タイムアウト前に理由結果を安全に返すためのsoft deadline。
 const reasonJobs = new Map();
 let reasonQueueRunning = false;
 let reasonQueueTimer = null;
@@ -1263,7 +1264,7 @@ function limitedPermutations(arr, max = 120) {
 function reasonLocalPrefilter(sentence) {
   // v58: 撤去済み。ローカルの助動詞/動詞リストで候補を捨てない。
   // 浅い候補可否は実績ある外部HF分類器だけに投げる。HF Chatは使わない。
-  return { ok:true, reason:'removed-v60-action-bucket-external-classifier-window' };
+  return { ok:true, reason:'removed-v61-streaming-action-bucket-external-classifier' };
 }
 
 async function explainByExploration(text, diagnostics = {}) {
@@ -1469,29 +1470,29 @@ async function explainByExploration(text, diagnostics = {}) {
     };
   }
 
-  async function runLevel(ops) {
-    // v59:
-    // - v58の timeout 原因は、HF前ではなく「全候補を順番にLG/LTへ投げる」部分。
-    // - ここで文法リスト/助動詞リストによるローカル判定はしない。
-    // - まず、最短手数・手札優先・生成順だけで表示候補窓を作る。
-    // - その窓だけをLG/LTへ並列投入し、通ったものだけ外部HF分類器へ投げる。
+  async function runLevel(ops, depthLabel = 1) {
+    // v61:
+    // - v60はaction bucketで候補窓を広げたが、窓内候補をまとめてLG/LT→HFへ流して30秒を再発した。
+    // - v61は「まとめて全部チェック」しない。action/source bucket順に1件ずつ外部判定へ流し、HFでOKが出た瞬間にreturnする。
+    // - ローカル文法判定・助動詞リスト判定・特定文accept/rejectは使わない。
+    // - 30秒job timeout直前に巻き込まれないようsoft deadlineで候補なし結果へ安全に戻す。
     const sourceRank = { hand:0, board:1, deck:2 };
-    const actionRank = { 'add-left':0, 'add-right':0, 'add-two-left':0, 'add-two-right':0, replace:1, reorder:2, delete:3 };
+    const actionRank = { 'add-left':0, 'add-right':1, 'add-two-left':2, 'add-two-right':3, replace:4, reorder:5, delete:6 };
     const rankedOps = (ops || [])
       .map((op, i) => ({ op, originalIndex:i, sentence:op.sentence || uniqueSentence(op.words) }))
       .filter(x => x.sentence && x.sentence.toLowerCase() !== originalKey)
       .sort((a,b) =>
         (sourceRank[a.op.source] ?? 9) - (sourceRank[b.op.source] ?? 9) ||
+        (actionRank[a.op.action] ?? 9) - (actionRank[b.op.action] ?? 9) ||
         Math.abs(String(a.sentence || '').split(/\s+/).filter(Boolean).length - 4) - Math.abs(String(b.sentence || '').split(/\s+/).filter(Boolean).length - 4) ||
         a.originalIndex - b.originalIndex
       );
 
-    // v60:
-    // v59の問題は「上位N件固定」だと、特定action（add-two-right等）や生成順だけで窓が埋まり、
-    // add-left / add-two-left などの補完候補が外部判定まで届かないこと。
-    // ここでは文法判断はしない。action/sourceごとに候補窓を公平に確保するだけ。
     const bucketOrder = [
+      // 1枚追加をまず見る。ただしここで成立しなければ2枚追加にすぐ進む。
       'hand:add-left', 'hand:add-right',
+      // 今回の Japanese now のような断片は「手札2枚を前に足す」候補が埋もれやすいので、bucketとして公平に確保する。
+      // これは具体文の固定ではなく、action/source別の探索順制御。
       'hand:add-two-left', 'hand:add-two-right',
       'hand:replace', 'hand:reorder',
       'board:add-left', 'board:add-right',
@@ -1508,101 +1509,73 @@ async function explainByExploration(text, diagnostics = {}) {
       if (!buckets.has(anyKey)) buckets.set(anyKey, []);
       buckets.get(anyKey).push(item);
     }
-    const picked = [];
-    const pickedKeys = new Set();
-    function pick(item) {
-      const k = String(item.sentence || '').toLowerCase();
-      if (!k || pickedKeys.has(k) || picked.length >= REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH) return false;
-      pickedKeys.add(k); picked.push(item); return true;
+
+    const seenSentences = new Set();
+    const ordered = [];
+    function addItem(item) {
+      const k = String(item?.sentence || '').toLowerCase();
+      if (!k || seenSentences.has(k) || ordered.length >= REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH) return false;
+      seenSentences.add(k); ordered.push(item); return true;
     }
     for (const key of bucketOrder) {
-      const arr = buckets.get(key) || [];
       let n = 0;
-      for (const item of arr) {
-        if (pick(item)) n++;
-        if (n >= REASON_ACTION_BUCKET_QUOTA || picked.length >= REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH) break;
+      for (const item of (buckets.get(key) || [])) {
+        if (addItem(item)) n++;
+        if (n >= REASON_ACTION_BUCKET_QUOTA || ordered.length >= REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH) break;
       }
-      if (picked.length >= REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH) break;
+      if (ordered.length >= REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH) break;
     }
     for (const item of rankedOps) {
-      if (picked.length >= REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH) break;
-      pick(item);
+      if (ordered.length >= REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH) break;
+      addItem(item);
     }
-    const candidateWindow = picked;
-    lightWindowChecks += candidateWindow.length;
+    lightWindowChecks += ordered.length;
 
-    async function checkLight(item) {
+    async function verifyAcceptedLight(item, light) {
+      finalHfChecks++;
       try {
-        const r = await isGood(item.sentence);
-        if (r && r.ok) return { op:item.op, light:r, originalIndex:item.originalIndex };
-      } catch (e) {
-        // 個別候補のI/O失敗でreason job全体を巻き込まない。
-      }
-      return null;
-    }
-
-    const lightCandidates = [];
-    for (let i = 0; i < candidateWindow.length; i += REASON_FINAL_HF_PARALLEL) {
-      const chunk = candidateWindow.slice(i, i + REASON_FINAL_HF_PARALLEL);
-      const done = await Promise.all(chunk.map(checkLight));
-      for (const x of done) if (x) lightCandidates.push(x);
-      if (lightCandidates.length >= REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH) break;
-    }
-
-    if (!lightCandidates.length) return [];
-
-    // 候補の成否はここでは決めない。外部HF分類器に出す順序を安定化するだけ。
-    const ranked = lightCandidates
-      .map((x, i) => ({ ...x, originalIndex:x.originalIndex ?? i }))
-      .sort((a,b) =>
-        (sourceRank[a.op.source] ?? 9) - (sourceRank[b.op.source] ?? 9) ||
-        (actionRank[a.op.action] ?? 9) - (actionRank[b.op.action] ?? 9) ||
-        Math.abs(String(a.light.text || '').split(/\s+/).filter(Boolean).length - 4) - Math.abs(String(b.light.text || '').split(/\s+/).filter(Boolean).length - 4) ||
-        a.originalIndex - b.originalIndex
-      );
-
-    const verifyWindow = ranked.slice(0, REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH);
-    finalHfChecks += verifyWindow.length;
-
-    async function verifyOne(item) {
-      try {
-        const hfGate = await withReasonTimeout(hfAcceptabilityGate(item.light.text), REASON_FINAL_HF_TIMEOUT_MS, `reason v60 external classifier ${item.light.text}`);
-        const finalAcceptability = applyHfAcceptabilityToLocalAcceptability(item.light.acceptability, hfGate);
+        const hfGate = await withReasonTimeout(hfAcceptabilityGate(light.text), REASON_FINAL_HF_TIMEOUT_MS, `reason v61 external classifier ${light.text}`);
+        const finalAcceptability = applyHfAcceptabilityToLocalAcceptability(light.acceptability, hfGate);
         const finalOk = !!(finalAcceptability?.ok && finalAcceptability?.gameOk !== false && finalAcceptability?.type === 'complete_sentence');
         const final = finalOk
-          ? { ...item.light, ok:true, stage:'external-hf-classifier-accepted-for-reason-display-v60', acceptability:finalAcceptability, hfAcceptability:hfGate }
-          : { ...item.light, ok:false, stage:hfGate.ok === false ? 'external-hf-classifier-rejected-for-reason-display-v60' : 'external-hf-classifier-unavailable-suppressed-v60', acceptability:finalAcceptability, hfAcceptability:hfGate };
+          ? { ...light, ok:true, stage:'external-hf-classifier-accepted-for-reason-display-v61', acceptability:finalAcceptability, hfAcceptability:hfGate }
+          : { ...light, ok:false, stage:hfGate.ok === false ? 'external-hf-classifier-rejected-for-reason-display-v61' : 'external-hf-classifier-unavailable-suppressed-v61', acceptability:finalAcceptability, hfAcceptability:hfGate };
         if (!final.ok) {
           if (hfGate.ok === false) finalHfRejected++;
           else finalHfSuppressed++;
+          return null;
         }
-        return { ...item, final };
+        return makeSuggestionFromFinal(item.op, final);
       } catch (e) {
         finalHfSuppressed++;
-        return { ...item, final:{ ...item.light, ok:false, stage:'external-hf-classifier-timeout-suppressed-v60', error:String(e?.message || e), hfAcceptability:{ checked:false, ok:false, available:false, reason:String(e?.message || e), model:ACCEPTABILITY_HF_MODEL } } };
+        return null;
       }
     }
 
-    const results = [];
-    for (let i = 0; i < verifyWindow.length; i += REASON_FINAL_HF_PARALLEL) {
-      const chunk = verifyWindow.slice(i, i + REASON_FINAL_HF_PARALLEL);
-      const done = await Promise.all(chunk.map(verifyOne));
-      results.push(...done);
-      const accepted = results.find(x => x.final && x.final.ok);
-      if (accepted) return [makeSuggestionFromFinal(accepted.op, accepted.final)];
+    // 逐次streaming。並列で詰め込まず、OK候補が出たら即return。
+    for (const item of ordered) {
+      if ((Date.now() - startedAt) > REASON_STREAMING_SOFT_DEADLINE_MS) break;
+      let light = null;
+      try {
+        light = await isGood(item.sentence);
+      } catch (e) {
+        light = null;
+      }
+      if (!light || !light.ok) continue;
+      const suggestion = await verifyAcceptedLight(item, light);
+      if (suggestion) return [suggestion];
     }
-
     return [];
   }
 
   const oneStepOps = buildOneStepOps();
-  let suggestions = await runLevel(oneStepOps);
+  let suggestions = await runLevel(oneStepOps, 1);
   let exploredDepth = 1;
   let twoStepOpsCount = 0;
   if (!suggestions.length) {
     const twoStepOps = buildTwoStepOps();
     twoStepOpsCount = twoStepOps.length;
-    suggestions = await runLevel(twoStepOps);
+    suggestions = await runLevel(twoStepOps, 2);
     exploredDepth = 2;
   }
 
@@ -1639,7 +1612,7 @@ async function explainByExploration(text, diagnostics = {}) {
   }
   return {
     ok:true,
-    method:'strict-link-grammar-oracle-exploration-v60-action-bucket-external-classifier-window',
+    method:'strict-link-grammar-oracle-exploration-v61-streaming-action-bucket-external-classifier',
     model:'none',
     observedStructure: top ? 'nearest successful path found and confirmed by final HF display filter' : 'no successful path found in staged finite candidate set',
     incompletePart: top ? top.action : 'not found in exhaustive finite candidate set',
@@ -1657,13 +1630,13 @@ async function explainByExploration(text, diagnostics = {}) {
       hfOnlyAfterLightAccept:true,
       hfNetworkSkippedInReason:false,
       hfFinalDisplayFilter:true,
-      externalShallowJudge:'hf-classifier-action-bucket-display-window-v60',
+      externalShallowJudge:'hf-classifier-streaming-action-bucket-v61',
       localGrammarPrefilter:false,
       hfChatUsed:false,
       externalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH,
       lightCandidateWindowPerDepth:REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH, actionBucketQuota:REASON_ACTION_BUCKET_QUOTA,
       lightWindowChecks,
-      externalVerifyParallel:REASON_FINAL_HF_PARALLEL,
+      externalVerifyParallel:REASON_FINAL_HF_PARALLEL, streamingSoftDeadlineMs:REASON_STREAMING_SOFT_DEADLINE_MS,
       finalHfChecks,
       finalHfRejected,
       finalHfSuppressed,
@@ -2098,11 +2071,11 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-plus-languagetool-error-gate-v60-action-bucket-external-classifier-window',
+        mode:'link-grammar-plus-languagetool-error-gate-v61-streaming-action-bucket-external-classifier',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v60-action-bucket-external-classifier-window',
+        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v61-streaming-action-bucket-external-classifier',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:!ACCEPTABILITY_HF_ENABLED,
@@ -2112,8 +2085,8 @@ const server = http.createServer(async (req, res) => {
         hfAcceptabilityStats,
         hfAcceptabilityCacheSize: hfAcceptabilityCache.size,
         hfAcceptabilityCacheKeyPolicy:'exact-text-case-sensitive-v45',
-        reasonExplorePolicy:'action-bucket-light-window-plus-external-classifier-display-window-v60',
-        browserQueryContext:true, reasonHfNetworkDisabled:false, reasonDisplayHfFilter:true, reasonExternalShallowJudge:'hf-classifier-action-bucket-display-window-v60', reasonLocalPrefilterEnabled:false, reasonFinalHfTimeoutMs:REASON_FINAL_HF_TIMEOUT_MS, reasonFinalHfParallel:REASON_FINAL_HF_PARALLEL, reasonExternalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH, reasonLightCandidateWindowPerDepth:REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH, reasonActionBucketQuota:REASON_ACTION_BUCKET_QUOTA,
+        reasonExplorePolicy:'streaming-action-bucket-light-plus-external-classifier-v61',
+        browserQueryContext:true, reasonHfNetworkDisabled:false, reasonDisplayHfFilter:true, reasonExternalShallowJudge:'hf-classifier-streaming-action-bucket-v61', reasonLocalPrefilterEnabled:false, reasonFinalHfTimeoutMs:REASON_FINAL_HF_TIMEOUT_MS, reasonFinalHfParallel:REASON_FINAL_HF_PARALLEL, reasonExternalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH, reasonLightCandidateWindowPerDepth:REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH, reasonActionBucketQuota:REASON_ACTION_BUCKET_QUOTA, reasonStreamingSoftDeadlineMs:REASON_STREAMING_SOFT_DEADLINE_MS,
         acceptanceGate:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate',
         pixabayKeyPresent: !!PIXABAY_API_KEY,
         hfModelScanVersion: 'v2-no-generation-params-for-classifiers',
@@ -2231,7 +2204,7 @@ const server = http.createServer(async (req, res) => {
         text,
         elapsedMs: Date.now() - startedAt,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v60-action-bucket-external-classifier-window',
+        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v61-streaming-action-bucket-external-classifier',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:!ACCEPTABILITY_HF_ENABLED,
@@ -2241,8 +2214,8 @@ const server = http.createServer(async (req, res) => {
         hfAcceptabilityStats,
         hfAcceptabilityCacheSize: hfAcceptabilityCache.size,
         hfAcceptabilityCacheKeyPolicy:'exact-text-case-sensitive-v45',
-        reasonExplorePolicy:'action-bucket-light-window-plus-external-classifier-display-window-v60',
-        browserQueryContext:true, reasonHfNetworkDisabled:false, reasonDisplayHfFilter:true, reasonExternalShallowJudge:'hf-classifier-action-bucket-display-window-v60', reasonLocalPrefilterEnabled:false, reasonFinalHfTimeoutMs:REASON_FINAL_HF_TIMEOUT_MS, reasonFinalHfParallel:REASON_FINAL_HF_PARALLEL, reasonExternalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH, reasonLightCandidateWindowPerDepth:REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH, reasonActionBucketQuota:REASON_ACTION_BUCKET_QUOTA,
+        reasonExplorePolicy:'streaming-action-bucket-light-plus-external-classifier-v61',
+        browserQueryContext:true, reasonHfNetworkDisabled:false, reasonDisplayHfFilter:true, reasonExternalShallowJudge:'hf-classifier-streaming-action-bucket-v61', reasonLocalPrefilterEnabled:false, reasonFinalHfTimeoutMs:REASON_FINAL_HF_TIMEOUT_MS, reasonFinalHfParallel:REASON_FINAL_HF_PARALLEL, reasonExternalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH, reasonLightCandidateWindowPerDepth:REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH, reasonActionBucketQuota:REASON_ACTION_BUCKET_QUOTA, reasonStreamingSoftDeadlineMs:REASON_STREAMING_SOFT_DEADLINE_MS,
         acceptanceGate:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,

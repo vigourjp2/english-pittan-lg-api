@@ -1,10 +1,8 @@
-# English Pittan v60
+# English Pittan Link Grammar API v61
 
-v60: action bucket external classifier window.
+v61: streaming action-bucket external classifier.
 
-- HF Chat撤去
-- ローカル文法ハードコードなし
-- action/source別に候補窓を確保
-- 最終表示は Link Grammar + LanguageTool + HF分類器で確認
+v60の再timeout原因は、action bucketで候補窓を広げたあと、窓内候補をまとめてLG/LT→HFへ流していたこと。
+v61では候補を1件ずつstreaming判定し、外部HF分類器でOKが出た瞬間にreturnする。
 
-See `README_action_bucket_external_classifier_v60.md`.
+HF Chat不使用。ローカル文法ハードコード不使用。
