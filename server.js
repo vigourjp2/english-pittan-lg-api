@@ -8,10 +8,16 @@ const LINK_TIMEOUT_MS = Number(process.env.LINK_TIMEOUT_MS || 3500);
 const LT_TIMEOUT_MS = Number(process.env.LT_TIMEOUT_MS || 5000);
 const HF_TIMEOUT_MS = Number(process.env.HF_TIMEOUT_MS || 25000);
 const HF_MODEL_SCAN_TIMEOUT_MS = Number(process.env.HF_MODEL_SCAN_TIMEOUT_MS || 20000);
-// v42.3: second-pass curated acceptability/grammar-classifier candidates. Focus on models that may catch "walking am happy".
-// Default /diagnose-acceptability still calls only textattack/roberta-base-CoLA.
-// Use ?scan=1 or /diagnose-model-benchmark when intentionally spending HF requests to compare models.
+// v43: production gate adds a lightweight HF grammar classifier only after Link Grammar + LanguageTool pass.
+// The selected production model is abdulmatinomotoso/English_Grammar_Checker because diagnostics verified:
+// OK: I am happy / The cat is sleeping, NG: eating am happy / walking am happy / he am happy.
+// /diagnose-acceptability remains available for model inspection. /check now uses the production HF gate when enabled.
 const HF_SCAN_MODELS = (process.env.HF_SCAN_MODELS || 'textattack/roberta-base-CoLA,abdulmatinomotoso/English_Grammar_Checker,agentlans/snowflake-arctic-xs-grammar-classifier,nikolasmoya/c4-binary-english-grammar-checker,pszemraj/electra-small-discriminator-CoLA,textattack/bert-base-uncased-CoLA,EstherT/sentence-acceptability').split(',').map(s => s.trim()).filter(Boolean);
+const ACCEPTABILITY_HF_ENABLED = !/^false|0|off$/i.test(String(process.env.ACCEPTABILITY_HF_ENABLED || 'true'));
+const ACCEPTABILITY_HF_MODEL = process.env.ACCEPTABILITY_HF_MODEL || 'abdulmatinomotoso/English_Grammar_Checker';
+const ACCEPTABILITY_HF_FAIL_CLOSED = /^true|1|on$/i.test(String(process.env.ACCEPTABILITY_HF_FAIL_CLOSED || 'false'));
+const ACCEPTABILITY_HF_DAILY_MAX = Math.max(0, Number(process.env.ACCEPTABILITY_HF_DAILY_MAX || 80));
+const ACCEPTABILITY_HF_CACHE_MAX = Math.max(100, Number(process.env.ACCEPTABILITY_HF_CACHE_MAX || 2000));
 
 const LANGUAGETOOL_URL = process.env.LANGUAGETOOL_URL || 'https://api.languagetool.org/v2/check';
 const HF_TOKEN = process.env.HF_TOKEN || '';
@@ -22,6 +28,11 @@ const PIXABAY_API_KEY = process.env.PIXABAY_API_KEY || '';
 const PIXABAY_TIMEOUT_MS = Number(process.env.PIXABAY_TIMEOUT_MS || 9000);
 const sentenceImageCache = new Map();
 const translateCache = new Map();
+const hfAcceptabilityCache = new Map();
+let hfAcceptabilityStats = { day:'', calls:0, cacheHits:0, accepted:0, rejected:0, unavailable:0, skipped:0 };
+function currentUtcDayKey() { return new Date().toISOString().slice(0, 10); }
+function resetHfAcceptabilityStatsIfNeeded() { const d = currentUtcDayKey(); if (hfAcceptabilityStats.day !== d) hfAcceptabilityStats = { day:d, calls:0, cacheHits:0, accepted:0, rejected:0, unavailable:0, skipped:0 }; }
+function trimHfAcceptabilityCache() { while (hfAcceptabilityCache.size > ACCEPTABILITY_HF_CACHE_MAX) hfAcceptabilityCache.delete(hfAcceptabilityCache.keys().next().value); }
 
 const REASON_JOB_RETRY_DELAYS_MS = (process.env.REASON_JOB_RETRY_DELAYS_MS || '3000,8000,15000,30000').split(',').map(x => Number(x.trim())).filter(Number.isFinite); // v26: 失敗直後の0ms即リトライを廃止
 const REASON_JOB_MAX_ATTEMPTS_RAW = Number(process.env.REASON_JOB_MAX_ATTEMPTS || 3);
@@ -519,13 +530,87 @@ function localAcceptabilityFromLinkParserAndLt(text, parsed, ltGate = null) {
   }
   return { ...base, method:'strict-link-grammar-plus-languagetool-error-gate', gate:'strict-link-grammar-and-languagetool', languageToolBlocking:false };
 }
+async function hfAcceptabilityGate(text) {
+  resetHfAcceptabilityStatsIfNeeded();
+  const src = normalizeText(text);
+  const key = `${ACCEPTABILITY_HF_MODEL}::${src.toLowerCase()}`;
+  const cached = hfAcceptabilityCache.get(key);
+  if (cached) {
+    hfAcceptabilityStats.cacheHits++;
+    return { ...cached, cached:true };
+  }
+  if (!ACCEPTABILITY_HF_ENABLED) {
+    hfAcceptabilityStats.skipped++;
+    return { checked:false, ok:true, available:false, enabled:false, model:ACCEPTABILITY_HF_MODEL, reason:'hf-acceptability-disabled', failOpen:!ACCEPTABILITY_HF_FAIL_CLOSED };
+  }
+  if (!HF_TOKEN) {
+    hfAcceptabilityStats.unavailable++;
+    return { checked:false, ok:!ACCEPTABILITY_HF_FAIL_CLOSED, available:false, enabled:true, model:ACCEPTABILITY_HF_MODEL, reason:'HF_TOKEN is not set', failOpen:!ACCEPTABILITY_HF_FAIL_CLOSED };
+  }
+  if (ACCEPTABILITY_HF_DAILY_MAX > 0 && hfAcceptabilityStats.calls >= ACCEPTABILITY_HF_DAILY_MAX) {
+    hfAcceptabilityStats.unavailable++;
+    return { checked:false, ok:!ACCEPTABILITY_HF_FAIL_CLOSED, available:false, enabled:true, model:ACCEPTABILITY_HF_MODEL, reason:'daily HF acceptability limit reached', dailyMax:ACCEPTABILITY_HF_DAILY_MAX, failOpen:!ACCEPTABILITY_HF_FAIL_CLOSED };
+  }
+  hfAcceptabilityStats.calls++;
+  const summary = await callHfInferenceModel(ACCEPTABILITY_HF_MODEL, src);
+  const judgement = inferAcceptabilityFromHfSummary(summary);
+  let value;
+  if (!judgement.ok || judgement.acceptable === null) {
+    hfAcceptabilityStats.unavailable++;
+    value = { checked:true, ok:!ACCEPTABILITY_HF_FAIL_CLOSED, available:false, enabled:true, model:ACCEPTABILITY_HF_MODEL, judgement, reason: judgement.error || judgement.reason || 'unknown HF output', failOpen:!ACCEPTABILITY_HF_FAIL_CLOSED };
+  } else if (judgement.acceptable === false) {
+    hfAcceptabilityStats.rejected++;
+    value = { checked:true, ok:false, available:true, enabled:true, model:ACCEPTABILITY_HF_MODEL, judgement, reason:`acceptability rejected by ${ACCEPTABILITY_HF_MODEL}`, failOpen:false };
+  } else {
+    hfAcceptabilityStats.accepted++;
+    value = { checked:true, ok:true, available:true, enabled:true, model:ACCEPTABILITY_HF_MODEL, judgement, reason:'acceptability accepted', failOpen:false };
+  }
+  hfAcceptabilityCache.set(key, value);
+  trimHfAcceptabilityCache();
+  return { ...value, cached:false };
+}
+
+function applyHfAcceptabilityToLocalAcceptability(baseAccept, hfGate) {
+  if (!(baseAccept?.ok && baseAccept?.gameOk !== false && baseAccept?.type === 'complete_sentence')) return baseAccept;
+  if (!hfGate?.checked && hfGate?.ok !== false) {
+    return { ...baseAccept, method:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate', gate:'strict-link-grammar-languagetool-hf-unchecked-open', hfUsed:false, hfAcceptability:hfGate };
+  }
+  if (hfGate?.ok === false) {
+    const msg = hfGate?.judgement?.reason || hfGate?.reason || 'External grammar classifier rejected this sentence.';
+    return {
+      ok:false,
+      gameOk:false,
+      type:'grammar_error',
+      method:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate',
+      reason: msg,
+      sentenceType:'not_complete_sentence',
+      utteranceType:'grammar_error',
+      displayKind:'文法エラー',
+      jaHint:'',
+      noteJa:`文法判定モデル: ${msg}`,
+      noteEn:msg,
+      gate:'hf-grammar-classifier-rejected',
+      hfUsed:true,
+      hfAcceptability:hfGate,
+      hfModel:hfGate?.model || ACCEPTABILITY_HF_MODEL,
+      languageToolBlocking:false
+    };
+  }
+  return { ...baseAccept, method:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate', gate:'strict-link-grammar-languagetool-hf-accepted', hfUsed:!!hfGate?.checked, hfAcceptability:hfGate, hfModel:hfGate?.model || ACCEPTABILITY_HF_MODEL };
+}
+
 async function evaluateGameTextExact(text) {
   const src = normalizeText(text);
   const parsed = await runLinkParser(src);
   let ltGate = null;
   if (strictLinkGrammarGameOk(parsed)) ltGate = await languageToolErrorGate(src);
-  const acceptability = localAcceptabilityFromLinkParserAndLt(src, parsed, ltGate);
-  return { text:src, parsed, languageTool:ltGate, acceptability, ok:!!acceptability.ok, gameOk:!!(acceptability.ok && acceptability.gameOk !== false && acceptability.type === 'complete_sentence') };
+  let acceptability = localAcceptabilityFromLinkParserAndLt(src, parsed, ltGate);
+  let hfGate = null;
+  if (acceptability.ok && acceptability.gameOk !== false && acceptability.type === 'complete_sentence') {
+    hfGate = await hfAcceptabilityGate(src);
+    acceptability = applyHfAcceptabilityToLocalAcceptability(acceptability, hfGate);
+  }
+  return { text:src, parsed, languageTool:ltGate, hfAcceptability:hfGate, acceptability, ok:!!acceptability.ok, gameOk:!!(acceptability.ok && acceptability.gameOk !== false && acceptability.type === 'complete_sentence') };
 }
 
 function runLinkParser(text) {
@@ -800,7 +885,7 @@ async function diagnoseAcceptabilityWithModels(text, modelFilter = '', scanAll =
   }
   return {
     ok:true,
-    version:'v42.3-model-scan-second-pass-diagnose-only',
+    version:'v43-hf-grammar-gate-abdul-only',
     text:src,
     usedForCorrection:false,
     linkGrammar:{ ok:strictLinkGrammarGameOk(parsed), fullParse:parsed.fullParse, strictLinkGrammar:parsed.strictLinkGrammar, linkages:parsed.linkages, nullCount:parsed.nullCount, code:parsed.code },
@@ -1232,16 +1317,16 @@ async function checkSentence(text, withTranslate = false, reasonMeta = {}) {
   }
   return {
     originalText, text: checkedText, normalized: proof.normalized, appliedCorrections: proof.appliedCorrections || [],
-    ok, gameOk, type, kind:'Strict Link Grammar + LanguageTool Error Gate + CoLA Label-Fix Diagnose v42.1',
+    ok, gameOk, type, kind:'Strict Link Grammar + LanguageTool + HF Grammar Classifier Gate v43',
     sentenceType: gameOk ? (acceptability.sentenceType || 'complete_sentence') : (acceptability.sentenceType || type),
     reason: gameOk ? '' : (acceptability.noteJa || acceptability.reason || reasonExplain?.explanationJa || reasonExplain?.explanationEn || ''),
-    reasonSource: gameOk ? '' : (acceptability.languageToolBlocking ? 'languagetool-error-gate' : (reasonExplain?.ok ? reasonExplain.method : 'reason-job-pending')),
+    reasonSource: gameOk ? '' : (acceptability.languageToolBlocking ? 'languagetool-error-gate' : (acceptability.hfUsed ? 'hf-grammar-classifier-gate' : (reasonExplain?.ok ? reasonExplain.method : 'reason-job-pending'))),
     reasonStatus: gameOk ? 'none' : (reasonJob?.status || 'pending'),
     reasonJobId: gameOk ? '' : (reasonJob?.id || ''),
     reasonExplain, proof,
     fullParse: parsed.fullParse, strictLinkGrammar: parsed.strictLinkGrammar,
     linkages: parsed.linkages, nullCount: parsed.nullCount, stdout: parsed.stdout, stderr: parsed.stderr, code: parsed.code,
-    acceptability, languageTool: ev.languageTool, ja: translation?.ja || '', translation
+    acceptability, languageTool: ev.languageTool, hfAcceptability: ev.hfAcceptability, ja: translation?.ja || '', translation
   };
 }
 
@@ -1560,15 +1645,20 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-plus-languagetool-error-gate-v42.3-model-scan-second-pass-diagnose',
+        mode:'link-grammar-plus-languagetool-error-gate-v43-hf-grammar-gate-abdul',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-languagetool-oracle-exploration-v42.3-model-scan-second-pass-diagnostic',
+        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v43',
         quotaFree:true,
         hfDisabledForReason:true,
-        hfDisabledForAcceptability:true,
-        acceptanceGate:'strict-link-grammar-plus-languagetool-error-gate',
+        hfDisabledForAcceptability:!ACCEPTABILITY_HF_ENABLED,
+        hfAcceptabilityModel: ACCEPTABILITY_HF_MODEL,
+        hfAcceptabilityFailClosed: ACCEPTABILITY_HF_FAIL_CLOSED,
+        hfAcceptabilityDailyMax: ACCEPTABILITY_HF_DAILY_MAX,
+        hfAcceptabilityStats,
+        hfAcceptabilityCacheSize: hfAcceptabilityCache.size,
+        acceptanceGate:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate',
         pixabayKeyPresent: !!PIXABAY_API_KEY,
         hfModelScanVersion: 'v2-no-generation-params-for-classifiers',
         hfModelScanModels: HF_SCAN_MODELS,
@@ -1581,7 +1671,12 @@ const server = http.createServer(async (req, res) => {
       const src = normalizeText(text);
       const parsed = await runLinkParser(src);
       const lt = await languageToolErrorGate(src);
-      const acceptability = localAcceptabilityFromLinkParserAndLt(src, parsed, lt);
+      let acceptability = localAcceptabilityFromLinkParserAndLt(src, parsed, lt);
+      let hfGate = null;
+      if (acceptability.ok && acceptability.gameOk !== false && acceptability.type === 'complete_sentence') {
+        hfGate = await hfAcceptabilityGate(src);
+        acceptability = applyHfAcceptabilityToLocalAcceptability(acceptability, hfGate);
+      }
       return send(res, 200, {
         ok:true,
         text:src,
@@ -1595,6 +1690,7 @@ const server = http.createServer(async (req, res) => {
           code: parsed.code
         },
         languageTool:lt,
+        hfAcceptability:hfGate,
         finalGatePreview:{
           ok: !!(acceptability.ok && acceptability.gameOk !== false && acceptability.type === 'complete_sentence'),
           type: acceptability.type,
@@ -1679,11 +1775,16 @@ const server = http.createServer(async (req, res) => {
         text,
         elapsedMs: Date.now() - startedAt,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-languagetool-oracle-exploration-v42.3-model-scan-second-pass-diagnostic',
+        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v43',
         quotaFree:true,
         hfDisabledForReason:true,
-        hfDisabledForAcceptability:true,
-        acceptanceGate:'strict-link-grammar-plus-languagetool-error-gate',
+        hfDisabledForAcceptability:!ACCEPTABILITY_HF_ENABLED,
+        hfAcceptabilityModel: ACCEPTABILITY_HF_MODEL,
+        hfAcceptabilityFailClosed: ACCEPTABILITY_HF_FAIL_CLOSED,
+        hfAcceptabilityDailyMax: ACCEPTABILITY_HF_DAILY_MAX,
+        hfAcceptabilityStats,
+        hfAcceptabilityCacheSize: hfAcceptabilityCache.size,
+        acceptanceGate:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         result: r
