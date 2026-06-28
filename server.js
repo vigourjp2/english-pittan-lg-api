@@ -8,9 +8,9 @@ const LINK_TIMEOUT_MS = Number(process.env.LINK_TIMEOUT_MS || 3500);
 const LT_TIMEOUT_MS = Number(process.env.LT_TIMEOUT_MS || 5000);
 const HF_TIMEOUT_MS = Number(process.env.HF_TIMEOUT_MS || 25000);
 const HF_MODEL_SCAN_TIMEOUT_MS = Number(process.env.HF_MODEL_SCAN_TIMEOUT_MS || 20000);
-// v93: game acceptability must not trust Link Grammar alone.
-// Strict Link Grammar is a parser, so a second external acceptability API gate is used for game scoring.
-// This is not a JS/local sentence hardcode; it is an API-backed model gate.
+// v95: game acceptability uses external API as a veto when available.
+// Unavailable model/quota must not turn valid beginner sentences into NG.
+// Reason suggestions are verified with the same game gate before being displayed.
 const HF_SCAN_MODELS = (process.env.HF_SCAN_MODELS || 'textattack/roberta-base-CoLA,abdulmatinomotoso/English_Grammar_Checker,agentlans/snowflake-arctic-xs-grammar-classifier,nikolasmoya/c4-binary-english-grammar-checker,pszemraj/electra-small-discriminator-CoLA,textattack/bert-base-uncased-CoLA,EstherT/sentence-acceptability').split(',').map(s => s.trim()).filter(Boolean);
 const ACCEPTABILITY_HF_ENABLED = !/^false|0|off$/i.test(String(process.env.ACCEPTABILITY_HF_ENABLED || 'true'));
 const ACCEPTABILITY_HF_GAME_GATE_ENABLED = !/^false|0|off$/i.test(String(process.env.ACCEPTABILITY_HF_GAME_GATE_ENABLED || 'true'));
@@ -20,7 +20,7 @@ const ACCEPTABILITY_HF_MODEL = process.env.ACCEPTABILITY_HF_MODEL || 'abdulmatin
 const ACCEPTABILITY_HF_SECONDARY_ENABLED = !/^false|0|off$/i.test(String(process.env.ACCEPTABILITY_HF_SECONDARY_ENABLED || 'true'));
 const ACCEPTABILITY_HF_SECONDARY_MODEL = process.env.ACCEPTABILITY_HF_SECONDARY_MODEL || 'textattack/roberta-base-CoLA';
 const ACCEPTABILITY_HF_SECONDARY_REJECT_MIN_CONF = Math.max(0, Math.min(1, Number(process.env.ACCEPTABILITY_HF_SECONDARY_REJECT_MIN_CONF || 0.70)));
-const ACCEPTABILITY_HF_FAIL_CLOSED = !/^false|0|off$/i.test(String(process.env.ACCEPTABILITY_HF_FAIL_CLOSED || 'true'));
+const ACCEPTABILITY_HF_FAIL_CLOSED = /^true|1|on$/i.test(String(process.env.ACCEPTABILITY_HF_FAIL_CLOSED || 'false')); // v95: unavailable external model fails open; explicit true only for tests
 const ACCEPTABILITY_HF_DAILY_MAX = Math.max(0, Number(process.env.ACCEPTABILITY_HF_DAILY_MAX || 80));
 const ACCEPTABILITY_HF_CACHE_MAX = Math.max(100, Number(process.env.ACCEPTABILITY_HF_CACHE_MAX || 2000));
 
@@ -761,6 +761,11 @@ function applyHfAcceptabilityToLocalAcceptability(baseAccept, hfGate) {
   if (!hfGate?.checked && hfGate?.ok !== false) {
     return { ...baseAccept, method:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate', gate:'strict-link-grammar-languagetool-hf-unchecked-open', hfUsed:false, hfAcceptability:hfGate };
   }
+  // v95: 外部APIが未設定/枠切れ/到達不可のときは、その文をNGにしない。
+  // 明確に available な外部判定が reject した時だけvetoする。
+  if (hfGate?.ok === false && hfGate?.available === false) {
+    return { ...baseAccept, method:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate', gate:'strict-link-grammar-languagetool-hf-unavailable-open-v95', hfUsed:false, hfAcceptability:hfGate };
+  }
   if (hfGate?.ok === false) {
     const msg = hfGate?.judgement?.reason || hfGate?.reason || 'External grammar classifier rejected this sentence.';
     return {
@@ -1330,7 +1335,10 @@ async function explainByExploration(text, diagnostics = {}) {
 
     // v48+: 候補全部にいきなり /check 相当(HF込み)をかけない。
     // まず軽い LG + LanguageTool だけでふるいにかける。
-    const light = await withReasonTimeout(evaluateGameTextLightForReason(t), REASON_CANDIDATE_TIMEOUT_MS, `reason light candidate ${t}`);
+    // v95: 理由補完候補は、採点と同じゲームAPIゲートで最終確認する。
+    // v80はLink Grammar + LanguageToolだけのlight判定で候補を表示したため、
+    // `I am Japanese need` のような変な補完が「英文になります」と出た。
+    const light = await withReasonTimeout(evaluateGameTextExact(t, { strictGameGate:true, acceptabilityModelGate:true }), REASON_CANDIDATE_TIMEOUT_MS + 4500, `reason game-gate candidate ${t}`);
     if (!light.gameOk) {
       const value = {
         ok:false,
@@ -1371,7 +1379,7 @@ async function explainByExploration(text, diagnostics = {}) {
       parsed:lightResult.parsed,
       languageTool:lightResult.languageTool,
       acceptability:lightResult.acceptability,
-      hfAcceptability:{ checked:false, skipped:true, reason:'reason display uses strict Link Grammar API result only v80' }
+      hfAcceptability:{ checked:false, skipped:true, reason:'reason display uses same game API gate v95' }
     };
   }
 
@@ -1573,8 +1581,8 @@ async function explainByExploration(text, diagnostics = {}) {
         ...light,
         text:candidateText,
         ok:true,
-        stage:'strict-link-grammar-accepted-for-reason-display-v80',
-        hfAcceptability:{ checked:false, skipped:true, reason:'reason display uses strict Link Grammar API result only v80' }
+        stage:'same-game-api-gate-accepted-for-reason-display-v95',
+        hfAcceptability:{ checked:false, skipped:true, reason:'reason display uses same game API gate v95' }
       };
       if (finalHfAcceptedTexts.length < 80) finalHfAcceptedTexts.push(candidateText);
       return makeSuggestionFromFinal(item.op, final);
@@ -2354,7 +2362,9 @@ async function diagnoseCustomBenchmark(url) {
       const text = await getTextFromReq(req, url);
       if (!text) return send(res, 400, { ok:false, error:'empty text' });
       const diagnostics = {
-        judgeSource:'displayed-reject-reason-job-context-v74',
+        judgeSource:'displayed-reject-reason-job-context-v95-same-game-api-gate',
+        strictGameGate: url.searchParams.get('strictGameGate') === '1' || url.searchParams.get('acceptabilityModelGate') === '1',
+        acceptabilityModelGate: url.searchParams.get('acceptabilityModelGate') === '1',
         reasonBoardCandidates: wordsFromQuery(url, ['reasonBoardCandidates','boardCandidates','board','boardWords'], 80),
         reasonHandCandidates: wordsFromQuery(url, ['reasonHandCandidates','handCandidates','hand','handWords'], 80),
         reasonDeckCandidates: wordsFromQuery(url, ['reasonDeckCandidates','reasonCandidates','deckCandidates','deck','deckWords'], 220)
