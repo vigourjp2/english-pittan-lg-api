@@ -8,7 +8,10 @@ const LINK_TIMEOUT_MS = Number(process.env.LINK_TIMEOUT_MS || 3500);
 const LT_TIMEOUT_MS = Number(process.env.LT_TIMEOUT_MS || 5000);
 const HF_TIMEOUT_MS = Number(process.env.HF_TIMEOUT_MS || 25000);
 const HF_MODEL_SCAN_TIMEOUT_MS = Number(process.env.HF_MODEL_SCAN_TIMEOUT_MS || 20000);
-const HF_SCAN_MODELS = (process.env.HF_SCAN_MODELS || 'textattack/roberta-base-CoLA,cointegrated/roberta-large-cola-krishna2020,mrm8488/deberta-v3-small-finetuned-cola,EstherT/sentence-acceptability,nikolasmoya/c4-binary-english-grammar-checker,vennify/t5-base-grammar-correction,samadpls/t5-base-grammar-checker,hassaanik/grammar-correction-model').split(',').map(s => s.trim()).filter(Boolean);
+// v42.2: curated acceptability/grammar-classifier candidates found from Hugging Face search.
+// Default /diagnose-acceptability still calls only textattack/roberta-base-CoLA.
+// Use ?scan=1 or /diagnose-model-benchmark when intentionally spending HF requests to compare models.
+const HF_SCAN_MODELS = (process.env.HF_SCAN_MODELS || 'textattack/roberta-base-CoLA,textattack/bert-base-uncased-CoLA,EstherT/sentence-acceptability,nikolasmoya/c4-binary-english-grammar-checker,cointegrated/roberta-large-cola-krishna2020,mrm8488/deberta-v3-small-finetuned-cola').split(',').map(s => s.trim()).filter(Boolean);
 
 const LANGUAGETOOL_URL = process.env.LANGUAGETOOL_URL || 'https://api.languagetool.org/v2/check';
 const HF_TOKEN = process.env.HF_TOKEN || '';
@@ -714,12 +717,21 @@ function inferAcceptabilityFromHfSummary(summary) {
     acceptable = false; reason = 'negative-top-label-or-generated-text';
   } else if (/\bacceptable\b|\bcorrect\b|\bgrammatical\b|\bgood\b|\bok\b/.test(topLabel) || /\bacceptable\b|\bcorrect\b|\bgrammatical\b|\bgood\b|\bok\b/.test(generatedLower)) {
     acceptable = true; reason = 'positive-top-label-or-generated-text';
-  } else if (model === 'textattack/roberta-base-CoLA') {
-    labelMapping = 'textattack/roberta-base-CoLA: LABEL_1=acceptable, LABEL_0=unacceptable';
+  } else if (model === 'textattack/roberta-base-CoLA' || model === 'textattack/bert-base-uncased-CoLA' || model === 'EstherT/sentence-acceptability' || model === 'cointegrated/roberta-large-cola-krishna2020' || model === 'mrm8488/deberta-v3-small-finetuned-cola') {
+    labelMapping = `${model}: LABEL_1=acceptable, LABEL_0=unacceptable`;
     if (topLabel === 'label_1') {
-      acceptable = true; reason = 'cola-label_1-acceptable';
+      acceptable = true; reason = 'cola-like-label_1-acceptable';
     } else if (topLabel === 'label_0') {
-      acceptable = false; reason = 'cola-label_0-unacceptable';
+      acceptable = false; reason = 'cola-like-label_0-unacceptable';
+    }
+  } else if (model === 'nikolasmoya/c4-binary-english-grammar-checker') {
+    // This model card reports a binary English grammar checker. Labels are not well documented, so keep generic
+    // LABEL_1=acceptable fallback unless benchmark evidence says otherwise.
+    labelMapping = 'c4-binary grammar checker: tentative LABEL_1=acceptable, LABEL_0=unacceptable';
+    if (topLabel === 'label_1') {
+      acceptable = true; reason = 'c4-label_1-tentative-acceptable';
+    } else if (topLabel === 'label_0') {
+      acceptable = false; reason = 'c4-label_0-tentative-unacceptable';
     }
   } else if (topLabel === 'label_1') {
     acceptable = true; reason = 'generic-label_1-assumed-acceptable';
@@ -746,12 +758,12 @@ function inferAcceptabilityFromHfSummary(summary) {
   };
 }
 
-async function diagnoseAcceptabilityWithModels(text, modelFilter = '') {
+async function diagnoseAcceptabilityWithModels(text, modelFilter = '', scanAll = false) {
   const src = normalizeText(text);
   const parsed = await runLinkParser(src);
   const lt = await languageToolErrorGate(src);
   const baseAccept = localAcceptabilityFromLinkParserAndLt(src, parsed, lt);
-  const hfScan = await scanHfModels(src, modelFilter || 'textattack/roberta-base-CoLA');
+  const hfScan = await scanHfModels(src, modelFilter || (scanAll ? '' : 'textattack/roberta-base-CoLA'));
   const modelJudgements = (hfScan.results || []).map(inferAcceptabilityFromHfSummary);
   const usable = modelJudgements.filter(x => x.ok && x.acceptable !== null);
   const rejected = usable.filter(x => x.acceptable === false);
@@ -760,7 +772,7 @@ async function diagnoseAcceptabilityWithModels(text, modelFilter = '') {
     ok: !!(baseAccept.ok && baseAccept.gameOk !== false && baseAccept.type === 'complete_sentence'),
     gate: baseAccept.gate,
     reason: baseAccept.reason || baseAccept.noteJa || '',
-    note: 'CoLA acceptability is diagnostic only in v42.1; /check is not changed by this endpoint.'
+    note: 'Acceptability models are diagnostic only in v42.2; /check is not changed by this endpoint.'
   };
   if (preview.ok && rejected.length > 0) {
     preview = {
@@ -773,7 +785,7 @@ async function diagnoseAcceptabilityWithModels(text, modelFilter = '') {
   }
   return {
     ok:true,
-    version:'v42.1-cola-label-fix-diagnose-only',
+    version:'v42.2-model-scan-diagnose-only',
     text:src,
     usedForCorrection:false,
     linkGrammar:{ ok:strictLinkGrammarGameOk(parsed), fullParse:parsed.fullParse, strictLinkGrammar:parsed.strictLinkGrammar, linkages:parsed.linkages, nullCount:parsed.nullCount, code:parsed.code },
@@ -1533,11 +1545,11 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-plus-languagetool-error-gate-v42.1-cola-label-fix-diagnose',
+        mode:'link-grammar-plus-languagetool-error-gate-v42.2-model-scan-diagnose',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-languagetool-oracle-exploration-v42.1-cola-label-fix-diagnostic',
+        reasonProvider:'strict-link-grammar-languagetool-oracle-exploration-v42.2-model-scan-diagnostic',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:true,
@@ -1600,8 +1612,39 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/diagnose-acceptability' || url.pathname === '/diagnose-models') {
       const text = await getTextFromReq(req, url);
       if (!text) return send(res, 400, { ok:false, error:'empty text' });
-      return send(res, 200, await diagnoseAcceptabilityWithModels(text, url.searchParams.get('model') || ''));
+      return send(res, 200, await diagnoseAcceptabilityWithModels(text, url.searchParams.get('model') || '', url.searchParams.get('scan') === '1'));
     }
+    if (url.pathname === '/diagnose-model-benchmark') {
+      const scanAll = url.searchParams.get('scan') === '1';
+      const model = url.searchParams.get('model') || '';
+      const samples = [
+        'I am happy',
+        'The cat is sleeping',
+        'eating am happy',
+        'walking am happy',
+        'he am happy'
+      ];
+      const results = [];
+      for (const sample of samples) {
+        results.push(await diagnoseAcceptabilityWithModels(sample, model, scanAll));
+      }
+      return send(res, 200, {
+        ok:true,
+        version:'v42.2-model-scan-benchmark',
+        note:'diagnostic only; this spends one HF inference request per sample per model unless cached by upstream/provider',
+        model:model || (scanAll ? 'HF_SCAN_MODELS' : 'textattack/roberta-base-CoLA'),
+        scanAll,
+        expected:{
+          'I am happy':'OK',
+          'The cat is sleeping':'OK',
+          'eating am happy':'NG',
+          'walking am happy':'NG',
+          'he am happy':'NG by LanguageTool before model gate'
+        },
+        results
+      });
+    }
+
     if (url.pathname === '/hf-model-scan' || url.pathname === '/hf-model-scan-v2') {
       const text = await getTextFromReq(req, url);
       if (!text) return send(res, 400, { ok:false, error:'empty text' });
@@ -1621,7 +1664,7 @@ const server = http.createServer(async (req, res) => {
         text,
         elapsedMs: Date.now() - startedAt,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-languagetool-oracle-exploration-v42.1-cola-label-fix-diagnostic',
+        reasonProvider:'strict-link-grammar-languagetool-oracle-exploration-v42.2-model-scan-diagnostic',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:true,
