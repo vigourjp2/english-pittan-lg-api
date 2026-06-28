@@ -1082,6 +1082,21 @@ function uniqueWordsFromArray(arr, max = 160) {
   }
   return out;
 }
+
+function wordsFromQuery(url, names, max = 160) {
+  // v50: browser URL debug helper. This is not grammar logic.
+  // It only lets a normal address-bar URL pass hand/board/deck context
+  // without DevTools Console. Accepts comma, pipe, slash, or newline separated words.
+  const raw = [];
+  for (const name of names) {
+    for (const value of url.searchParams.getAll(name)) {
+      if (!value) continue;
+      raw.push(...String(value).split(/[|,\/\n\r\t]+/g));
+    }
+  }
+  return uniqueWordsFromArray(raw, max);
+}
+
 function canonicalGameWords(words) {
   // v34: no grammar/case hardcoding. Do not lowercase, do not special-case I/am/is/etc.
   // Use the exact card tokens/text supplied by the game and let Strict Link Grammar be the oracle.
@@ -1349,7 +1364,7 @@ async function explainByExploration(text, diagnostics = {}) {
   }
   return {
     ok:true,
-    method:'strict-link-grammar-oracle-exploration-v49-staged-timeout-isolated',
+    method:'strict-link-grammar-oracle-exploration-v50-staged-timeout-isolated-browser-context',
     model:'none',
     observedStructure: top ? 'nearest successful path found by staged light-first exploration' : 'no successful path found in staged finite candidate set',
     incompletePart: top ? top.action : 'not found in exhaustive finite candidate set',
@@ -1795,11 +1810,11 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-plus-languagetool-error-gate-v49-reason-timeout-isolation',
+        mode:'link-grammar-plus-languagetool-error-gate-v50-browser-context-debug',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v49-staged-reason-exploration',
+        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v50-browser-context-debug',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:!ACCEPTABILITY_HF_ENABLED,
@@ -1809,7 +1824,8 @@ const server = http.createServer(async (req, res) => {
         hfAcceptabilityStats,
         hfAcceptabilityCacheSize: hfAcceptabilityCache.size,
         hfAcceptabilityCacheKeyPolicy:'exact-text-case-sensitive-v45',
-        reasonExplorePolicy:'staged-light-first-with-timeout-isolation-v49',
+        reasonExplorePolicy:'staged-light-first-with-timeout-isolation-plus-browser-query-context-v50',
+        browserQueryContext:true,
         acceptanceGate:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate',
         pixabayKeyPresent: !!PIXABAY_API_KEY,
         hfModelScanVersion: 'v2-no-generation-params-for-classifiers',
@@ -1927,7 +1943,7 @@ const server = http.createServer(async (req, res) => {
         text,
         elapsedMs: Date.now() - startedAt,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v49-staged-reason-exploration',
+        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v50-browser-context-debug',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:!ACCEPTABILITY_HF_ENABLED,
@@ -1937,11 +1953,31 @@ const server = http.createServer(async (req, res) => {
         hfAcceptabilityStats,
         hfAcceptabilityCacheSize: hfAcceptabilityCache.size,
         hfAcceptabilityCacheKeyPolicy:'exact-text-case-sensitive-v45',
-        reasonExplorePolicy:'staged-light-first-with-timeout-isolation-v49',
+        reasonExplorePolicy:'staged-light-first-with-timeout-isolation-plus-browser-query-context-v50',
+        browserQueryContext:true,
         acceptanceGate:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         result: r
+      });
+    }
+
+    if (url.pathname === '/reason-context-test') {
+      const text = await getTextFromReq(req, url);
+      if (!text) return send(res, 400, { ok:false, error:'empty text' });
+      const diagnostics = {
+        judgeSource:'manual-browser-reason-context-test-v50',
+        reasonBoardCandidates: wordsFromQuery(url, ['reasonBoardCandidates','boardCandidates','board','boardWords'], 80),
+        reasonHandCandidates: wordsFromQuery(url, ['reasonHandCandidates','handCandidates','hand','handWords'], 80),
+        reasonDeckCandidates: wordsFromQuery(url, ['reasonDeckCandidates','reasonCandidates','deckCandidates','deck','deckWords'], 220)
+      };
+      const job = enqueueReasonJob(normalizeText(text), diagnostics);
+      return send(res, 200, {
+        ok:true,
+        text: normalizeText(text),
+        contextReceived: diagnostics,
+        next:`/reason-result?id=${job?.id || ''}`,
+        ...publicReasonJob(job)
       });
     }
 
@@ -2003,13 +2039,16 @@ const server = http.createServer(async (req, res) => {
       }
       text = normalizeText(text);
       if (!text) return send(res, 400, { ok:false, error:'empty text' });
+      const queryBoardCandidates = wordsFromQuery(url, ['reasonBoardCandidates','boardCandidates','board','boardWords'], 80);
+      const queryHandCandidates = wordsFromQuery(url, ['reasonHandCandidates','handCandidates','hand','handWords'], 80);
+      const queryDeckCandidates = wordsFromQuery(url, ['reasonDeckCandidates','reasonCandidates','deckCandidates','deck','deckWords'], 220);
       const reasonMeta = {
         reasonPriorityEpoch: body.reasonPriorityEpoch || body.reasonEpoch || Number(url.searchParams.get('reasonPriorityEpoch') || 0),
         reasonPrioritySeq: body.reasonPrioritySeq || body.reasonSeq || Number(url.searchParams.get('reasonPrioritySeq') || 0),
-        words: Array.isArray(body.words) ? body.words : [],
-        reasonBoardCandidates: body.reasonBoardCandidates || body.boardCandidates || [],
-        reasonHandCandidates: body.reasonHandCandidates || body.handCandidates || [],
-        reasonDeckCandidates: body.reasonDeckCandidates || body.reasonCandidates || body.deckCandidates || []
+        words: Array.isArray(body.words) ? body.words : wordsFromQuery(url, ['words'], 80),
+        reasonBoardCandidates: body.reasonBoardCandidates || body.boardCandidates || queryBoardCandidates,
+        reasonHandCandidates: body.reasonHandCandidates || body.handCandidates || queryHandCandidates,
+        reasonDeckCandidates: body.reasonDeckCandidates || body.reasonCandidates || body.deckCandidates || queryDeckCandidates
       };
       return send(res, 200, await checkSentence(text, url.pathname === '/check-and-translate', reasonMeta));
     }
@@ -2019,4 +2058,4 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => console.log(`Strict Link Grammar + LanguageTool v42.1 CoLA Label-Fix Diagnose API listening on ${PORT}`));
+server.listen(PORT, () => console.log(`Strict Link Grammar + LanguageTool v50 Browser Context Debug API listening on ${PORT}`));

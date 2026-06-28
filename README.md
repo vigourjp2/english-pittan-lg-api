@@ -38,3 +38,7 @@ For board `I like` with hand containing `apples`, the reason job should finish a
 `I like apples`
 
 For bad candidates such as `I like am`, v48 should reject them before spending HF where possible.
+
+
+## v50 Browser URL Context Debug
+DevTools Console不要化。GET URLの hand/board/deck を reason job context として受け取る。文法ルール追加ではない。
