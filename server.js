@@ -698,29 +698,46 @@ function inferAcceptabilityFromHfSummary(summary) {
   const labels = Array.isArray(summary?.labels) ? summary.labels : [];
   const top = summary?.top || labels.slice().sort((a,b)=>(Number(b.score)||0)-(Number(a.score)||0))[0] || null;
   const generated = String(summary?.generatedText || '').trim();
-  const hay = [top?.label, ...labels.map(x=>x?.label), generated].filter(Boolean).join(' ').toLowerCase();
+  const topLabelRaw = String(top?.label || '').trim();
+  const topLabel = topLabelRaw.toLowerCase();
+  const generatedLower = generated.toLowerCase();
+  const model = String(summary?.model || '');
   const score = Number(top?.score || 0);
   let acceptable = null;
   let reason = 'unknown-output';
+  let labelMapping = '';
 
-  if (/\bunacceptable\b|\bnot acceptable\b|\bincorrect\b|\bungrammatical\b|\bbad\b|\berror\b/.test(hay)) {
-    acceptable = false; reason = 'negative-label';
-  } else if (/\bacceptable\b|\bcorrect\b|\bgrammatical\b|\bgood\b|\bok\b/.test(hay)) {
-    acceptable = true; reason = 'positive-label';
-  } else if (/\blabel_0\b/.test(hay)) {
-    acceptable = false; reason = 'label_0-assumed-unacceptable';
-  } else if (/\blabel_1\b/.test(hay)) {
-    acceptable = true; reason = 'label_1-assumed-acceptable';
+  // v42 bug: it scanned all labels, but classifier output normally includes both LABEL_0 and LABEL_1.
+  // Therefore every result contained LABEL_0 somewhere and was treated as unacceptable.
+  // v42.1 decides from the top label only.
+  if (/\bunacceptable\b|\bnot acceptable\b|\bincorrect\b|\bungrammatical\b|\bbad\b|\berror\b/.test(topLabel) || /\bunacceptable\b|\bnot acceptable\b|\bincorrect\b|\bungrammatical\b|\bbad\b|\berror\b/.test(generatedLower)) {
+    acceptable = false; reason = 'negative-top-label-or-generated-text';
+  } else if (/\bacceptable\b|\bcorrect\b|\bgrammatical\b|\bgood\b|\bok\b/.test(topLabel) || /\bacceptable\b|\bcorrect\b|\bgrammatical\b|\bgood\b|\bok\b/.test(generatedLower)) {
+    acceptable = true; reason = 'positive-top-label-or-generated-text';
+  } else if (model === 'textattack/roberta-base-CoLA') {
+    labelMapping = 'textattack/roberta-base-CoLA: LABEL_1=acceptable, LABEL_0=unacceptable';
+    if (topLabel === 'label_1') {
+      acceptable = true; reason = 'cola-label_1-acceptable';
+    } else if (topLabel === 'label_0') {
+      acceptable = false; reason = 'cola-label_0-unacceptable';
+    }
+  } else if (topLabel === 'label_1') {
+    acceptable = true; reason = 'generic-label_1-assumed-acceptable';
+    labelMapping = 'generic fallback: LABEL_1=acceptable';
+  } else if (topLabel === 'label_0') {
+    acceptable = false; reason = 'generic-label_0-assumed-unacceptable';
+    labelMapping = 'generic fallback: LABEL_0=unacceptable';
   }
 
   return {
-    model: summary?.model || '',
+    model,
     ok: !!summary?.ok,
     provider: summary?.provider || '',
     kind: summary?.kind || '',
     acceptable,
     confidence: score || null,
     reason,
+    labelMapping,
     top,
     labels: labels.slice(0, 8),
     generatedText: generated,
@@ -734,7 +751,7 @@ async function diagnoseAcceptabilityWithModels(text, modelFilter = '') {
   const parsed = await runLinkParser(src);
   const lt = await languageToolErrorGate(src);
   const baseAccept = localAcceptabilityFromLinkParserAndLt(src, parsed, lt);
-  const hfScan = await scanHfModels(src, modelFilter);
+  const hfScan = await scanHfModels(src, modelFilter || 'textattack/roberta-base-CoLA');
   const modelJudgements = (hfScan.results || []).map(inferAcceptabilityFromHfSummary);
   const usable = modelJudgements.filter(x => x.ok && x.acceptable !== null);
   const rejected = usable.filter(x => x.acceptable === false);
@@ -743,7 +760,7 @@ async function diagnoseAcceptabilityWithModels(text, modelFilter = '') {
     ok: !!(baseAccept.ok && baseAccept.gameOk !== false && baseAccept.type === 'complete_sentence'),
     gate: baseAccept.gate,
     reason: baseAccept.reason || baseAccept.noteJa || '',
-    note: 'HF acceptability models are diagnostic only in v42; /check is not changed by this endpoint.'
+    note: 'CoLA acceptability is diagnostic only in v42.1; /check is not changed by this endpoint.'
   };
   if (preview.ok && rejected.length > 0) {
     preview = {
@@ -756,7 +773,7 @@ async function diagnoseAcceptabilityWithModels(text, modelFilter = '') {
   }
   return {
     ok:true,
-    version:'v42-acceptability-diagnose-only',
+    version:'v42.1-cola-label-fix-diagnose-only',
     text:src,
     usedForCorrection:false,
     linkGrammar:{ ok:strictLinkGrammarGameOk(parsed), fullParse:parsed.fullParse, strictLinkGrammar:parsed.strictLinkGrammar, linkages:parsed.linkages, nullCount:parsed.nullCount, code:parsed.code },
@@ -1188,7 +1205,7 @@ async function checkSentence(text, withTranslate = false, reasonMeta = {}) {
   }
   return {
     originalText, text: checkedText, normalized: proof.normalized, appliedCorrections: proof.appliedCorrections || [],
-    ok, gameOk, type, kind:'Strict Link Grammar + LanguageTool Error Gate + Acceptability Diagnose v42',
+    ok, gameOk, type, kind:'Strict Link Grammar + LanguageTool Error Gate + CoLA Label-Fix Diagnose v42.1',
     sentenceType: gameOk ? (acceptability.sentenceType || 'complete_sentence') : (acceptability.sentenceType || type),
     reason: gameOk ? '' : (acceptability.noteJa || acceptability.reason || reasonExplain?.explanationJa || reasonExplain?.explanationEn || ''),
     reasonSource: gameOk ? '' : (acceptability.languageToolBlocking ? 'languagetool-error-gate' : (reasonExplain?.ok ? reasonExplain.method : 'reason-job-pending')),
@@ -1516,11 +1533,11 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-plus-languagetool-error-gate-v42-acceptability-diagnose',
+        mode:'link-grammar-plus-languagetool-error-gate-v42.1-cola-label-fix-diagnose',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-languagetool-oracle-exploration-v42-diagnostic',
+        reasonProvider:'strict-link-grammar-languagetool-oracle-exploration-v42.1-cola-label-fix-diagnostic',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:true,
@@ -1604,7 +1621,7 @@ const server = http.createServer(async (req, res) => {
         text,
         elapsedMs: Date.now() - startedAt,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-languagetool-oracle-exploration-v42-diagnostic',
+        reasonProvider:'strict-link-grammar-languagetool-oracle-exploration-v42.1-cola-label-fix-diagnostic',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:true,
@@ -1689,4 +1706,4 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => console.log(`Strict Link Grammar + LanguageTool v42 Acceptability Diagnose API listening on ${PORT}`));
+server.listen(PORT, () => console.log(`Strict Link Grammar + LanguageTool v42.1 CoLA Label-Fix Diagnose API listening on ${PORT}`));
