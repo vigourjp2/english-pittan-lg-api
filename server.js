@@ -1828,7 +1828,8 @@ async function checkSentence(text, withTranslate = false, reasonMeta = {}) {
   let reasonJob = null;
   if (gameOk && acceptability.jaHint) translation = { ok:true, ja:acceptability.jaHint, source:'contextual-short-answer' };
   else if (gameOk && withTranslate) translation = await translateToJapanese(checkedText);
-  if (!gameOk) {
+  const reasonDisabled = !!(reasonMeta.reasonDisabled || reasonMeta.disableReasonJob || reasonMeta.reasonMode === 'none');
+  if (!gameOk && !reasonDisabled) {
     reasonJob = enqueueReasonJob(checkedText, {
       judgeSource: acceptability.gate || 'strict-link-grammar-plus-languagetool',
       linkGrammarOk: strictLinkGrammarGameOk(parsed),
@@ -1846,9 +1847,9 @@ async function checkSentence(text, withTranslate = false, reasonMeta = {}) {
     ok, gameOk, type, kind:'Strict Link Grammar + LanguageTool + HF Grammar Classifier Gate v49',
     sentenceType: gameOk ? (acceptability.sentenceType || 'complete_sentence') : (acceptability.sentenceType || type),
     reason: gameOk ? '' : (acceptability.noteJa || acceptability.reason || reasonExplain?.explanationJa || reasonExplain?.explanationEn || ''),
-    reasonSource: gameOk ? '' : (acceptability.languageToolBlocking ? 'languagetool-error-gate' : (acceptability.hfUsed ? 'hf-grammar-classifier-gate' : (reasonExplain?.ok ? reasonExplain.method : 'reason-job-pending'))),
-    reasonStatus: gameOk ? 'none' : (reasonJob?.status || 'pending'),
-    reasonJobId: gameOk ? '' : (reasonJob?.id || ''),
+    reasonSource: gameOk ? '' : (reasonDisabled ? 'reason-job-disabled-for-bulk-scan' : (acceptability.languageToolBlocking ? 'languagetool-error-gate' : (acceptability.hfUsed ? 'hf-grammar-classifier-gate' : (reasonExplain?.ok ? reasonExplain.method : 'reason-job-pending')))),
+    reasonStatus: gameOk ? 'none' : (reasonDisabled ? 'none' : (reasonJob?.status || 'pending')),
+    reasonJobId: gameOk ? '' : (reasonDisabled ? '' : (reasonJob?.id || '')),
     reasonExplain, proof,
     fullParse: parsed.fullParse, strictLinkGrammar: parsed.strictLinkGrammar,
     linkages: parsed.linkages, nullCount: parsed.nullCount, stdout: parsed.stdout, stderr: parsed.stderr, code: parsed.code,
@@ -1887,7 +1888,7 @@ async function checkSentenceBatch(req) {
     while (next < items.length) {
       const item = items[next++];
       try {
-        const checked = await checkSentence(item.text, true, { reasonPriorityEpoch: j.reasonPriorityEpoch || j.reasonEpoch || Date.now(), reasonPrioritySeq: Number(item.id || 0), words:item.words, reasonBoardCandidates:j.reasonBoardCandidates || j.boardCandidates || [], reasonHandCandidates:j.reasonHandCandidates || j.handCandidates || [], reasonDeckCandidates:j.reasonDeckCandidates || j.reasonCandidates || j.deckCandidates || [] });
+        const checked = await checkSentence(item.text, true, { reasonPriorityEpoch: j.reasonPriorityEpoch || j.reasonEpoch || Date.now(), reasonPrioritySeq: Number(item.id || 0), words:item.words, reasonBoardCandidates:j.reasonBoardCandidates || j.boardCandidates || [], reasonHandCandidates:j.reasonHandCandidates || j.handCandidates || [], reasonDeckCandidates:j.reasonDeckCandidates || j.reasonCandidates || j.deckCandidates || [], reasonDisabled: j.reasonDisabled===true || j.disableReasonJob===true || j.reasonMode==='none' });
         const accept = checked.acceptability || {};
         const type = accept.type || (checked.gameOk ? 'complete_sentence' : (checked.fullParse ? 'fragment' : 'invalid'));
         const gameOk = !!(checked.ok && checked.gameOk && (accept.gameOk !== false) && type === 'complete_sentence');
@@ -2171,11 +2172,11 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-plus-languagetool-error-gate-v65-dual-hf-acceptability-gate',
+        mode:'link-grammar-plus-languagetool-error-gate-v72-no-auto-reason-enqueue',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v65-dual-hf-acceptability-gate',
+        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v72-no-auto-reason-enqueue',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:!ACCEPTABILITY_HF_ENABLED,
@@ -2490,7 +2491,9 @@ async function diagnoseCustomBenchmark(url) {
         words: Array.isArray(body.words) ? body.words : wordsFromQuery(url, ['words'], 80),
         reasonBoardCandidates: body.reasonBoardCandidates || body.boardCandidates || queryBoardCandidates,
         reasonHandCandidates: body.reasonHandCandidates || body.handCandidates || queryHandCandidates,
-        reasonDeckCandidates: body.reasonDeckCandidates || body.reasonCandidates || body.deckCandidates || queryDeckCandidates
+        reasonDeckCandidates: body.reasonDeckCandidates || body.reasonCandidates || body.deckCandidates || queryDeckCandidates,
+        reasonDisabled: body.reasonDisabled === true || body.disableReasonJob === true || body.reasonMode === 'none' || url.searchParams.get('reasonMode') === 'none' || url.searchParams.get('reasonDisabled') === '1',
+        reasonMode: body.reasonMode || url.searchParams.get('reasonMode') || ''
       };
       return send(res, 200, await checkSentence(text, url.pathname === '/check-and-translate', reasonMeta));
     }
