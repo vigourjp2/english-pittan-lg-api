@@ -1088,10 +1088,10 @@ function inferAcceptabilityFromHfSummary(summary) {
     }
   } else if (topLabel === 'label_1') {
     acceptable = true; reason = 'generic-label_1-assumed-acceptable';
-    labelMapping = 'generic fallback: LABEL_1=acceptable';
+    labelMapping = 'generic default mapping: LABEL_1=acceptable';
   } else if (topLabel === 'label_0') {
     acceptable = false; reason = 'generic-label_0-assumed-unacceptable';
-    labelMapping = 'generic fallback: LABEL_0=unacceptable';
+    labelMapping = 'generic default mapping: LABEL_0=unacceptable';
   }
 
   return {
@@ -1200,50 +1200,6 @@ function localAcceptabilityFromLinkParser(text, parsed) {
     sentenceType: words.length <= 1 ? 'single_word' : 'not_complete_sentence',
     gate:'link-grammar-only',
     hfUsed:false
-  };
-}
-
-function localReasonFromDiagnostics(text, diagnostics = {}) {
-  const src = normalizeText(text);
-  const words = src.split(/\s+/).filter(Boolean);
-  const linkages = Number(diagnostics.linkages || 0);
-  const linkGrammarOk = !!diagnostics.linkGrammarOk;
-  let observedStructure = '';
-  let incompletePart = '';
-  let explanationEn = '';
-  let explanationJa = '';
-
-  if (!src) {
-    observedStructure = 'empty input';
-    incompletePart = 'no words were provided';
-    explanationEn = 'No words were placed, so this cannot be checked as a complete English sentence.';
-    explanationJa = '単語が置かれていないため、完全な英文として判定できません。';
-  } else if (words.length === 1) {
-    observedStructure = 'single word';
-    incompletePart = 'a complete sentence needs more structure than one word';
-    explanationEn = `"${src}" is only one word. A complete English sentence normally needs enough words to form a full statement.`;
-    explanationJa = `「${src}」は単語だけです。完全な英文にするには、文として意味が完結するだけの語のつながりが必要です。`;
-  } else if (!linkGrammarOk || linkages <= 0) {
-    observedStructure = 'multiple words, but no complete strict Link Grammar linkage';
-    incompletePart = 'the placed words do not connect as one complete sentence under strict parsing';
-    explanationEn = `The words "${src}" did not form a complete strict Link Grammar parse. Some word connection is missing, extra, or in an unnatural order for a complete sentence.`;
-    explanationJa = `「${src}」は Strict Link Grammar で完全な文として結びつきませんでした。語のつながりが足りない、余っている、または語順が自然な完全英文になっていない可能性があります。`;
-  } else {
-    observedStructure = 'parser accepted structure but game rejected it by a secondary rule';
-    incompletePart = 'game acceptability rule rejected the candidate';
-    explanationEn = `The candidate "${src}" was rejected by the game acceptability rule, not by a paid AI service.`;
-    explanationJa = `「${src}」はゲーム側の成立条件で不成立になりました。有料AIサービスではなく、ローカル判定結果です。`;
-  }
-  return {
-    ok:true,
-    method:'local-link-grammar-reason-v30',
-    model:'none',
-    observedStructure,
-    incompletePart,
-    explanationEn,
-    explanationJa,
-    confidence: linkGrammarOk ? 0.7 : 0.85,
-    rawReason:{ local:true, words, diagnostics:{ linkGrammarOk, linkages, judgeSource:diagnostics.judgeSource || '' } }
   };
 }
 
@@ -1695,12 +1651,34 @@ async function explainByExploration(text, diagnostics = {}) {
       explanationEn = `Adding "${top.candidate}" and "${top.candidate2}" before this makes a complete sentence: ${top.sentence}`;
     }
   } else {
-    explanationJa = `Strict Link Grammarでは完全な英文になりませんでした。現在渡された盤面・手札・候補カードを軽量判定で調べましたが、成立する経路は見つかりませんでした。`;
-    explanationEn = `Strict Link Grammar could not build a complete sentence. I checked the finite board/hand/candidate set by shortest edit distance with a fast light oracle and did not find a completing path.`;
+    return {
+      ok:false,
+      status:'no_verified_suggestion',
+      retryable:false,
+      error:'reason exploration found no verified completing path',
+      method:'strict-link-grammar-oracle-exploration-v79-strict-only',
+      suggestions:[],
+      rawReason:{
+        exploration:true,
+        exhaustive:true,
+        stagedReason:true,
+        strictExplorationOnly:true,
+        text:src,
+        words,
+        checks,
+        elapsedMs: Date.now() - startedAt,
+        exploredDepth,
+        oneStepOpsCount: oneStepOps.length,
+        twoStepOpsCount,
+        boardCandidates:board,
+        handCandidates:hand,
+        deckCandidateCount:deck.length
+      }
+    };
   }
   return {
     ok:true,
-    method:'strict-link-grammar-oracle-exploration-v65-dual-hf-acceptability-gate',
+    method:'strict-link-grammar-oracle-exploration-v79-strict-only',
     model:'none',
     observedStructure: top ? 'nearest successful path found and confirmed by final HF display filter' : 'no successful path found in staged finite candidate set',
     incompletePart: top ? top.action : 'not found in exhaustive finite candidate set',
@@ -1753,8 +1731,9 @@ async function explainByExploration(text, diagnostics = {}) {
 }
 
 async function explainRejectedSentence(text, diagnostics = {}) {
-  // v34: no local grammar templates/case hacks. Explore candidate paths and accept only actual Strict Link Grammar success.
-  return explainByExploration(text, diagnostics);
+  // v79: no local grammar templates/case hacks and no local diagnostic reason text.
+  // Return only explanations backed by the exploration result; otherwise let the job fail/unavailable.
+  return await explainByExploration(text, diagnostics);
 }
 
 
