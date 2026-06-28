@@ -1,7 +1,9 @@
-# English Pittan API/frontend v51
+# English Pittan API/UI v53
 
-v51 fixes the v50 timeout where reason-context-test accepted hand candidates but the reason job failed after 12000ms.
+v53 is based on v52 and fixes reason suggestion quality.
 
-The reason job no longer calls the HF acceptability network for every candidate. It uses Strict Link Grammar + LanguageTool as a fast reason oracle, while the normal game `/check` route still uses the full HF gate.
+Main change: reason exploration remains light-first, but candidates are no longer displayed after only Strict Link Grammar + LanguageTool. Before a suggestion is shown, it is checked by the same HF grammar classifier gate used by the production `/check` endpoint.
 
-See `README_fast_reason_light_oracle_v51.md`.
+This prevents false suggestions such as `happy now should` and `should Japanese now`, which Link Grammar can parse but the real game gate rejects.
+
+See `README_reason_display_hf_filter_v53.md`.
