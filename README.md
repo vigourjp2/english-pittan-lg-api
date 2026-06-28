@@ -12,3 +12,8 @@ https://game-aor.pages.dev/index-english.html?lgapi=https://english-pittan-lg-ap
 
 ## v33
 StrictLG API only for scoring; exploration cleanup; no stale image panel.
+
+
+## v44 frontend case fix
+
+Fixes game-side false NG where card `I` was lowercased to `i` before API judgement. API text now preserves card casing; cache key bumped to v44.
