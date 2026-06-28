@@ -61,12 +61,13 @@ function reasonKey(text) {
   return normalizeText(text).toLowerCase().replace(/[.!?]+$/,'').replace(/\s+/g,' ');
 }
 function reasonContextSignature(diagnostics = {}) {
-  // v38: 理由探索は「その時点の手札/候補カード」に依存する。
+  // v39: 理由探索は「その時点の盤面/手札/候補カード」に依存する。
   // 文だけで成功キャッシュすると、候補なしで作った古い結果が、候補ありの現在盤面に再利用される。
   // 単語別文法ルールではなく、探索入力そのものをjob keyに含める。
+  const board = uniqueWordsFromArray(diagnostics.reasonBoardCandidates || diagnostics.boardCandidates || [], 80);
   const hand = uniqueWordsFromArray(diagnostics.reasonHandCandidates || diagnostics.handCandidates || [], 40);
   const deck = uniqueWordsFromArray(diagnostics.reasonDeckCandidates || diagnostics.reasonCandidates || diagnostics.deckCandidates || [], 220);
-  const sig = JSON.stringify({ hand, deck });
+  const sig = JSON.stringify({ board, hand, deck });
   let h = 2166136261;
   for (let i = 0; i < sig.length; i++) {
     h ^= sig.charCodeAt(i);
@@ -84,12 +85,13 @@ function latestReasonJobByText(text) {
     .sort((a,b)=>(b.updatedAt||0)-(a.updatedAt||0))[0] || null;
 }
 function reasonDiagnosticsForJob(diagnostics = {}) {
-  // v38: 作成時に候補カードを捨てない。ここを捨てていたため「1通りしか試してない」になった。
+  // v39: 作成時に盤面/手札/候補カードを捨てない。成立判定前の自動補正は禁止。
   return {
     ...diagnostics,
     judgeSource: diagnostics.judgeSource || 'link-grammar',
     linkGrammarOk: !!diagnostics.linkGrammarOk,
     linkages: Number(diagnostics.linkages || 0),
+    reasonBoardCandidates: uniqueWordsFromArray(diagnostics.reasonBoardCandidates || diagnostics.boardCandidates || [], 80),
     reasonHandCandidates: uniqueWordsFromArray(diagnostics.reasonHandCandidates || diagnostics.handCandidates || [], 40),
     reasonDeckCandidates: uniqueWordsFromArray(diagnostics.reasonDeckCandidates || diagnostics.reasonCandidates || diagnostics.deckCandidates || [], 220)
   };
@@ -751,13 +753,20 @@ function limitedPermutations(arr, max = 120) {
 async function explainByExploration(text, diagnostics = {}) {
   const src = normalizeText(text).replace(/[.!?]+$/,'');
   const words = canonicalGameWords(src.split(/\s+/).filter(Boolean));
+  const boardRaw = uniqueWordsFromArray(diagnostics.reasonBoardCandidates || diagnostics.boardCandidates || [], 80);
+  const wordSet = new Set(words.map(w => w.toLowerCase()));
+  // 盤面にすでに存在する周辺カードを最優先。ただし今チェック中の候補に含まれる語は重複追加しない。
+  const board = boardRaw.filter(w => !wordSet.has(String(w).toLowerCase()));
   const hand = uniqueWordsFromArray(diagnostics.reasonHandCandidates || diagnostics.handCandidates || [], 24);
   const deck = uniqueWordsFromArray(diagnostics.reasonDeckCandidates || diagnostics.reasonCandidates || diagnostics.deckCandidates || [], 140);
-  const candidates = uniqueWordsFromArray([...hand, ...deck], 160);
+  const candidates = uniqueWordsFromArray([...board, ...hand, ...deck], 180);
+  const boardSet = new Set(board.map(w => w.toLowerCase()));
   const handSet = new Set(hand.map(w => w.toLowerCase()));
   const originalKey = src.toLowerCase();
-  const maxChecks = Math.max(30, Math.min(Number(process.env.REASON_EXPLORE_MAX_CHECKS || 180), 480));
-  const maxSuggestions = Math.max(1, Math.min(Number(process.env.REASON_EXPLORE_MAX_SUGGESTIONS || 6), 12));
+  const maxChecks = Math.max(12, Math.min(Number(process.env.REASON_EXPLORE_MAX_CHECKS || 48), 120));
+  const maxMs = Math.max(1200, Math.min(Number(process.env.REASON_EXPLORE_MAX_MS || 4500), 9000));
+  const startedAt = Date.now();
+  const maxSuggestions = Math.max(1, Math.min(Number(process.env.REASON_EXPLORE_MAX_SUGGESTIONS || 8), 12));
   let checks = 0;
   const checked = new Map();
   const suggestions = [];
@@ -767,7 +776,7 @@ async function explainByExploration(text, diagnostics = {}) {
     const k = t.toLowerCase();
     if (!t || k === originalKey) return false;
     if (checked.has(k)) return checked.get(k);
-    if (checks >= maxChecks) return false;
+    if (checks >= maxChecks || (Date.now() - startedAt) >= maxMs) return false;
     checks++;
     const parsed = await runLinkParser(t);
     const ok = strictLinkGrammarGameOk(parsed);
@@ -797,14 +806,25 @@ async function explainByExploration(text, diagnostics = {}) {
   }
   async function runPhase(list, fn) {
     for (const x of list) {
-      if (checks >= maxChecks || suggestions.length >= maxSuggestions) break;
+      if (checks >= maxChecks || (Date.now() - startedAt) >= maxMs || suggestions.length >= maxSuggestions) break;
       if (await fn(x)) break;
     }
   }
 
-  // 1) 現在手札での最短一手。ここが一番ゲームとして役に立つ。
-  await runPhase(hand, async c => trySuggestion({ action:'add-right', source:'hand', candidate:c, words:[...words, c] }));
+  // 1) 盤面上の他カードでの一手。いま見えている盤面文脈を最優先する。
+  await runPhase(board, async c => trySuggestion({ action:'add-left', source:'board', candidate:c, words:[c, ...words] }));
+  await runPhase(board, async c => trySuggestion({ action:'add-right', source:'board', candidate:c, words:[...words, c] }));
+
+  // 2) 現在手札での最短一手。
   await runPhase(hand, async c => trySuggestion({ action:'add-left', source:'hand', candidate:c, words:[c, ...words] }));
+  await runPhase(hand, async c => trySuggestion({ action:'add-right', source:'hand', candidate:c, words:[...words, c] }));
+  for (let i = 0; i < words.length && checks < maxChecks && suggestions.length < maxSuggestions; i++) {
+    await runPhase(board, async c => {
+      if (String(c).toLowerCase() === String(words[i]).toLowerCase()) return false;
+      const nw = words.slice(); nw[i] = c;
+      return trySuggestion({ action:'replace', source:'board', from:words[i], to:c, words:nw });
+    });
+  }
   for (let i = 0; i < words.length && checks < maxChecks && suggestions.length < maxSuggestions; i++) {
     await runPhase(hand, async c => {
       if (String(c).toLowerCase() === String(words[i]).toLowerCase()) return false;
@@ -829,7 +849,7 @@ async function explainByExploration(text, diagnostics = {}) {
   }
 
   // 3) 山札/全カード候補での一手。手札に無くても「こういうカードが来たら成立」が見える。
-  const deckOnly = candidates.filter(c => !handSet.has(c.toLowerCase()));
+  const deckOnly = candidates.filter(c => !boardSet.has(c.toLowerCase()) && !handSet.has(c.toLowerCase()));
   await runPhase(deckOnly, async c => trySuggestion({ action:'add-right', source:'deck', candidate:c, words:[...words, c] }));
   await runPhase(deckOnly, async c => trySuggestion({ action:'add-left', source:'deck', candidate:c, words:[c, ...words] }));
   for (let i = 0; i < words.length && checks < maxChecks && suggestions.length < maxSuggestions; i++) {
@@ -880,7 +900,7 @@ async function explainByExploration(text, diagnostics = {}) {
   }
   return {
     ok:true,
-    method:'strict-link-grammar-oracle-exploration-v38-context-aware-reason-jobs',
+    method:'strict-link-grammar-oracle-exploration-v39-clean-no-autocorrect-board-aware',
     model:'none',
     observedStructure: top ? 'nearest successful path found by strict Link Grammar exploration' : 'no successful path found in bounded exploration',
     incompletePart: top ? top.action : 'unknown within candidate search budget',
@@ -894,6 +914,9 @@ async function explainByExploration(text, diagnostics = {}) {
       words,
       checks,
       maxChecks,
+      maxMs,
+      elapsedMs: Date.now() - startedAt,
+      boardCandidates:board,
       handCandidates:hand,
       deckCandidateCount:deck.length,
       diagnostics:{ judgeSource:diagnostics.judgeSource || '', linkages:diagnostics.linkages || 0, linkGrammarOk:!!diagnostics.linkGrammarOk }
@@ -946,10 +969,22 @@ async function translateToJapanese(text) {
   return { ok:false, error:String(lastErr?.message || lastErr || 'translation failed') };
 }
 
+function noAutocorrectProof(originalText) {
+  return {
+    ok:true,
+    text: originalText,
+    corrected: originalText,
+    normalized:false,
+    matchesCount:0,
+    appliedCorrections:[],
+    note:'no-autocorrect: game judgement uses the exact placed cards'
+  };
+}
+
 async function checkSentence(text, withTranslate = false, reasonMeta = {}) {
   const originalText = normalizeText(text);
-  const proof = await proofreadEnglish(originalText);
-  const checkedText = proof.corrected || originalText;
+  const proof = noAutocorrectProof(originalText);
+  const checkedText = originalText;
   const parsed = await runLinkParser(checkedText);
   const acceptability = localAcceptabilityFromLinkParser(checkedText, parsed);
 
@@ -967,7 +1002,7 @@ async function checkSentence(text, withTranslate = false, reasonMeta = {}) {
     }
     return {
       originalText, text: checkedText, normalized: proof.normalized, appliedCorrections: proof.appliedCorrections || [],
-      ok: gameOk, gameOk, type, kind:'Strict Link Grammar ONLY + Exploration Reason Queue v38',
+      ok: gameOk, gameOk, type, kind:'Strict Link Grammar ONLY + Clean Exploration Reason Queue v39',
       sentenceType: gameOk ? (acceptability.sentenceType || 'complete_sentence') : (acceptability.sentenceType || type),
       reason: gameOk ? '' : (reasonExplain?.explanationJa || reasonExplain?.explanationEn || ''),
       reasonSource: gameOk ? '' : (reasonExplain?.ok ? reasonExplain.method : 'reason-job-pending'),
@@ -994,7 +1029,7 @@ async function checkSentence(text, withTranslate = false, reasonMeta = {}) {
   }
   return {
     originalText, text: checkedText, normalized: proof.normalized, appliedCorrections: proof.appliedCorrections || [],
-    ok, gameOk, type, kind:'Strict Link Grammar ONLY + Exploration Reason Queue v38',
+    ok, gameOk, type, kind:'Strict Link Grammar ONLY + Clean Exploration Reason Queue v39',
     sentenceType: gameOk ? (acceptability.sentenceType || 'complete_sentence') : (acceptability.sentenceType || type),
     reason: gameOk ? '' : (reasonExplain?.explanationJa || reasonExplain?.explanationEn || ''),
     reasonSource: gameOk ? '' : (reasonExplain?.ok ? reasonExplain.method : 'reason-job-pending'),
@@ -1038,7 +1073,7 @@ async function checkSentenceBatch(req) {
     while (next < items.length) {
       const item = items[next++];
       try {
-        const checked = await checkSentence(item.text, true, { reasonPriorityEpoch: j.reasonPriorityEpoch || j.reasonEpoch || Date.now(), reasonPrioritySeq: Number(item.id || 0), words:item.words, reasonHandCandidates:j.reasonHandCandidates || j.handCandidates || [], reasonDeckCandidates:j.reasonDeckCandidates || j.reasonCandidates || j.deckCandidates || [] });
+        const checked = await checkSentence(item.text, true, { reasonPriorityEpoch: j.reasonPriorityEpoch || j.reasonEpoch || Date.now(), reasonPrioritySeq: Number(item.id || 0), words:item.words, reasonBoardCandidates:j.reasonBoardCandidates || j.boardCandidates || [], reasonHandCandidates:j.reasonHandCandidates || j.handCandidates || [], reasonDeckCandidates:j.reasonDeckCandidates || j.reasonCandidates || j.deckCandidates || [] });
         const accept = checked.acceptability || {};
         const type = accept.type || (checked.gameOk ? 'complete_sentence' : (checked.fullParse ? 'fragment' : 'invalid'));
         const gameOk = !!(checked.ok && checked.gameOk && (accept.gameOk !== false) && type === 'complete_sentence');
@@ -1322,11 +1357,11 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-strict-only-v38-context-aware-reason-jobs',
+        mode:'link-grammar-strict-only-v39-clean-no-autocorrect-board-aware',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-oracle-exploration-context-aware-reason-jobs',
+        reasonProvider:'strict-link-grammar-oracle-exploration-clean-no-autocorrect-board-aware',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:true,
@@ -1373,7 +1408,7 @@ const server = http.createServer(async (req, res) => {
         text,
         elapsedMs: Date.now() - startedAt,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-oracle-exploration-context-aware-reason-jobs',
+        reasonProvider:'strict-link-grammar-oracle-exploration-clean-no-autocorrect-board-aware',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:true,
@@ -1446,6 +1481,7 @@ const server = http.createServer(async (req, res) => {
         reasonPriorityEpoch: body.reasonPriorityEpoch || body.reasonEpoch || Number(url.searchParams.get('reasonPriorityEpoch') || 0),
         reasonPrioritySeq: body.reasonPrioritySeq || body.reasonSeq || Number(url.searchParams.get('reasonPrioritySeq') || 0),
         words: Array.isArray(body.words) ? body.words : [],
+        reasonBoardCandidates: body.reasonBoardCandidates || body.boardCandidates || [],
         reasonHandCandidates: body.reasonHandCandidates || body.handCandidates || [],
         reasonDeckCandidates: body.reasonDeckCandidates || body.reasonCandidates || body.deckCandidates || []
       };
@@ -1457,4 +1493,4 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => console.log(`Strict Link Grammar v36 Contextual Short Answer API listening on ${PORT}`));
+server.listen(PORT, () => console.log(`Strict Link Grammar v39 Clean No-Autocorrect API listening on ${PORT}`));
