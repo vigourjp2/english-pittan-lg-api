@@ -424,6 +424,107 @@ async function proofreadEnglish(text) {
   }
 }
 
+
+const ltGateCache = new Map();
+const LT_GATE_IGNORE_RULE_IDS = new Set([
+  'UPPERCASE_SENTENCE_START',
+  'WHITESPACE_RULE',
+  'COMMA_PARENTHESIS_WHITESPACE',
+  'EN_QUOTES',
+  'MORFOLOGIK_RULE_EN_US'
+]);
+function simplifyLanguageToolMatch(m) {
+  const rule = m?.rule || {};
+  const category = rule?.category || {};
+  const id = String(rule?.id || '');
+  const issueType = String(rule?.issueType || '');
+  const categoryId = String(category?.id || '');
+  const ignored = LT_GATE_IGNORE_RULE_IDS.has(id) || issueType === 'typographical' || categoryId === 'CASING';
+  const blocking = !ignored && (issueType === 'grammar' || categoryId === 'GRAMMAR');
+  return {
+    offset: Number(m?.offset || 0),
+    length: Number(m?.length || 0),
+    ruleId: id,
+    message: String(m?.message || ''),
+    shortMessage: String(m?.shortMessage || ''),
+    issueType,
+    categoryId,
+    categoryName: String(category?.name || ''),
+    replacements: Array.isArray(m?.replacements) ? m.replacements.slice(0, 5).map(r => String(r?.value || '')).filter(Boolean) : [],
+    ignored,
+    blocking,
+    usedForCorrection: false
+  };
+}
+async function languageToolErrorGate(text) {
+  const src = normalizeText(text);
+  const key = src.toLowerCase();
+  const cached = ltGateCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  if (!src) return { checked:false, ok:true, matches:[], blockingMatches:[], error:'empty text' };
+  try {
+    const body = new URLSearchParams({ text: src, language: 'en-US' });
+    const j = await fetchJsonWithTimeout(LANGUAGETOOL_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', 'accept': 'application/json' },
+      body
+    }, LT_TIMEOUT_MS);
+    const matches = (Array.isArray(j?.matches) ? j.matches : []).map(simplifyLanguageToolMatch);
+    const blockingMatches = matches.filter(m => m.blocking);
+    const value = {
+      checked:true,
+      ok:blockingMatches.length === 0,
+      usedForCorrection:false,
+      matches,
+      blockingMatches,
+      matchesCount:matches.length,
+      blockingCount:blockingMatches.length,
+      gate:'languagetool-error-detection-only'
+    };
+    ltGateCache.set(key, { value, expiresAt: Date.now() + 30 * 60 * 1000 });
+    if (ltGateCache.size > 500) ltGateCache.delete(ltGateCache.keys().next().value);
+    return value;
+  } catch (e) {
+    return { checked:false, ok:true, usedForCorrection:false, matches:[], blockingMatches:[], matchesCount:0, blockingCount:0, error:String(e.message || e), gate:'languagetool-error-detection-only-failed-open' };
+  }
+}
+function localAcceptabilityFromLinkParserAndLt(text, parsed, ltGate = null) {
+  const base = localAcceptabilityFromLinkParser(text, parsed);
+  if (!strictLinkGrammarGameOk(parsed)) return { ...base, method:'strict-link-grammar-plus-languagetool-error-gate', gate:'strict-link-grammar-failed', languageToolBlocking:false };
+  const blocking = Array.isArray(ltGate?.blockingMatches) ? ltGate.blockingMatches : [];
+  if (blocking.length > 0) {
+    const top = blocking[0];
+    return {
+      ok:false,
+      gameOk:false,
+      type:'grammar_error',
+      method:'strict-link-grammar-plus-languagetool-error-gate',
+      reason: top.message || 'LanguageTool detected a blocking grammar issue.',
+      sentenceType:'not_complete_sentence',
+      utteranceType:'grammar_error',
+      displayKind:'文法エラー',
+      jaHint:'',
+      noteJa: top.message ? `LanguageTool判定: ${top.message}` : 'LanguageToolが文法上の問題を検出しました。',
+      noteEn: top.message || '',
+      gate:'languagetool-blocking-rule',
+      hfUsed:false,
+      languageToolBlocking:true,
+      blockingRuleId: top.ruleId || '',
+      blockingMessage: top.message || '',
+      blockingMatches: blocking.slice(0, 5)
+    };
+  }
+  return { ...base, method:'strict-link-grammar-plus-languagetool-error-gate', gate:'strict-link-grammar-and-languagetool', languageToolBlocking:false };
+}
+async function evaluateGameTextExact(text) {
+  const src = normalizeText(text);
+  const parsed = await runLinkParser(src);
+  let ltGate = null;
+  if (strictLinkGrammarGameOk(parsed)) ltGate = await languageToolErrorGate(src);
+  const acceptability = localAcceptabilityFromLinkParserAndLt(src, parsed, ltGate);
+  return { text:src, parsed, languageTool:ltGate, acceptability, ok:!!acceptability.ok, gameOk:!!(acceptability.ok && acceptability.gameOk !== false && acceptability.type === 'complete_sentence') };
+}
+
 function runLinkParser(text) {
   return new Promise((resolve) => {
     const args = ['en', '-batch', '-verbosity=0', '-graphics=0', '-null=0', '-islands-ok=0', '-spell=0', '-timeout=3'];
@@ -691,8 +792,8 @@ function localReasonFromDiagnostics(text, diagnostics = {}) {
 }
 
 async function judgeAcceptability(text) {
-  // v29: HF/chat acceptability judge removed. 判定は checkSentence() 側で Strict Link Grammar の結果から決める。
-  return localAcceptabilityFromLinkParser(text, { ok:true, fullParse:true, strictLinkGrammar:true, linkages:1, nullCount:0, code:0 });
+  const ev = await evaluateGameTextExact(text);
+  return ev.acceptability;
 }
 
 
@@ -778,9 +879,9 @@ async function explainByExploration(text, diagnostics = {}) {
     if (checked.has(k)) return checked.get(k);
     if (checks >= maxChecks || (Date.now() - startedAt) >= maxMs) return false;
     checks++;
-    const parsed = await runLinkParser(t);
-    const ok = strictLinkGrammarGameOk(parsed);
-    checked.set(k, { ok, parsed, text:t });
+    const ev = await evaluateGameTextExact(t);
+    const ok = !!ev.gameOk;
+    checked.set(k, { ok, parsed:ev.parsed, languageTool:ev.languageTool, acceptability:ev.acceptability, text:t });
     return checked.get(k);
   }
   async function trySuggestion(op) {
@@ -799,7 +900,9 @@ async function explainByExploration(text, diagnostics = {}) {
         sentence: r.text,
         linkages: r.parsed.linkages,
         fullParse: r.parsed.fullParse,
-        strictLinkGrammar: r.parsed.strictLinkGrammar
+        strictLinkGrammar: r.parsed.strictLinkGrammar,
+        languageToolBlocking: !!r.acceptability?.languageToolBlocking,
+        languageToolBlockingRuleId: r.acceptability?.blockingRuleId || ''
       });
     }
     return suggestions.length >= maxSuggestions;
@@ -985,36 +1088,9 @@ async function checkSentence(text, withTranslate = false, reasonMeta = {}) {
   const originalText = normalizeText(text);
   const proof = noAutocorrectProof(originalText);
   const checkedText = originalText;
-  const parsed = await runLinkParser(checkedText);
-  const acceptability = localAcceptabilityFromLinkParser(checkedText, parsed);
-
-  if (!parsed.ok) {
-    const type = acceptability.type || 'invalid';
-    const gameOk = !!(acceptability.ok && acceptability.gameOk !== false && type === 'complete_sentence');
-    let translation = null;
-    let reasonExplain = null;
-    let reasonJob = null;
-    if (gameOk && acceptability.jaHint) translation = { ok:true, ja:acceptability.jaHint, source:'contextual-short-answer' };
-    else if (gameOk && withTranslate) translation = await translateToJapanese(checkedText);
-    if (!gameOk) {
-      reasonJob = enqueueReasonJob(checkedText, { judgeSource:'link-grammar', linkGrammarOk:false, linkages:parsed.linkages, ...reasonMeta });
-      if (reasonJob?.status === 'success') reasonExplain = reasonJob.result;
-    }
-    return {
-      originalText, text: checkedText, normalized: proof.normalized, appliedCorrections: proof.appliedCorrections || [],
-      ok: gameOk, gameOk, type, kind:'Strict Link Grammar ONLY + Clean Exploration Reason Queue v39',
-      sentenceType: gameOk ? (acceptability.sentenceType || 'complete_sentence') : (acceptability.sentenceType || type),
-      reason: gameOk ? '' : (reasonExplain?.explanationJa || reasonExplain?.explanationEn || ''),
-      reasonSource: gameOk ? '' : (reasonExplain?.ok ? reasonExplain.method : 'reason-job-pending'),
-      reasonStatus: gameOk ? 'none' : (reasonJob?.status || 'pending'),
-      reasonJobId: gameOk ? '' : (reasonJob?.id || ''),
-      reasonExplain, proof,
-      fullParse: parsed.fullParse, strictLinkGrammar: parsed.strictLinkGrammar,
-      linkages: parsed.linkages, nullCount: parsed.nullCount, stdout: parsed.stdout, stderr: parsed.stderr, code: parsed.code,
-      acceptability, ja: translation?.ja || '', translation
-    };
-  }
-
+  const ev = await evaluateGameTextExact(checkedText);
+  const parsed = ev.parsed;
+  const acceptability = ev.acceptability;
   const ok = !!acceptability.ok;
   const type = acceptability.type || (ok ? 'complete_sentence' : 'invalid');
   const gameOk = !!(ok && acceptability.gameOk !== false && type === 'complete_sentence');
@@ -1024,21 +1100,30 @@ async function checkSentence(text, withTranslate = false, reasonMeta = {}) {
   if (gameOk && acceptability.jaHint) translation = { ok:true, ja:acceptability.jaHint, source:'contextual-short-answer' };
   else if (gameOk && withTranslate) translation = await translateToJapanese(checkedText);
   if (!gameOk) {
-    reasonJob = enqueueReasonJob(checkedText, { judgeSource:'link-grammar', linkGrammarOk:true, linkages:parsed.linkages, ...reasonMeta });
+    reasonJob = enqueueReasonJob(checkedText, {
+      judgeSource: acceptability.gate || 'strict-link-grammar-plus-languagetool',
+      linkGrammarOk: strictLinkGrammarGameOk(parsed),
+      linkages: parsed.linkages,
+      languageTool: ev.languageTool,
+      languageToolBlocking: !!acceptability.languageToolBlocking,
+      blockingRuleId: acceptability.blockingRuleId || '',
+      blockingMessage: acceptability.blockingMessage || '',
+      ...reasonMeta
+    });
     if (reasonJob?.status === 'success') reasonExplain = reasonJob.result;
   }
   return {
     originalText, text: checkedText, normalized: proof.normalized, appliedCorrections: proof.appliedCorrections || [],
-    ok, gameOk, type, kind:'Strict Link Grammar ONLY + Clean Exploration Reason Queue v39',
+    ok, gameOk, type, kind:'Strict Link Grammar + LanguageTool Error Gate + Clean Exploration Reason Queue v41',
     sentenceType: gameOk ? (acceptability.sentenceType || 'complete_sentence') : (acceptability.sentenceType || type),
-    reason: gameOk ? '' : (reasonExplain?.explanationJa || reasonExplain?.explanationEn || ''),
-    reasonSource: gameOk ? '' : (reasonExplain?.ok ? reasonExplain.method : 'reason-job-pending'),
+    reason: gameOk ? '' : (acceptability.noteJa || acceptability.reason || reasonExplain?.explanationJa || reasonExplain?.explanationEn || ''),
+    reasonSource: gameOk ? '' : (acceptability.languageToolBlocking ? 'languagetool-error-gate' : (reasonExplain?.ok ? reasonExplain.method : 'reason-job-pending')),
     reasonStatus: gameOk ? 'none' : (reasonJob?.status || 'pending'),
     reasonJobId: gameOk ? '' : (reasonJob?.id || ''),
     reasonExplain, proof,
     fullParse: parsed.fullParse, strictLinkGrammar: parsed.strictLinkGrammar,
     linkages: parsed.linkages, nullCount: parsed.nullCount, stdout: parsed.stdout, stderr: parsed.stderr, code: parsed.code,
-    acceptability, ja: translation?.ja || '', translation
+    acceptability, languageTool: ev.languageTool, ja: translation?.ja || '', translation
   };
 }
 
@@ -1357,19 +1442,51 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-strict-only-v39-clean-no-autocorrect-board-aware',
+        mode:'link-grammar-plus-languagetool-error-gate-v41-no-autocorrect',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-oracle-exploration-clean-no-autocorrect-board-aware',
+        reasonProvider:'strict-link-grammar-languagetool-oracle-exploration-v41',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:true,
-        acceptanceGate:'strict-link-grammar-only',
+        acceptanceGate:'strict-link-grammar-plus-languagetool-error-gate',
         pixabayKeyPresent: !!PIXABAY_API_KEY,
         hfModelScanVersion: 'v2-no-generation-params-for-classifiers',
         hfModelScanModels: HF_SCAN_MODELS,
         reasonJobs: { size: reasonJobs.size, running: reasonQueueRunning, maxAttempts: REASON_JOB_MAX_ATTEMPTS, rawMaxAttempts: REASON_JOB_MAX_ATTEMPTS_RAW, stats: reasonStats, successCacheSize: [...reasonJobs.values()].filter(j=>j.status==='success').length, pendingSize: [...reasonJobs.values()].filter(j=>!['success','failure','failed','error','cancelled','canceled','unavailable'].includes(String(j.status||'').toLowerCase())).length }
+      });
+    }
+    if (url.pathname === '/diagnose') {
+      const text = await getTextFromReq(req, url);
+      if (!text) return send(res, 400, { ok:false, error:'empty text' });
+      const src = normalizeText(text);
+      const parsed = await runLinkParser(src);
+      const lt = await languageToolErrorGate(src);
+      const acceptability = localAcceptabilityFromLinkParserAndLt(src, parsed, lt);
+      return send(res, 200, {
+        ok:true,
+        text:src,
+        usedForCorrection:false,
+        linkGrammar:{
+          ok: strictLinkGrammarGameOk(parsed),
+          fullParse: parsed.fullParse,
+          strictLinkGrammar: parsed.strictLinkGrammar,
+          linkages: parsed.linkages,
+          nullCount: parsed.nullCount,
+          code: parsed.code
+        },
+        languageTool:lt,
+        finalGatePreview:{
+          ok: !!(acceptability.ok && acceptability.gameOk !== false && acceptability.type === 'complete_sentence'),
+          type: acceptability.type,
+          gate: acceptability.gate,
+          method: acceptability.method,
+          reason: acceptability.reason || acceptability.noteJa || '',
+          blockingRuleId: acceptability.blockingRuleId || '',
+          blockingMessage: acceptability.blockingMessage || ''
+        },
+        acceptability
       });
     }
     if (url.pathname === '/proof') {
@@ -1408,11 +1525,11 @@ const server = http.createServer(async (req, res) => {
         text,
         elapsedMs: Date.now() - startedAt,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-oracle-exploration-clean-no-autocorrect-board-aware',
+        reasonProvider:'strict-link-grammar-languagetool-oracle-exploration-v41',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:true,
-        acceptanceGate:'strict-link-grammar-only',
+        acceptanceGate:'strict-link-grammar-plus-languagetool-error-gate',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         result: r
@@ -1493,4 +1610,4 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => console.log(`Strict Link Grammar v39 Clean No-Autocorrect API listening on ${PORT}`));
+server.listen(PORT, () => console.log(`Strict Link Grammar + LanguageTool v41 No-Autocorrect API listening on ${PORT}`));
