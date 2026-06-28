@@ -38,6 +38,8 @@ const REASON_JOB_RETRY_DELAYS_MS = (process.env.REASON_JOB_RETRY_DELAYS_MS || '3
 const REASON_JOB_MAX_ATTEMPTS_RAW = Number(process.env.REASON_JOB_MAX_ATTEMPTS || 3);
 const REASON_JOB_MAX_ATTEMPTS = Math.max(1, Math.min(5, Number.isFinite(REASON_JOB_MAX_ATTEMPTS_RAW) ? REASON_JOB_MAX_ATTEMPTS_RAW : 3)); // v26: Render環境変数が999999等でも強制クランプ、標準3回
 const REASON_JOB_MAX_CACHE = Number(process.env.REASON_JOB_MAX_CACHE || 800);
+const REASON_JOB_TIMEOUT_MS = Math.max(3000, Number(process.env.REASON_JOB_TIMEOUT_MS || 12000)); // v49: 1つの理由jobが固まって全体キューを塞がないための外部I/Oタイムアウト。候補探索の打ち切り上限ではない。
+const REASON_CANDIDATE_TIMEOUT_MS = Math.max(1000, Number(process.env.REASON_CANDIDATE_TIMEOUT_MS || 4500)); // v49: 候補1件ごとのAPI待ち防止。候補数上限ではない。
 const reasonJobs = new Map();
 let reasonQueueRunning = false;
 let reasonQueueTimer = null;
@@ -68,6 +70,41 @@ function isNonRetryableReasonError(err) {
     msg.includes('billing') ||
     msg.includes('payment required');
   return !HF_TOKEN || status === 400 || status === 401 || status === 402 || status === 403 || status === 404 || quotaLike || msg.includes('hf_token is not set') || msg.includes('authorization') || msg.includes('unauthorized') || msg.includes('forbidden') || msg.includes('model not found') || msg.includes('invalid api key') || msg.includes('invalid token');
+}
+
+
+function withReasonTimeout(promise, timeoutMs, label) {
+  let timer = null;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        const err = new Error(`${label || 'reason operation'} timed out after ${timeoutMs}ms`);
+        err.retryable = false;
+        err.reasonTimeout = true;
+        reject(err);
+      }, timeoutMs);
+    })
+  ]).finally(() => { if (timer) clearTimeout(timer); });
+}
+
+function expireStaleRunningReasonJobs() {
+  const now = Date.now();
+  let changed = false;
+  for (const j of reasonJobs.values()) {
+    if (String(j.status || '').toLowerCase() !== 'running') continue;
+    const age = now - Number(j.startedAt || j.updatedAt || 0);
+    if (age > REASON_JOB_TIMEOUT_MS * 2) {
+      j.status = 'failure';
+      j.lastError = `stale running reason job expired after ${age}ms`;
+      j.nextRetryAt = null;
+      j.updatedAt = now;
+      reasonStats.failure++;
+      changed = true;
+    }
+  }
+  if (changed) reasonQueueRevision++;
+  return changed;
 }
 
 
@@ -249,6 +286,7 @@ function scheduleReasonQueue(delayMs = 0) {
   reasonQueueTimer = setTimeout(() => { reasonQueueTimer = null; processReasonQueue().catch(()=>{}); }, Math.max(0, delayMs));
 }
 async function processReasonQueue() {
+  expireStaleRunningReasonJobs();
   if (reasonQueueRunning) return;
   reasonQueueRunning = true;
   try {
@@ -260,10 +298,11 @@ async function processReasonQueue() {
         .sort(compareReasonJobs)[0];
       if (!ready) break;
       ready.status = 'running';
-      ready.updatedAt = Date.now();
+      ready.startedAt = Date.now();
+      ready.updatedAt = ready.startedAt;
       reasonQueueRevision++;
       try {
-        const r = await explainRejectedSentence(ready.text, ready.diagnostics || {});
+        const r = await withReasonTimeout(explainRejectedSentence(ready.text, ready.diagnostics || {}), REASON_JOB_TIMEOUT_MS, `reason job ${ready.id}`);
         const hasExplanation = !!(r?.ok && (String(r.explanationJa||'').trim() || String(r.explanationEn||'').trim()));
         if (!hasExplanation) {
           const err = new Error(r?.error || 'reason-explain returned no explanation');
@@ -278,6 +317,15 @@ async function processReasonQueue() {
         reasonStats.success++;
         reasonQueueRevision++;
       } catch (e) {
+        if (e?.reasonTimeout) {
+          ready.status = 'failure';
+          ready.nextRetryAt = null;
+          ready.lastError = String(e.message || e);
+          ready.updatedAt = Date.now();
+          reasonStats.failure++;
+          reasonQueueRevision++;
+          continue;
+        }
         if (isNonRetryableReasonError(e)) {
           ready.status = 'unavailable';
           ready.nextRetryAt = null;
@@ -1105,7 +1153,7 @@ async function explainByExploration(text, diagnostics = {}) {
     // v48: 理由探索では、候補全部にいきなり /check 相当(HF込み)をかけない。
     // まず軽い LG + LanguageTool だけで全候補をふるいにかける。
     // HF 文法分類は、軽い判定を通った「成立しそうな候補」にだけ最後にかける。
-    const light = await evaluateGameTextLightForReason(t);
+    const light = await withReasonTimeout(evaluateGameTextLightForReason(t), REASON_CANDIDATE_TIMEOUT_MS, `reason light candidate ${t}`);
     if (!light.gameOk) {
       const value = {
         ok:false,
@@ -1120,7 +1168,7 @@ async function explainByExploration(text, diagnostics = {}) {
       return value;
     }
 
-    const ev = await evaluateGameTextExact(t);
+    const ev = await withReasonTimeout(evaluateGameTextExact(t), REASON_CANDIDATE_TIMEOUT_MS, `reason final candidate ${t}`);
     const ok = !!ev.gameOk;
     const value = {
       ok,
@@ -1228,7 +1276,13 @@ async function explainByExploration(text, diagnostics = {}) {
   async function runLevel(ops) {
     const found = [];
     for (const op of ops) {
-      const r = await isGood(op.sentence || uniqueSentence(op.words));
+      let r = null;
+      try {
+        r = await isGood(op.sentence || uniqueSentence(op.words));
+      } catch (e) {
+        // v49: 候補1件の外部I/O詰まりで理由job全体・後続jobを止めない。
+        r = { ok:false, stage:'candidate-error', text:op.sentence || uniqueSentence(op.words), error:String(e?.message || e) };
+      }
       if (r && r.ok) {
         found.push({
           action: op.action,
@@ -1295,7 +1349,7 @@ async function explainByExploration(text, diagnostics = {}) {
   }
   return {
     ok:true,
-    method:'strict-link-grammar-oracle-exploration-v48-staged-light-first',
+    method:'strict-link-grammar-oracle-exploration-v49-staged-timeout-isolated',
     model:'none',
     observedStructure: top ? 'nearest successful path found by staged light-first exploration' : 'no successful path found in staged finite candidate set',
     incompletePart: top ? top.action : 'not found in exhaustive finite candidate set',
@@ -1307,6 +1361,7 @@ async function explainByExploration(text, diagnostics = {}) {
       exploration:true,
       exhaustive:true,
       stagedReason:true,
+      timeoutIsolated:true,
       lightFirst:true,
       hfOnlyAfterLightAccept:true,
       noArbitraryCandidateBudget:true,
@@ -1412,7 +1467,7 @@ async function checkSentence(text, withTranslate = false, reasonMeta = {}) {
   }
   return {
     originalText, text: checkedText, normalized: proof.normalized, appliedCorrections: proof.appliedCorrections || [],
-    ok, gameOk, type, kind:'Strict Link Grammar + LanguageTool + HF Grammar Classifier Gate v48',
+    ok, gameOk, type, kind:'Strict Link Grammar + LanguageTool + HF Grammar Classifier Gate v49',
     sentenceType: gameOk ? (acceptability.sentenceType || 'complete_sentence') : (acceptability.sentenceType || type),
     reason: gameOk ? '' : (acceptability.noteJa || acceptability.reason || reasonExplain?.explanationJa || reasonExplain?.explanationEn || ''),
     reasonSource: gameOk ? '' : (acceptability.languageToolBlocking ? 'languagetool-error-gate' : (acceptability.hfUsed ? 'hf-grammar-classifier-gate' : (reasonExplain?.ok ? reasonExplain.method : 'reason-job-pending'))),
@@ -1740,11 +1795,11 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-plus-languagetool-error-gate-v48-staged-reason-exploration',
+        mode:'link-grammar-plus-languagetool-error-gate-v49-reason-timeout-isolation',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v48-staged-reason-exploration',
+        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v49-staged-reason-exploration',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:!ACCEPTABILITY_HF_ENABLED,
@@ -1754,12 +1809,12 @@ const server = http.createServer(async (req, res) => {
         hfAcceptabilityStats,
         hfAcceptabilityCacheSize: hfAcceptabilityCache.size,
         hfAcceptabilityCacheKeyPolicy:'exact-text-case-sensitive-v45',
-        reasonExplorePolicy:'staged-light-first-final-hf-only-on-promising-candidates-v48',
+        reasonExplorePolicy:'staged-light-first-with-timeout-isolation-v49',
         acceptanceGate:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate',
         pixabayKeyPresent: !!PIXABAY_API_KEY,
         hfModelScanVersion: 'v2-no-generation-params-for-classifiers',
         hfModelScanModels: HF_SCAN_MODELS,
-        reasonJobs: { size: reasonJobs.size, running: reasonQueueRunning, maxAttempts: REASON_JOB_MAX_ATTEMPTS, rawMaxAttempts: REASON_JOB_MAX_ATTEMPTS_RAW, stats: reasonStats, successCacheSize: [...reasonJobs.values()].filter(j=>j.status==='success').length, pendingSize: [...reasonJobs.values()].filter(j=>!['success','failure','failed','error','cancelled','canceled','unavailable'].includes(String(j.status||'').toLowerCase())).length }
+        reasonJobs: { size: reasonJobs.size, running: reasonQueueRunning, maxAttempts: REASON_JOB_MAX_ATTEMPTS, rawMaxAttempts: REASON_JOB_MAX_ATTEMPTS_RAW, timeoutMs: REASON_JOB_TIMEOUT_MS, candidateTimeoutMs: REASON_CANDIDATE_TIMEOUT_MS, stats: reasonStats, successCacheSize: [...reasonJobs.values()].filter(j=>j.status==='success').length, pendingSize: [...reasonJobs.values()].filter(j=>!['success','failure','failed','error','cancelled','canceled','unavailable'].includes(String(j.status||'').toLowerCase())).length }
       });
     }
     if (url.pathname === '/diagnose') {
@@ -1872,7 +1927,7 @@ const server = http.createServer(async (req, res) => {
         text,
         elapsedMs: Date.now() - startedAt,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v48-staged-reason-exploration',
+        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v49-staged-reason-exploration',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:!ACCEPTABILITY_HF_ENABLED,
@@ -1882,7 +1937,7 @@ const server = http.createServer(async (req, res) => {
         hfAcceptabilityStats,
         hfAcceptabilityCacheSize: hfAcceptabilityCache.size,
         hfAcceptabilityCacheKeyPolicy:'exact-text-case-sensitive-v45',
-        reasonExplorePolicy:'staged-light-first-final-hf-only-on-promising-candidates-v48',
+        reasonExplorePolicy:'staged-light-first-with-timeout-isolation-v49',
         acceptanceGate:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
