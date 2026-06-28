@@ -15,6 +15,12 @@ const HF_MODEL_SCAN_TIMEOUT_MS = Number(process.env.HF_MODEL_SCAN_TIMEOUT_MS || 
 const HF_SCAN_MODELS = (process.env.HF_SCAN_MODELS || 'textattack/roberta-base-CoLA,abdulmatinomotoso/English_Grammar_Checker,agentlans/snowflake-arctic-xs-grammar-classifier,nikolasmoya/c4-binary-english-grammar-checker,pszemraj/electra-small-discriminator-CoLA,textattack/bert-base-uncased-CoLA,EstherT/sentence-acceptability').split(',').map(s => s.trim()).filter(Boolean);
 const ACCEPTABILITY_HF_ENABLED = !/^false|0|off$/i.test(String(process.env.ACCEPTABILITY_HF_ENABLED || 'true'));
 const ACCEPTABILITY_HF_MODEL = process.env.ACCEPTABILITY_HF_MODEL || 'abdulmatinomotoso/English_Grammar_Checker';
+// v65: main classifier alone accepts modal-inversion fragments like "happy today he must".
+// Add a second, external classifier gate that only rejects when it returns a clear unacceptable verdict.
+// This is not a sentence/word hardcode; it is an additional HF model vote.
+const ACCEPTABILITY_HF_SECONDARY_ENABLED = !/^false|0|off$/i.test(String(process.env.ACCEPTABILITY_HF_SECONDARY_ENABLED || 'true'));
+const ACCEPTABILITY_HF_SECONDARY_MODEL = process.env.ACCEPTABILITY_HF_SECONDARY_MODEL || 'textattack/roberta-base-CoLA';
+const ACCEPTABILITY_HF_SECONDARY_REJECT_MIN_CONF = Math.max(0, Math.min(1, Number(process.env.ACCEPTABILITY_HF_SECONDARY_REJECT_MIN_CONF || 0.70)));
 const ACCEPTABILITY_HF_FAIL_CLOSED = /^true|1|on$/i.test(String(process.env.ACCEPTABILITY_HF_FAIL_CLOSED || 'false'));
 const ACCEPTABILITY_HF_DAILY_MAX = Math.max(0, Number(process.env.ACCEPTABILITY_HF_DAILY_MAX || 80));
 const ACCEPTABILITY_HF_CACHE_MAX = Math.max(100, Number(process.env.ACCEPTABILITY_HF_CACHE_MAX || 2000));
@@ -617,8 +623,68 @@ async function hfAcceptabilityGate(text) {
     hfAcceptabilityStats.rejected++;
     value = { checked:true, ok:false, available:true, enabled:true, model:ACCEPTABILITY_HF_MODEL, judgement, reason:`acceptability rejected by ${ACCEPTABILITY_HF_MODEL}`, failOpen:false };
   } else {
-    hfAcceptabilityStats.accepted++;
-    value = { checked:true, ok:true, available:true, enabled:true, model:ACCEPTABILITY_HF_MODEL, judgement, reason:'acceptability accepted', failOpen:false };
+    // v65: if primary model accepts, ask a second external classifier as an additional veto.
+    // The benchmark showed:
+    // - valid: I am happy today / I must be happy today / I am Japanese now / I like Japanese now => accepted by roberta-CoLA
+    // - bad modal inversion: happy today he must => rejected by roberta-CoLA
+    // Primary model still catches walking/eating fragments, so this is a two-model OR-rejection / AND-acceptance gate.
+    let secondaryGate = null;
+    if (ACCEPTABILITY_HF_SECONDARY_ENABLED && ACCEPTABILITY_HF_SECONDARY_MODEL && ACCEPTABILITY_HF_SECONDARY_MODEL !== ACCEPTABILITY_HF_MODEL) {
+      const skey = `${ACCEPTABILITY_HF_SECONDARY_MODEL}::${src}`;
+      const scached = hfAcceptabilityCache.get(skey);
+      if (scached) {
+        hfAcceptabilityStats.cacheHits++;
+        secondaryGate = { ...scached, cached:true };
+      } else if (ACCEPTABILITY_HF_DAILY_MAX > 0 && hfAcceptabilityStats.calls >= ACCEPTABILITY_HF_DAILY_MAX) {
+        hfAcceptabilityStats.unavailable++;
+        secondaryGate = { checked:false, ok:true, available:false, enabled:true, model:ACCEPTABILITY_HF_SECONDARY_MODEL, reason:'daily HF acceptability limit reached before secondary gate', dailyMax:ACCEPTABILITY_HF_DAILY_MAX, failOpen:true, secondary:true };
+      } else {
+        hfAcceptabilityStats.calls++;
+        const ssummary = await callHfInferenceModel(ACCEPTABILITY_HF_SECONDARY_MODEL, src);
+        const sjudgement = inferAcceptabilityFromHfSummary(ssummary);
+        if (!sjudgement.ok || sjudgement.acceptable === null) {
+          hfAcceptabilityStats.unavailable++;
+          secondaryGate = { checked:true, ok:true, available:false, enabled:true, model:ACCEPTABILITY_HF_SECONDARY_MODEL, judgement:sjudgement, reason:sjudgement.error || sjudgement.reason || 'secondary unknown HF output', failOpen:true, secondary:true };
+        } else if (sjudgement.acceptable === false && Number(sjudgement.confidence || 0) >= ACCEPTABILITY_HF_SECONDARY_REJECT_MIN_CONF) {
+          hfAcceptabilityStats.rejected++;
+          secondaryGate = { checked:true, ok:false, available:true, enabled:true, model:ACCEPTABILITY_HF_SECONDARY_MODEL, judgement:sjudgement, reason:`secondary acceptability rejected by ${ACCEPTABILITY_HF_SECONDARY_MODEL}`, failOpen:false, secondary:true, minRejectConfidence:ACCEPTABILITY_HF_SECONDARY_REJECT_MIN_CONF };
+        } else {
+          hfAcceptabilityStats.accepted++;
+          secondaryGate = { checked:true, ok:true, available:true, enabled:true, model:ACCEPTABILITY_HF_SECONDARY_MODEL, judgement:sjudgement, reason:sjudgement.acceptable === false ? 'secondary reject confidence below threshold; fail-open' : 'secondary acceptability accepted', failOpen:false, secondary:true, minRejectConfidence:ACCEPTABILITY_HF_SECONDARY_REJECT_MIN_CONF };
+        }
+        hfAcceptabilityCache.set(skey, secondaryGate);
+      }
+    }
+    if (secondaryGate?.ok === false) {
+      value = {
+        checked:true,
+        ok:false,
+        available:true,
+        enabled:true,
+        model:`${ACCEPTABILITY_HF_MODEL}+${ACCEPTABILITY_HF_SECONDARY_MODEL}`,
+        judgement,
+        primaryHfAcceptability:{ checked:true, ok:true, available:true, enabled:true, model:ACCEPTABILITY_HF_MODEL, judgement, reason:'primary acceptability accepted', failOpen:false },
+        secondaryHfAcceptability:secondaryGate,
+        reason:secondaryGate.reason || `secondary acceptability rejected by ${ACCEPTABILITY_HF_SECONDARY_MODEL}`,
+        failOpen:false,
+        dualGate:true
+      };
+    } else {
+      hfAcceptabilityStats.accepted++;
+      value = {
+        checked:true,
+        ok:true,
+        available:true,
+        enabled:true,
+        model: secondaryGate ? `${ACCEPTABILITY_HF_MODEL}+${ACCEPTABILITY_HF_SECONDARY_MODEL}` : ACCEPTABILITY_HF_MODEL,
+        judgement,
+        primaryHfAcceptability:{ checked:true, ok:true, available:true, enabled:true, model:ACCEPTABILITY_HF_MODEL, judgement, reason:'primary acceptability accepted', failOpen:false },
+        secondaryHfAcceptability:secondaryGate,
+        reason: secondaryGate ? 'dual acceptability accepted' : 'acceptability accepted',
+        failOpen:false,
+        dualGate:!!secondaryGate
+      };
+    }
   }
   hfAcceptabilityCache.set(key, value);
   trimHfAcceptabilityCache();
@@ -1264,7 +1330,7 @@ function limitedPermutations(arr, max = 120) {
 function reasonLocalPrefilter(sentence) {
   // v58: 撤去済み。ローカルの助動詞/動詞リストで候補を捨てない。
   // 浅い候補可否は実績ある外部HF分類器だけに投げる。HF Chatは使わない。
-  return { ok:true, reason:'removed-v64-custom-model-benchmark' };
+  return { ok:true, reason:'removed-v65-dual-hf-acceptability-gate' };
 }
 
 async function explainByExploration(text, diagnostics = {}) {
@@ -1638,7 +1704,7 @@ async function explainByExploration(text, diagnostics = {}) {
   }
   return {
     ok:true,
-    method:'strict-link-grammar-oracle-exploration-v64-custom-model-benchmark',
+    method:'strict-link-grammar-oracle-exploration-v65-dual-hf-acceptability-gate',
     model:'none',
     observedStructure: top ? 'nearest successful path found and confirmed by final HF display filter' : 'no successful path found in staged finite candidate set',
     incompletePart: top ? top.action : 'not found in exhaustive finite candidate set',
@@ -1656,7 +1722,7 @@ async function explainByExploration(text, diagnostics = {}) {
       hfOnlyAfterLightAccept:true,
       hfNetworkSkippedInReason:false,
       hfFinalDisplayFilter:true,
-      externalShallowJudge:'hf-classifier-depth-timeslice-v64-custom-benchmark',
+      externalShallowJudge:'hf-classifier-depth-timeslice-v65-dual-hf-gate',
       localGrammarPrefilter:false,
       hfChatUsed:false,
       externalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH,
@@ -2105,22 +2171,25 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-plus-languagetool-error-gate-v64-custom-model-benchmark',
+        mode:'link-grammar-plus-languagetool-error-gate-v65-dual-hf-acceptability-gate',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v64-custom-model-benchmark',
+        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v65-dual-hf-acceptability-gate',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:!ACCEPTABILITY_HF_ENABLED,
         hfAcceptabilityModel: ACCEPTABILITY_HF_MODEL,
+        hfAcceptabilitySecondaryEnabled: ACCEPTABILITY_HF_SECONDARY_ENABLED,
+        hfAcceptabilitySecondaryModel: ACCEPTABILITY_HF_SECONDARY_MODEL,
+        hfAcceptabilitySecondaryRejectMinConfidence: ACCEPTABILITY_HF_SECONDARY_REJECT_MIN_CONF,
         hfAcceptabilityFailClosed: ACCEPTABILITY_HF_FAIL_CLOSED,
         hfAcceptabilityDailyMax: ACCEPTABILITY_HF_DAILY_MAX,
         hfAcceptabilityStats,
         hfAcceptabilityCacheSize: hfAcceptabilityCache.size,
         hfAcceptabilityCacheKeyPolicy:'exact-text-case-sensitive-v45',
-        reasonExplorePolicy:'depth-timeslice-action-bucket-plus-external-classifier-v64-custom-benchmark',
-        browserQueryContext:true, reasonHfNetworkDisabled:false, reasonDisplayHfFilter:true, reasonExternalShallowJudge:'hf-classifier-depth-timeslice-v64-custom-benchmark', reasonLocalPrefilterEnabled:false, reasonFinalHfTimeoutMs:REASON_FINAL_HF_TIMEOUT_MS, reasonFinalHfParallel:REASON_FINAL_HF_PARALLEL, reasonExternalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH, reasonLightCandidateWindowPerDepth:REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH, reasonActionBucketQuota:REASON_ACTION_BUCKET_QUOTA, reasonStreamingSoftDeadlineMs:REASON_STREAMING_SOFT_DEADLINE_MS,
+        reasonExplorePolicy:'depth-timeslice-action-bucket-plus-external-classifier-v65-dual-hf-gate',
+        browserQueryContext:true, reasonHfNetworkDisabled:false, reasonDisplayHfFilter:true, reasonExternalShallowJudge:'hf-classifier-depth-timeslice-v65-dual-hf-gate', reasonLocalPrefilterEnabled:false, reasonFinalHfTimeoutMs:REASON_FINAL_HF_TIMEOUT_MS, reasonFinalHfParallel:REASON_FINAL_HF_PARALLEL, reasonExternalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH, reasonLightCandidateWindowPerDepth:REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH, reasonActionBucketQuota:REASON_ACTION_BUCKET_QUOTA, reasonStreamingSoftDeadlineMs:REASON_STREAMING_SOFT_DEADLINE_MS,
         acceptanceGate:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate',
         pixabayKeyPresent: !!PIXABAY_API_KEY,
         hfModelScanVersion: 'v2-no-generation-params-for-classifiers',
@@ -2234,7 +2303,7 @@ async function diagnoseCustomBenchmark(url) {
   });
   return {
     ok:true,
-    version:'v64-custom-model-benchmark-for-modal-inversion-cases',
+    version:'v65-dual-hf-acceptability-gate-for-modal-inversion-cases',
     note:'diagnostic only; /check is unchanged. Use scan=1 to compare all HF_SCAN_MODELS. Use sample=... repeatedly or samples=a||b||c for custom cases.',
     model:model || (scanAll ? 'HF_SCAN_MODELS' : 'textattack/roberta-base-CoLA'),
     scanAll,
@@ -2313,18 +2382,21 @@ async function diagnoseCustomBenchmark(url) {
         text,
         elapsedMs: Date.now() - startedAt,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v64-custom-model-benchmark',
+        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v65-dual-hf-acceptability-gate',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:!ACCEPTABILITY_HF_ENABLED,
         hfAcceptabilityModel: ACCEPTABILITY_HF_MODEL,
+        hfAcceptabilitySecondaryEnabled: ACCEPTABILITY_HF_SECONDARY_ENABLED,
+        hfAcceptabilitySecondaryModel: ACCEPTABILITY_HF_SECONDARY_MODEL,
+        hfAcceptabilitySecondaryRejectMinConfidence: ACCEPTABILITY_HF_SECONDARY_REJECT_MIN_CONF,
         hfAcceptabilityFailClosed: ACCEPTABILITY_HF_FAIL_CLOSED,
         hfAcceptabilityDailyMax: ACCEPTABILITY_HF_DAILY_MAX,
         hfAcceptabilityStats,
         hfAcceptabilityCacheSize: hfAcceptabilityCache.size,
         hfAcceptabilityCacheKeyPolicy:'exact-text-case-sensitive-v45',
-        reasonExplorePolicy:'depth-timeslice-action-bucket-plus-external-classifier-v64-custom-benchmark',
-        browserQueryContext:true, reasonHfNetworkDisabled:false, reasonDisplayHfFilter:true, reasonExternalShallowJudge:'hf-classifier-depth-timeslice-v64-custom-benchmark', reasonLocalPrefilterEnabled:false, reasonFinalHfTimeoutMs:REASON_FINAL_HF_TIMEOUT_MS, reasonFinalHfParallel:REASON_FINAL_HF_PARALLEL, reasonExternalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH, reasonLightCandidateWindowPerDepth:REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH, reasonActionBucketQuota:REASON_ACTION_BUCKET_QUOTA, reasonStreamingSoftDeadlineMs:REASON_STREAMING_SOFT_DEADLINE_MS,
+        reasonExplorePolicy:'depth-timeslice-action-bucket-plus-external-classifier-v65-dual-hf-gate',
+        browserQueryContext:true, reasonHfNetworkDisabled:false, reasonDisplayHfFilter:true, reasonExternalShallowJudge:'hf-classifier-depth-timeslice-v65-dual-hf-gate', reasonLocalPrefilterEnabled:false, reasonFinalHfTimeoutMs:REASON_FINAL_HF_TIMEOUT_MS, reasonFinalHfParallel:REASON_FINAL_HF_PARALLEL, reasonExternalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH, reasonLightCandidateWindowPerDepth:REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH, reasonActionBucketQuota:REASON_ACTION_BUCKET_QUOTA, reasonStreamingSoftDeadlineMs:REASON_STREAMING_SOFT_DEADLINE_MS,
         acceptanceGate:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
