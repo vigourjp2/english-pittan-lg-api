@@ -8,9 +8,9 @@ const LINK_TIMEOUT_MS = Number(process.env.LINK_TIMEOUT_MS || 3500);
 const LT_TIMEOUT_MS = Number(process.env.LT_TIMEOUT_MS || 5000);
 const HF_TIMEOUT_MS = Number(process.env.HF_TIMEOUT_MS || 25000);
 const HF_MODEL_SCAN_TIMEOUT_MS = Number(process.env.HF_MODEL_SCAN_TIMEOUT_MS || 20000);
-// v95: game acceptability uses external API as a veto when available.
-// Unavailable model/quota must not turn valid beginner sentences into NG.
-// Reason suggestions are verified with the same game gate before being displayed.
+// v96: game acceptability keeps Strict Link Grammar + LanguageTool as the base truth.
+// External acceptability is used as a primary veto only; secondary model rejects are advisory to avoid false NG.
+// Reason suggestions are verified with the same game gate and redundant time-adverb stacking is rejected.
 const HF_SCAN_MODELS = (process.env.HF_SCAN_MODELS || 'textattack/roberta-base-CoLA,abdulmatinomotoso/English_Grammar_Checker,agentlans/snowflake-arctic-xs-grammar-classifier,nikolasmoya/c4-binary-english-grammar-checker,pszemraj/electra-small-discriminator-CoLA,textattack/bert-base-uncased-CoLA,EstherT/sentence-acceptability').split(',').map(s => s.trim()).filter(Boolean);
 const ACCEPTABILITY_HF_ENABLED = !/^false|0|off$/i.test(String(process.env.ACCEPTABILITY_HF_ENABLED || 'true'));
 const ACCEPTABILITY_HF_GAME_GATE_ENABLED = !/^false|0|off$/i.test(String(process.env.ACCEPTABILITY_HF_GAME_GATE_ENABLED || 'true'));
@@ -589,6 +589,44 @@ function localAcceptabilityFromLinkParserAndLt(text, parsed, ltGate = null) {
   }
   return { ...base, method:'strict-link-grammar-plus-languagetool-error-gate', gate:'strict-link-grammar-and-languagetool', languageToolBlocking:false };
 }
+
+function normalizeWordMetaList(wordMeta) {
+  if (!Array.isArray(wordMeta)) return [];
+  return wordMeta.map(m => {
+    if (!m || typeof m !== 'object') return null;
+    const w = String(m.w || m.word || '').trim();
+    const pos = Array.isArray(m.pos) ? m.pos.map(x => String(x || '').trim()).filter(Boolean) : [];
+    if (!w) return null;
+    return { w, pos };
+  }).filter(Boolean);
+}
+function applyGameSemanticGate(text, acceptability, options = {}) {
+  if (!(acceptability?.ok && acceptability?.gameOk !== false && acceptability?.type === 'complete_sentence')) return acceptability;
+  const meta = normalizeWordMetaList(options.wordMeta);
+  if (!meta.length) return acceptability;
+  const timeWords = meta.filter(m => m.pos.includes('advTime')).map(m => m.w);
+  if (timeWords.length >= 2) {
+    return {
+      ok:false,
+      gameOk:false,
+      type:'semantic_overlap',
+      method:(acceptability.method || 'strict-link-grammar-plus-languagetool') + '+game-semantic-pos-gate',
+      reason:`redundant advTime cards: ${timeWords.join(', ')}`,
+      sentenceType:'not_complete_sentence',
+      utteranceType:'semantic_overlap',
+      displayKind:'時間表現の重複',
+      jaHint:'',
+      noteJa:`advTimeカード（${timeWords.join(' / ')}）が重複しています。ゲームの成立候補としては扱いません。`,
+      noteEn:`Redundant advTime cards: ${timeWords.join(', ')}`,
+      gate:'game-semantic-advtime-pos-overlap-v97',
+      hfUsed:false,
+      languageToolBlocking:false,
+      semanticGateSource:'client-word-pos-metadata',
+      baseAcceptability:acceptability
+    };
+  }
+  return acceptability;
+}
 async function hfAcceptabilityGate(text) {
   resetHfAcceptabilityStatsIfNeeded();
   const src = normalizeText(text);
@@ -652,18 +690,22 @@ async function hfAcceptabilityGate(text) {
       }
     }
     if (secondaryGate?.ok === false) {
+      // v96: secondary classifiers such as CoLA often reject short beginner sentences
+      // like "I am happy today" even when Link Grammar + LanguageTool + primary model accept them.
+      // Treat secondary reject as diagnostic only. Primary reject above remains a real veto.
       value = {
         checked:true,
-        ok:false,
+        ok:true,
         available:true,
         enabled:true,
         model:`${ACCEPTABILITY_HF_MODEL}+${ACCEPTABILITY_HF_SECONDARY_MODEL}`,
         judgement,
         primaryHfAcceptability:{ checked:true, ok:true, available:true, enabled:true, model:ACCEPTABILITY_HF_MODEL, judgement, reason:'primary acceptability accepted', failOpen:false },
         secondaryHfAcceptability:secondaryGate,
-        reason:secondaryGate.reason || `secondary acceptability rejected by ${ACCEPTABILITY_HF_SECONDARY_MODEL}`,
+        reason:'primary accepted; secondary reject treated as advisory v96',
         failOpen:false,
-        dualGate:true
+        dualGate:true,
+        secondaryAdvisoryReject:true
       };
     } else {
       hfAcceptabilityStats.accepted++;
@@ -764,7 +806,7 @@ function applyHfAcceptabilityToLocalAcceptability(baseAccept, hfGate) {
   // v95: 外部APIが未設定/枠切れ/到達不可のときは、その文をNGにしない。
   // 明確に available な外部判定が reject した時だけvetoする。
   if (hfGate?.ok === false && hfGate?.available === false) {
-    return { ...baseAccept, method:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate', gate:'strict-link-grammar-languagetool-hf-unavailable-open-v95', hfUsed:false, hfAcceptability:hfGate };
+    return { ...baseAccept, method:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate', gate:'strict-link-grammar-languagetool-hf-unavailable-open-v96', hfUsed:false, hfAcceptability:hfGate };
   }
   if (hfGate?.ok === false) {
     const msg = hfGate?.judgement?.reason || hfGate?.reason || 'External grammar classifier rejected this sentence.';
@@ -795,7 +837,7 @@ async function evaluateGameTextExact(text, options = {}) {
   const parsed = await runLinkParser(src);
   let ltGate = null;
   if (strictLinkGrammarGameOk(parsed)) ltGate = await languageToolErrorGate(src);
-  let acceptability = localAcceptabilityFromLinkParserAndLt(src, parsed, ltGate);
+  let acceptability = applyGameSemanticGate(src, localAcceptabilityFromLinkParserAndLt(src, parsed, ltGate), options);
   let hfGate = null;
   if ((ACCEPTABILITY_HF_GAME_GATE_ENABLED || options.strictGameGate === true || options.acceptabilityModelGate === true) && acceptability.ok && acceptability.gameOk !== false && acceptability.type === 'complete_sentence') {
     hfGate = await hfAcceptabilityGate(src);
@@ -804,12 +846,12 @@ async function evaluateGameTextExact(text, options = {}) {
   return { text:src, parsed, languageTool:ltGate, hfAcceptability:hfGate, acceptability, ok:!!acceptability.ok, gameOk:!!(acceptability.ok && acceptability.gameOk !== false && acceptability.type === 'complete_sentence') };
 }
 
-async function evaluateGameTextLightForReason(text) {
+async function evaluateGameTextLightForReason(text, options = {}) {
   const src = normalizeText(text);
   const parsed = await runLinkParser(src);
   let ltGate = null;
   if (strictLinkGrammarGameOk(parsed)) ltGate = await languageToolErrorGate(src);
-  const acceptability = localAcceptabilityFromLinkParserAndLt(src, parsed, ltGate);
+  const acceptability = applyGameSemanticGate(src, localAcceptabilityFromLinkParserAndLt(src, parsed, ltGate), options);
   return {
     text: src,
     parsed,
@@ -1379,7 +1421,7 @@ async function explainByExploration(text, diagnostics = {}) {
       parsed:lightResult.parsed,
       languageTool:lightResult.languageTool,
       acceptability:lightResult.acceptability,
-      hfAcceptability:{ checked:false, skipped:true, reason:'reason display uses same game API gate v95' }
+      hfAcceptability:{ checked:false, skipped:true, reason:'reason display uses same game API gate v96' }
     };
   }
 
@@ -1581,8 +1623,8 @@ async function explainByExploration(text, diagnostics = {}) {
         ...light,
         text:candidateText,
         ok:true,
-        stage:'same-game-api-gate-accepted-for-reason-display-v95',
-        hfAcceptability:{ checked:false, skipped:true, reason:'reason display uses same game API gate v95' }
+        stage:'same-game-api-gate-accepted-for-reason-display-v96',
+        hfAcceptability:{ checked:false, skipped:true, reason:'reason display uses same game API gate v96' }
       };
       if (finalHfAcceptedTexts.length < 80) finalHfAcceptedTexts.push(candidateText);
       return makeSuggestionFromFinal(item.op, final);
@@ -1789,7 +1831,7 @@ async function checkSentence(text, withTranslate = false, reasonMeta = {}) {
   const originalText = normalizeText(text);
   const proof = noAutocorrectProof(originalText);
   const checkedText = originalText;
-  const ev = await evaluateGameTextExact(checkedText, { strictGameGate: reasonMeta.strictGameGate === true, acceptabilityModelGate: reasonMeta.acceptabilityModelGate === true });
+  const ev = await evaluateGameTextExact(checkedText, { strictGameGate: reasonMeta.strictGameGate === true, acceptabilityModelGate: reasonMeta.acceptabilityModelGate === true, wordMeta: reasonMeta.wordMeta });
   const parsed = ev.parsed;
   const acceptability = ev.acceptability;
   const ok = !!acceptability.ok;
@@ -1836,7 +1878,7 @@ function normalizeCandidateItem(item, i = 0) {
   }
   const words = Array.isArray(item?.words) ? item.words.map(x => normalizeText(String(x))).filter(Boolean) : null;
   const text = normalizeText(item?.text || (words ? words.join(' ') : ''));
-  return { id: String(item?.id ?? i), text, words: words || text.split(/\s+/).filter(Boolean) };
+  return { id: String(item?.id ?? i), text, words: words || text.split(/\s+/).filter(Boolean), wordMeta: Array.isArray(item?.wordMeta) ? item.wordMeta : [] };
 }
 
 async function checkSentenceBatch(req) {
@@ -1860,7 +1902,7 @@ async function checkSentenceBatch(req) {
     while (next < items.length) {
       const item = items[next++];
       try {
-        const checked = await checkSentence(item.text, j.translate !== false && j.withTranslate !== false, { reasonPriorityEpoch: j.reasonPriorityEpoch || j.reasonEpoch || Date.now(), reasonPrioritySeq: Number(item.id || 0), words:item.words, reasonBoardCandidates:j.reasonBoardCandidates || j.boardCandidates || [], reasonHandCandidates:j.reasonHandCandidates || j.handCandidates || [], reasonDeckCandidates:j.reasonDeckCandidates || j.reasonCandidates || j.deckCandidates || [], strictGameGate: j.strictGameGate === true || j.acceptabilityModelGate === true, acceptabilityModelGate: j.acceptabilityModelGate === true, reasonDisabled: j.reasonDisabled===true || j.disableReasonJob===true || j.reasonMode==='none' });
+        const checked = await checkSentence(item.text, j.translate !== false && j.withTranslate !== false, { reasonPriorityEpoch: j.reasonPriorityEpoch || j.reasonEpoch || Date.now(), reasonPrioritySeq: Number(item.id || 0), words:item.words, wordMeta:item.wordMeta, reasonBoardCandidates:j.reasonBoardCandidates || j.boardCandidates || [], reasonHandCandidates:j.reasonHandCandidates || j.handCandidates || [], reasonDeckCandidates:j.reasonDeckCandidates || j.reasonCandidates || j.deckCandidates || [], strictGameGate: j.strictGameGate === true || j.acceptabilityModelGate === true, acceptabilityModelGate: j.acceptabilityModelGate === true, reasonDisabled: j.reasonDisabled===true || j.disableReasonJob===true || j.reasonMode==='none' });
         const accept = checked.acceptability || {};
         const type = accept.type || (checked.gameOk ? 'complete_sentence' : (checked.fullParse ? 'fragment' : 'invalid'));
         const gameOk = !!(checked.ok && checked.gameOk && (accept.gameOk !== false) && type === 'complete_sentence');
@@ -2177,7 +2219,7 @@ const server = http.createServer(async (req, res) => {
       const src = normalizeText(text);
       const parsed = await runLinkParser(src);
       const lt = await languageToolErrorGate(src);
-      let acceptability = localAcceptabilityFromLinkParserAndLt(src, parsed, lt);
+      let acceptability = applyGameSemanticGate(src, localAcceptabilityFromLinkParserAndLt(src, parsed, lt), {});
       let hfGate = null;
       if (acceptability.ok && acceptability.gameOk !== false && acceptability.type === 'complete_sentence') {
         hfGate = await hfAcceptabilityGate(src);
@@ -2362,7 +2404,7 @@ async function diagnoseCustomBenchmark(url) {
       const text = await getTextFromReq(req, url);
       if (!text) return send(res, 400, { ok:false, error:'empty text' });
       const diagnostics = {
-        judgeSource:'displayed-reject-reason-job-context-v95-same-game-api-gate',
+        judgeSource:'displayed-reject-reason-job-context-v96-same-game-api-gate',
         strictGameGate: url.searchParams.get('strictGameGate') === '1' || url.searchParams.get('acceptabilityModelGate') === '1',
         acceptabilityModelGate: url.searchParams.get('acceptabilityModelGate') === '1',
         reasonBoardCandidates: wordsFromQuery(url, ['reasonBoardCandidates','boardCandidates','board','boardWords'], 80),
@@ -2437,6 +2479,7 @@ async function diagnoseCustomBenchmark(url) {
         reasonPriorityEpoch: body.reasonPriorityEpoch || body.reasonEpoch || Number(url.searchParams.get('reasonPriorityEpoch') || 0),
         reasonPrioritySeq: body.reasonPrioritySeq || body.reasonSeq || Number(url.searchParams.get('reasonPrioritySeq') || 0),
         words: Array.isArray(body.words) ? body.words : wordsFromQuery(url, ['words'], 80),
+        wordMeta: Array.isArray(body.wordMeta) ? body.wordMeta : [],
         reasonBoardCandidates: body.reasonBoardCandidates || body.boardCandidates || queryBoardCandidates,
         reasonHandCandidates: body.reasonHandCandidates || body.handCandidates || queryHandCandidates,
         reasonDeckCandidates: body.reasonDeckCandidates || body.reasonCandidates || body.deckCandidates || queryDeckCandidates,
