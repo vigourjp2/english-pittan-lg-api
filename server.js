@@ -1345,8 +1345,8 @@ async function explainByExploration(text, diagnostics = {}) {
       return value;
     }
 
-    // v55: ここではまだ「候補発見」だけ。表示確定は runLevel 側でHF文法ゲートに通す。
-    // 候補全部にHFをかけず、LG+LanguageToolを通った候補だけ最終確認する。
+    // v80: ここでゲームAPI系の軽量判定を通った候補は、表示候補として扱う。
+    // HF最終フィルタは使わない。
     const value = {
       ok:true,
       stage:'light-accepted-awaiting-hf-display-filter-v55',
@@ -1363,23 +1363,16 @@ async function explainByExploration(text, diagnostics = {}) {
   async function verifyReasonDisplayCandidate(lightResult) {
     const t = normalizeText(lightResult?.text || '').replace(/[.!?]+$/,'');
     if (!t || !lightResult?.ok) return { ok:false, stage:'display-filter-no-light-candidate', text:t };
-    try {
-      const hfGate = await withReasonTimeout(hfAcceptabilityGate(t), REASON_FINAL_HF_TIMEOUT_MS, `reason final HF candidate ${t}`);
-      const finalAcceptability = applyHfAcceptabilityToLocalAcceptability(lightResult.acceptability, hfGate);
-      const finalOk = !!(finalAcceptability?.ok && finalAcceptability?.gameOk !== false && finalAcceptability?.type === 'complete_sentence');
-      return {
-        ok: finalOk,
-        stage: finalOk ? 'light-and-hf-accepted-for-reason-display-v55' : 'hf-rejected-for-reason-display-v56',
-        text:t,
-        parsed:lightResult.parsed,
-        languageTool:lightResult.languageTool,
-        acceptability:finalAcceptability,
-        hfAcceptability:hfGate
-      };
-    } catch (e) {
-      // v55: HFが遅い/失敗した候補は「仮候補」として表示しない。間違った候補を出すより安全側に倒す。
-      return { ok:false, stage:'hf-unavailable-suppressed-for-reason-display-v56', text:t, error:String(e?.message || e), parsed:lightResult.parsed, languageTool:lightResult.languageTool, acceptability:lightResult.acceptability, hfAcceptability:{ checked:false, ok:false, available:false, reason:String(e?.message || e) } };
-    }
+    const finalOk = !!(lightResult.acceptability?.ok && lightResult.acceptability?.gameOk !== false && lightResult.acceptability?.type === 'complete_sentence');
+    return {
+      ok: finalOk,
+      stage: finalOk ? 'strict-link-grammar-accepted-for-reason-display-v80' : 'strict-link-grammar-rejected-for-reason-display-v80',
+      text:t,
+      parsed:lightResult.parsed,
+      languageTool:lightResult.languageTool,
+      acceptability:lightResult.acceptability,
+      hfAcceptability:{ checked:false, skipped:true, reason:'reason display uses strict Link Grammar API result only v80' }
+    };
   }
 
   function opSentence(op) { return uniqueSentence(op.words); }
@@ -1501,7 +1494,7 @@ async function explainByExploration(text, diagnostics = {}) {
     // - v61はdepth1を先にstreamingし続けたため、depth2候補(I am Japanese now 等)に入る前にsoft deadline近くまで消費した。
     // - v63はdepth1に小さいtime sliceを持たせ、depth2補完へ必ず進む。
     // - ローカル文法判定・助動詞リスト判定・特定文accept/rejectは使わない。
-    // - 判定は引き続き Link Grammar + LanguageTool + HF分類器。
+    // - 判定は Link Grammar + LanguageTool のゲームAPI系判定だけ。HF最終フィルタは使わない。
     const sourceRank = { hand:0, board:1, deck:2 };
     const actionRank = { 'add-left':0, 'add-right':1, 'add-two-left':2, 'add-two-right':3, replace:4, reorder:5, delete:6 };
     const rankedOps = (ops || [])
@@ -1515,11 +1508,12 @@ async function explainByExploration(text, diagnostics = {}) {
       );
 
     const bucketOrder = [
-      // 1枚追加をまず見る。ただしここで成立しなければ2枚追加にすぐ進む。
-      'hand:add-left', 'hand:add-right',
-      // 今回の Japanese now のような断片は「手札2枚を前に足す」候補が埋もれやすいので、bucketとして公平に確保する。
-      // これは具体文の固定ではなく、action/source別の探索順制御。
-      'hand:add-two-left', 'hand:add-two-right',
+      // v80: 左側追加を先に6件消費すると、I like + apples のような右追加候補が
+      // depth1の少量チェック枠に入らず、理由探索が「待ち/未発見」に見える。
+      // 文や単語の固定ではなく、同じ手札候補を右追加→左追加の順に探索するだけ。
+      'hand:add-right', 'hand:add-left',
+      // 2枚追加も同様に、英文の続きを作る候補を先に見てから前置補完を見る。
+      'hand:add-two-right', 'hand:add-two-left',
       'hand:replace', 'hand:reorder',
       'board:add-left', 'board:add-right',
       'deck:add-left', 'deck:add-right',
@@ -1567,28 +1561,23 @@ async function explainByExploration(text, diagnostics = {}) {
     let levelChecks = 0;
 
     async function verifyAcceptedLight(item, light) {
-      finalHfChecks++;
       const candidateText = normalizeText(light?.text || item?.sentence || '').replace(/[.!?]+$/,'');
       if (finalHfCandidateTexts.length < 80) finalHfCandidateTexts.push(candidateText);
-      try {
-        const hfGate = await withReasonTimeout(hfAcceptabilityGate(candidateText), REASON_FINAL_HF_TIMEOUT_MS, `reason v63 external classifier ${candidateText}`);
-        const finalAcceptability = applyHfAcceptabilityToLocalAcceptability(light.acceptability, hfGate);
-        const finalOk = !!(finalAcceptability?.ok && finalAcceptability?.gameOk !== false && finalAcceptability?.type === 'complete_sentence');
-        const final = finalOk
-          ? { ...light, text:candidateText, ok:true, stage:'external-hf-classifier-accepted-for-reason-display-v63', acceptability:finalAcceptability, hfAcceptability:hfGate }
-          : { ...light, text:candidateText, ok:false, stage:hfGate.ok === false ? 'external-hf-classifier-rejected-for-reason-display-v63' : 'external-hf-classifier-unavailable-suppressed-v63', acceptability:finalAcceptability, hfAcceptability:hfGate };
-        if (!final.ok) {
-          if (hfGate.ok === false) { finalHfRejected++; if (finalHfRejectedTexts.length < 80) finalHfRejectedTexts.push(candidateText); }
-          else { finalHfSuppressed++; if (finalHfSuppressedTexts.length < 80) finalHfSuppressedTexts.push(candidateText); }
-          return null;
-        }
-        if (finalHfAcceptedTexts.length < 80) finalHfAcceptedTexts.push(candidateText);
-        return makeSuggestionFromFinal(item.op, final);
-      } catch (e) {
-        finalHfSuppressed++;
-        if (finalHfSuppressedTexts.length < 80) finalHfSuppressedTexts.push(candidateText);
+      const finalOk = !!(light?.acceptability?.ok && light?.acceptability?.gameOk !== false && light?.acceptability?.type === 'complete_sentence');
+      if (!finalOk) {
+        finalHfRejected++;
+        if (finalHfRejectedTexts.length < 80) finalHfRejectedTexts.push(candidateText);
         return null;
       }
+      const final = {
+        ...light,
+        text:candidateText,
+        ok:true,
+        stage:'strict-link-grammar-accepted-for-reason-display-v80',
+        hfAcceptability:{ checked:false, skipped:true, reason:'reason display uses strict Link Grammar API result only v80' }
+      };
+      if (finalHfAcceptedTexts.length < 80) finalHfAcceptedTexts.push(candidateText);
+      return makeSuggestionFromFinal(item.op, final);
     }
 
     // 逐次streaming。並列で詰め込まず、OK候補が出たら即return。
@@ -1613,7 +1602,7 @@ async function explainByExploration(text, diagnostics = {}) {
 
   const oneStepOps = buildOneStepOps();
   // v63: depth1だけで時間を使い切らない。まず少量だけ見て、depth2補完へ進める。
-  let suggestions = await runLevel(oneStepOps, 1, { timeBudgetMs: 6500, checkBudget: 8 });
+  let suggestions = await runLevel(oneStepOps, 1, { timeBudgetMs: 9000, checkBudget: 18 });
   let exploredDepth = 1;
   let twoStepOpsCount = 0;
   if (!suggestions.length) {
@@ -1656,7 +1645,7 @@ async function explainByExploration(text, diagnostics = {}) {
       status:'no_verified_suggestion',
       retryable:false,
       error:'reason exploration found no verified completing path',
-      method:'strict-link-grammar-oracle-exploration-v79-strict-only',
+      method:'strict-link-grammar-oracle-exploration-v80-right-first-no-hf-no-local-fallback',
       suggestions:[],
       rawReason:{
         exploration:true,
@@ -1678,9 +1667,9 @@ async function explainByExploration(text, diagnostics = {}) {
   }
   return {
     ok:true,
-    method:'strict-link-grammar-oracle-exploration-v79-strict-only',
+    method:'strict-link-grammar-oracle-exploration-v80-right-first-no-hf-no-local-fallback',
     model:'none',
-    observedStructure: top ? 'nearest successful path found and confirmed by final HF display filter' : 'no successful path found in staged finite candidate set',
+    observedStructure: top ? 'nearest successful path found by strict Link Grammar API exploration' : 'no successful path found in staged finite candidate set',
     incompletePart: top ? top.action : 'not found in exhaustive finite candidate set',
     explanationEn,
     explanationJa,
@@ -1693,10 +1682,10 @@ async function explainByExploration(text, diagnostics = {}) {
       fastFirstSuccess:true,
       timeoutIsolated:true,
       lightFirst:true,
-      hfOnlyAfterLightAccept:true,
-      hfNetworkSkippedInReason:false,
-      hfFinalDisplayFilter:true,
-      externalShallowJudge:'hf-classifier-depth-timeslice-v65-dual-hf-gate',
+      hfOnlyAfterLightAccept:false,
+      hfNetworkSkippedInReason:true,
+      hfFinalDisplayFilter:false,
+      externalShallowJudge:'disabled-reason-uses-strict-link-grammar-api-only-v80',
       localGrammarPrefilter:false,
       hfChatUsed:false,
       externalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH,
@@ -2166,7 +2155,7 @@ const server = http.createServer(async (req, res) => {
         hfAcceptabilityCacheSize: hfAcceptabilityCache.size,
         hfAcceptabilityCacheKeyPolicy:'exact-text-case-sensitive-v45',
         reasonExplorePolicy:'depth-timeslice-action-bucket-plus-external-classifier-v65-dual-hf-gate',
-        browserQueryContext:true, reasonHfNetworkDisabled:false, reasonDisplayHfFilter:true, reasonExternalShallowJudge:'hf-classifier-depth-timeslice-v65-dual-hf-gate', reasonLocalPrefilterEnabled:false, reasonFinalHfTimeoutMs:REASON_FINAL_HF_TIMEOUT_MS, reasonFinalHfParallel:REASON_FINAL_HF_PARALLEL, reasonExternalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH, reasonLightCandidateWindowPerDepth:REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH, reasonActionBucketQuota:REASON_ACTION_BUCKET_QUOTA, reasonStreamingSoftDeadlineMs:REASON_STREAMING_SOFT_DEADLINE_MS,
+        browserQueryContext:true, reasonHfNetworkDisabled:true, reasonDisplayHfFilter:false, reasonExternalShallowJudge:'disabled-reason-uses-strict-link-grammar-api-only-v80', reasonLocalPrefilterEnabled:false, reasonFinalHfTimeoutMs:REASON_FINAL_HF_TIMEOUT_MS, reasonFinalHfParallel:REASON_FINAL_HF_PARALLEL, reasonExternalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH, reasonLightCandidateWindowPerDepth:REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH, reasonActionBucketQuota:REASON_ACTION_BUCKET_QUOTA, reasonStreamingSoftDeadlineMs:REASON_STREAMING_SOFT_DEADLINE_MS,
         acceptanceGate: ACCEPTABILITY_HF_GAME_GATE_ENABLED ? 'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate' : 'strict-link-grammar-plus-languagetool-only-game-gate',
         pixabayKeyPresent: !!PIXABAY_API_KEY,
         hfModelScanVersion: 'v2-no-generation-params-for-classifiers',
@@ -2334,7 +2323,7 @@ async function diagnoseCustomBenchmark(url) {
         hfAcceptabilityCacheSize: hfAcceptabilityCache.size,
         hfAcceptabilityCacheKeyPolicy:'exact-text-case-sensitive-v45',
         reasonExplorePolicy:'depth-timeslice-action-bucket-plus-external-classifier-v65-dual-hf-gate',
-        browserQueryContext:true, reasonHfNetworkDisabled:false, reasonDisplayHfFilter:true, reasonExternalShallowJudge:'hf-classifier-depth-timeslice-v65-dual-hf-gate', reasonLocalPrefilterEnabled:false, reasonFinalHfTimeoutMs:REASON_FINAL_HF_TIMEOUT_MS, reasonFinalHfParallel:REASON_FINAL_HF_PARALLEL, reasonExternalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH, reasonLightCandidateWindowPerDepth:REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH, reasonActionBucketQuota:REASON_ACTION_BUCKET_QUOTA, reasonStreamingSoftDeadlineMs:REASON_STREAMING_SOFT_DEADLINE_MS,
+        browserQueryContext:true, reasonHfNetworkDisabled:true, reasonDisplayHfFilter:false, reasonExternalShallowJudge:'disabled-reason-uses-strict-link-grammar-api-only-v80', reasonLocalPrefilterEnabled:false, reasonFinalHfTimeoutMs:REASON_FINAL_HF_TIMEOUT_MS, reasonFinalHfParallel:REASON_FINAL_HF_PARALLEL, reasonExternalVerifyMaxPerDepth:REASON_EXTERNAL_VERIFY_MAX_PER_DEPTH, reasonLightCandidateWindowPerDepth:REASON_LIGHT_CANDIDATE_WINDOW_PER_DEPTH, reasonActionBucketQuota:REASON_ACTION_BUCKET_QUOTA, reasonStreamingSoftDeadlineMs:REASON_STREAMING_SOFT_DEADLINE_MS,
         acceptanceGate: ACCEPTABILITY_HF_GAME_GATE_ENABLED ? 'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate' : 'strict-link-grammar-plus-languagetool-only-game-gate',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
