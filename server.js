@@ -1870,13 +1870,13 @@ async function checkSentenceBatch(req) {
   }
   const items = [...seen.values()];
   const results = [];
-  const concurrency = Math.max(1, Math.min(Number(process.env.BATCH_CONCURRENCY || 4), 8));
+  const concurrency = Math.max(1, Math.min(Number(process.env.BATCH_CONCURRENCY || 8), 12));
   let next = 0;
   async function worker() {
     while (next < items.length) {
       const item = items[next++];
       try {
-        const checked = await checkSentence(item.text, true, { reasonPriorityEpoch: j.reasonPriorityEpoch || j.reasonEpoch || Date.now(), reasonPrioritySeq: Number(item.id || 0), words:item.words, reasonBoardCandidates:j.reasonBoardCandidates || j.boardCandidates || [], reasonHandCandidates:j.reasonHandCandidates || j.handCandidates || [], reasonDeckCandidates:j.reasonDeckCandidates || j.reasonCandidates || j.deckCandidates || [], reasonDisabled: j.reasonDisabled===true || j.disableReasonJob===true || j.reasonMode==='none' });
+        const checked = await checkSentence(item.text, !(j.withTranslate===false || j.translate===false), { reasonPriorityEpoch: j.reasonPriorityEpoch || j.reasonEpoch || Date.now(), reasonPrioritySeq: Number(item.id || 0), words:item.words, reasonBoardCandidates:j.reasonBoardCandidates || j.boardCandidates || [], reasonHandCandidates:j.reasonHandCandidates || j.handCandidates || [], reasonDeckCandidates:j.reasonDeckCandidates || j.reasonCandidates || j.deckCandidates || [], reasonDisabled: j.reasonDisabled===true || j.disableReasonJob===true || j.reasonMode==='none' });
         const accept = checked.acceptability || {};
         const type = accept.type || (checked.gameOk ? 'complete_sentence' : (checked.fullParse ? 'fragment' : 'invalid'));
         const gameOk = !!(checked.ok && checked.gameOk && (accept.gameOk !== false) && type === 'complete_sentence');
