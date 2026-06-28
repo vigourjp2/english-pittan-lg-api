@@ -8,19 +8,19 @@ const LINK_TIMEOUT_MS = Number(process.env.LINK_TIMEOUT_MS || 3500);
 const LT_TIMEOUT_MS = Number(process.env.LT_TIMEOUT_MS || 5000);
 const HF_TIMEOUT_MS = Number(process.env.HF_TIMEOUT_MS || 25000);
 const HF_MODEL_SCAN_TIMEOUT_MS = Number(process.env.HF_MODEL_SCAN_TIMEOUT_MS || 20000);
-// v77: game acceptability must be deterministic.
-// HF grammar classifiers are kept for diagnostics/reason exploration, but they are NOT used as the default /check game gate.
-// Set ACCEPTABILITY_HF_GAME_GATE_ENABLED=true only when intentionally testing the external veto gate.
+// v93: game acceptability must not trust Link Grammar alone.
+// Strict Link Grammar is a parser, so a second external acceptability API gate is used for game scoring.
+// This is not a JS/local sentence hardcode; it is an API-backed model gate.
 const HF_SCAN_MODELS = (process.env.HF_SCAN_MODELS || 'textattack/roberta-base-CoLA,abdulmatinomotoso/English_Grammar_Checker,agentlans/snowflake-arctic-xs-grammar-classifier,nikolasmoya/c4-binary-english-grammar-checker,pszemraj/electra-small-discriminator-CoLA,textattack/bert-base-uncased-CoLA,EstherT/sentence-acceptability').split(',').map(s => s.trim()).filter(Boolean);
 const ACCEPTABILITY_HF_ENABLED = !/^false|0|off$/i.test(String(process.env.ACCEPTABILITY_HF_ENABLED || 'true'));
-const ACCEPTABILITY_HF_GAME_GATE_ENABLED = /^true|1|on$/i.test(String(process.env.ACCEPTABILITY_HF_GAME_GATE_ENABLED || 'false'));
+const ACCEPTABILITY_HF_GAME_GATE_ENABLED = !/^false|0|off$/i.test(String(process.env.ACCEPTABILITY_HF_GAME_GATE_ENABLED || 'true'));
 const ACCEPTABILITY_HF_MODEL = process.env.ACCEPTABILITY_HF_MODEL || 'abdulmatinomotoso/English_Grammar_Checker';
 // v74: add a second external classifier gate that only rejects when it returns a clear unacceptable verdict.
 // This is not a sentence/word rule; it is an additional HF model vote.
 const ACCEPTABILITY_HF_SECONDARY_ENABLED = !/^false|0|off$/i.test(String(process.env.ACCEPTABILITY_HF_SECONDARY_ENABLED || 'true'));
 const ACCEPTABILITY_HF_SECONDARY_MODEL = process.env.ACCEPTABILITY_HF_SECONDARY_MODEL || 'textattack/roberta-base-CoLA';
 const ACCEPTABILITY_HF_SECONDARY_REJECT_MIN_CONF = Math.max(0, Math.min(1, Number(process.env.ACCEPTABILITY_HF_SECONDARY_REJECT_MIN_CONF || 0.70)));
-const ACCEPTABILITY_HF_FAIL_CLOSED = /^true|1|on$/i.test(String(process.env.ACCEPTABILITY_HF_FAIL_CLOSED || 'false'));
+const ACCEPTABILITY_HF_FAIL_CLOSED = !/^false|0|off$/i.test(String(process.env.ACCEPTABILITY_HF_FAIL_CLOSED || 'true'));
 const ACCEPTABILITY_HF_DAILY_MAX = Math.max(0, Number(process.env.ACCEPTABILITY_HF_DAILY_MAX || 80));
 const ACCEPTABILITY_HF_CACHE_MAX = Math.max(100, Number(process.env.ACCEPTABILITY_HF_CACHE_MAX || 2000));
 
@@ -785,14 +785,14 @@ function applyHfAcceptabilityToLocalAcceptability(baseAccept, hfGate) {
   return { ...baseAccept, method:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate', gate:'strict-link-grammar-languagetool-hf-accepted', hfUsed:!!hfGate?.checked, hfAcceptability:hfGate, hfModel:hfGate?.model || ACCEPTABILITY_HF_MODEL };
 }
 
-async function evaluateGameTextExact(text) {
+async function evaluateGameTextExact(text, options = {}) {
   const src = normalizeText(text);
   const parsed = await runLinkParser(src);
   let ltGate = null;
   if (strictLinkGrammarGameOk(parsed)) ltGate = await languageToolErrorGate(src);
   let acceptability = localAcceptabilityFromLinkParserAndLt(src, parsed, ltGate);
   let hfGate = null;
-  if (ACCEPTABILITY_HF_GAME_GATE_ENABLED && acceptability.ok && acceptability.gameOk !== false && acceptability.type === 'complete_sentence') {
+  if ((ACCEPTABILITY_HF_GAME_GATE_ENABLED || options.strictGameGate === true || options.acceptabilityModelGate === true) && acceptability.ok && acceptability.gameOk !== false && acceptability.type === 'complete_sentence') {
     hfGate = await hfAcceptabilityGate(src);
     acceptability = applyHfAcceptabilityToLocalAcceptability(acceptability, hfGate);
   }
@@ -1781,7 +1781,7 @@ async function checkSentence(text, withTranslate = false, reasonMeta = {}) {
   const originalText = normalizeText(text);
   const proof = noAutocorrectProof(originalText);
   const checkedText = originalText;
-  const ev = await evaluateGameTextExact(checkedText);
+  const ev = await evaluateGameTextExact(checkedText, { strictGameGate: reasonMeta.strictGameGate === true, acceptabilityModelGate: reasonMeta.acceptabilityModelGate === true });
   const parsed = ev.parsed;
   const acceptability = ev.acceptability;
   const ok = !!acceptability.ok;
@@ -1808,7 +1808,7 @@ async function checkSentence(text, withTranslate = false, reasonMeta = {}) {
   }
   return {
     originalText, text: checkedText, normalized: proof.normalized, appliedCorrections: proof.appliedCorrections || [],
-    ok, gameOk, type, kind: ACCEPTABILITY_HF_GAME_GATE_ENABLED ? 'Strict Link Grammar + LanguageTool + HF Grammar Classifier Gate v77' : 'Strict Link Grammar + LanguageTool Gate v77' ,
+    ok, gameOk, type, kind: (ACCEPTABILITY_HF_GAME_GATE_ENABLED || reasonMeta.strictGameGate === true || reasonMeta.acceptabilityModelGate === true) ? 'Strict Link Grammar + LanguageTool + external acceptability API gate v93' : 'Strict Link Grammar + LanguageTool Gate v77' ,
     sentenceType: gameOk ? (acceptability.sentenceType || 'complete_sentence') : (acceptability.sentenceType || type),
     reason: gameOk ? '' : (acceptability.noteJa || acceptability.reason || reasonExplain?.explanationJa || reasonExplain?.explanationEn || ''),
     reasonSource: gameOk ? '' : (reasonDisabled ? 'reason-job-disabled-for-bulk-scan' : (acceptability.languageToolBlocking ? 'languagetool-error-gate' : (acceptability.hfUsed ? 'hf-grammar-classifier-gate' : (reasonExplain?.ok ? reasonExplain.method : 'reason-job-pending')))),
@@ -1846,13 +1846,13 @@ async function checkSentenceBatch(req) {
   }
   const items = [...seen.values()];
   const results = [];
-  const concurrency = Math.max(1, Math.min(Number(process.env.BATCH_CONCURRENCY || 4), 8));
+  const concurrency = Math.max(1, Math.min(Number(process.env.BATCH_CONCURRENCY || 8), 12));
   let next = 0;
   async function worker() {
     while (next < items.length) {
       const item = items[next++];
       try {
-        const checked = await checkSentence(item.text, true, { reasonPriorityEpoch: j.reasonPriorityEpoch || j.reasonEpoch || Date.now(), reasonPrioritySeq: Number(item.id || 0), words:item.words, reasonBoardCandidates:j.reasonBoardCandidates || j.boardCandidates || [], reasonHandCandidates:j.reasonHandCandidates || j.handCandidates || [], reasonDeckCandidates:j.reasonDeckCandidates || j.reasonCandidates || j.deckCandidates || [], reasonDisabled: j.reasonDisabled===true || j.disableReasonJob===true || j.reasonMode==='none' });
+        const checked = await checkSentence(item.text, j.translate !== false && j.withTranslate !== false, { reasonPriorityEpoch: j.reasonPriorityEpoch || j.reasonEpoch || Date.now(), reasonPrioritySeq: Number(item.id || 0), words:item.words, reasonBoardCandidates:j.reasonBoardCandidates || j.boardCandidates || [], reasonHandCandidates:j.reasonHandCandidates || j.handCandidates || [], reasonDeckCandidates:j.reasonDeckCandidates || j.reasonCandidates || j.deckCandidates || [], strictGameGate: j.strictGameGate === true || j.acceptabilityModelGate === true, acceptabilityModelGate: j.acceptabilityModelGate === true, reasonDisabled: j.reasonDisabled===true || j.disableReasonJob===true || j.reasonMode==='none' });
         const accept = checked.acceptability || {};
         const type = accept.type || (checked.gameOk ? 'complete_sentence' : (checked.fullParse ? 'fragment' : 'invalid'));
         const gameOk = !!(checked.ok && checked.gameOk && (accept.gameOk !== false) && type === 'complete_sentence');
