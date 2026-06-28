@@ -2383,7 +2383,7 @@ async function diagnoseCustomBenchmark(url) {
         text,
         elapsedMs: Date.now() - startedAt,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v65-dual-hf-acceptability-gate',
+        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v73-no-bulk-reason-representative-explain',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:!ACCEPTABILITY_HF_ENABLED,
@@ -2424,6 +2424,18 @@ async function diagnoseCustomBenchmark(url) {
       });
     }
 
+    if (url.pathname === '/reason-job-context') {
+      const text = await getTextFromReq(req, url);
+      if (!text) return send(res, 400, { ok:false, error:'empty text' });
+      const diagnostics = {
+        judgeSource:'representative-reason-job-context-v73',
+        reasonBoardCandidates: wordsFromQuery(url, ['reasonBoardCandidates','boardCandidates','board','boardWords'], 80),
+        reasonHandCandidates: wordsFromQuery(url, ['reasonHandCandidates','handCandidates','hand','handWords'], 80),
+        reasonDeckCandidates: wordsFromQuery(url, ['reasonDeckCandidates','reasonCandidates','deckCandidates','deck','deckWords'], 220)
+      };
+      const job = enqueueReasonJob(normalizeText(text), diagnostics);
+      return send(res, 200, { ok:true, text: normalizeText(text), contextReceived: diagnostics, next:`/reason-result?id=${job?.id || ''}`, ...publicReasonJob(job) });
+    }
     if (url.pathname === '/reason-job') {
       const text = await getTextFromReq(req, url);
       if (!text) return send(res, 400, { ok:false, error:'empty text' });
