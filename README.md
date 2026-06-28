@@ -1,5 +1,3 @@
-# English Pittan LG API / Frontend v54
+# English Pittan API v56
 
-Root fix over v53: final HF grammar verification for reason display suggestions is executed in parallel chunks instead of one-by-one. This preserves the main `/check` gate consistency while avoiding reason-job timeout from sequential rejected HF candidates.
-
-Output zip: english_reason_parallel_hf_filter_v54.zip
+外部HF batch分類器で理由表示候補の浅い判定を行う版。ローカル文法リスト前処理は撤去。
