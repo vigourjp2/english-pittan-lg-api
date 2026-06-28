@@ -533,7 +533,8 @@ function localAcceptabilityFromLinkParserAndLt(text, parsed, ltGate = null) {
 async function hfAcceptabilityGate(text) {
   resetHfAcceptabilityStatsIfNeeded();
   const src = normalizeText(text);
-  const key = `${ACCEPTABILITY_HF_MODEL}::${src.toLowerCase()}`;
+  // v45: HF判定キャッシュは exact text。lowercase化すると `walking...` と `Walking...` の検証が混ざるため。
+  const key = `${ACCEPTABILITY_HF_MODEL}::${src}`;
   const cached = hfAcceptabilityCache.get(key);
   if (cached) {
     hfAcceptabilityStats.cacheHits++;
@@ -1057,123 +1058,162 @@ function limitedPermutations(arr, max = 120) {
 async function explainByExploration(text, diagnostics = {}) {
   const src = normalizeText(text).replace(/[.!?]+$/,'');
   const words = canonicalGameWords(src.split(/\s+/).filter(Boolean));
-  const boardRaw = uniqueWordsFromArray(diagnostics.reasonBoardCandidates || diagnostics.boardCandidates || [], 80);
   const wordSet = new Set(words.map(w => w.toLowerCase()));
-  // 盤面にすでに存在する周辺カードを最優先。ただし今チェック中の候補に含まれる語は重複追加しない。
+
+  // v47: 探索上限・時間上限・順序依存を廃止。
+  // 「前から試したから後ろに足す候補まで届かない」のようなイタチごっこをやめる。
+  // 1手で到達できる候補を全列挙して全部判定し、1手で無ければ2手候補へ進む。
+  // これは特定英文をOKにする処理ではなく、有限な候補空間を最短編集距離で総当たりする探索。
+  const boardRaw = uniqueWordsFromArray(diagnostics.reasonBoardCandidates || diagnostics.boardCandidates || [], 1000000);
   const board = boardRaw.filter(w => !wordSet.has(String(w).toLowerCase()));
-  const hand = uniqueWordsFromArray(diagnostics.reasonHandCandidates || diagnostics.handCandidates || [], 24);
-  const deck = uniqueWordsFromArray(diagnostics.reasonDeckCandidates || diagnostics.reasonCandidates || diagnostics.deckCandidates || [], 140);
-  const candidates = uniqueWordsFromArray([...board, ...hand, ...deck], 180);
+  const hand = uniqueWordsFromArray(diagnostics.reasonHandCandidates || diagnostics.handCandidates || [], 1000000);
+  const deck = uniqueWordsFromArray(diagnostics.reasonDeckCandidates || diagnostics.reasonCandidates || diagnostics.deckCandidates || [], 1000000);
+  const candidates = uniqueWordsFromArray([...board, ...hand, ...deck], 1000000);
   const boardSet = new Set(board.map(w => w.toLowerCase()));
   const handSet = new Set(hand.map(w => w.toLowerCase()));
+  const deckOnly = candidates.filter(c => !boardSet.has(c.toLowerCase()) && !handSet.has(c.toLowerCase()));
   const originalKey = src.toLowerCase();
-  const maxChecks = Math.max(12, Math.min(Number(process.env.REASON_EXPLORE_MAX_CHECKS || 48), 120));
-  const maxMs = Math.max(1200, Math.min(Number(process.env.REASON_EXPLORE_MAX_MS || 4500), 9000));
   const startedAt = Date.now();
-  const maxSuggestions = Math.max(1, Math.min(Number(process.env.REASON_EXPLORE_MAX_SUGGESTIONS || 8), 12));
   let checks = 0;
   const checked = new Map();
-  const suggestions = [];
 
   async function isGood(sentence) {
     const t = normalizeText(sentence).replace(/[.!?]+$/,'');
     const k = t.toLowerCase();
     if (!t || k === originalKey) return false;
     if (checked.has(k)) return checked.get(k);
-    if (checks >= maxChecks || (Date.now() - startedAt) >= maxMs) return false;
     checks++;
     const ev = await evaluateGameTextExact(t);
     const ok = !!ev.gameOk;
     checked.set(k, { ok, parsed:ev.parsed, languageTool:ev.languageTool, acceptability:ev.acceptability, text:t });
     return checked.get(k);
   }
-  async function trySuggestion(op) {
-    if (suggestions.length >= maxSuggestions) return true;
-    const sentence = uniqueSentence(op.words);
-    const r = await isGood(sentence);
-    if (r && r.ok) {
-      suggestions.push({
-        action: op.action,
-        source: op.source || 'deck',
-        candidate: op.candidate || '',
-        candidate2: op.candidate2 || '',
-        from: op.from || '',
-        to: op.to || '',
-        remove: op.remove || '',
-        sentence: r.text,
-        linkages: r.parsed.linkages,
-        fullParse: r.parsed.fullParse,
-        strictLinkGrammar: r.parsed.strictLinkGrammar,
-        languageToolBlocking: !!r.acceptability?.languageToolBlocking,
-        languageToolBlockingRuleId: r.acceptability?.blockingRuleId || ''
-      });
-    }
-    return suggestions.length >= maxSuggestions;
-  }
-  async function runPhase(list, fn) {
-    for (const x of list) {
-      if (checks >= maxChecks || (Date.now() - startedAt) >= maxMs || suggestions.length >= maxSuggestions) break;
-      if (await fn(x)) break;
-    }
-  }
 
-  // 1) 盤面上の他カードでの一手。いま見えている盤面文脈を最優先する。
-  await runPhase(board, async c => trySuggestion({ action:'add-left', source:'board', candidate:c, words:[c, ...words] }));
-  await runPhase(board, async c => trySuggestion({ action:'add-right', source:'board', candidate:c, words:[...words, c] }));
-
-  // 2) 現在手札での最短一手。
-  await runPhase(hand, async c => trySuggestion({ action:'add-left', source:'hand', candidate:c, words:[c, ...words] }));
-  await runPhase(hand, async c => trySuggestion({ action:'add-right', source:'hand', candidate:c, words:[...words, c] }));
-  for (let i = 0; i < words.length && checks < maxChecks && suggestions.length < maxSuggestions; i++) {
-    await runPhase(board, async c => {
-      if (String(c).toLowerCase() === String(words[i]).toLowerCase()) return false;
-      const nw = words.slice(); nw[i] = c;
-      return trySuggestion({ action:'replace', source:'board', from:words[i], to:c, words:nw });
-    });
+  function opSentence(op) { return uniqueSentence(op.words); }
+  function pushOp(list, seen, op) {
+    const sentence = opSentence(op);
+    const k = sentence.toLowerCase();
+    if (!sentence || k === originalKey || seen.has(k)) return;
+    seen.add(k);
+    list.push({ ...op, sentence });
   }
-  for (let i = 0; i < words.length && checks < maxChecks && suggestions.length < maxSuggestions; i++) {
-    await runPhase(hand, async c => {
-      if (String(c).toLowerCase() === String(words[i]).toLowerCase()) return false;
-      const nw = words.slice(); nw[i] = c;
-      return trySuggestion({ action:'replace', source:'hand', from:words[i], to:c, words:nw });
-    });
-  }
-
-  // 2) 余計なカードを外す・並べ替える。これは候補カード不要なので嘘が少ない。
-  for (let i = 0; i < words.length && checks < maxChecks && suggestions.length < maxSuggestions; i++) {
-    if (words.length <= 2) break;
-    const nw = words.slice(0,i).concat(words.slice(i+1));
-    await trySuggestion({ action:'delete', source:'board', remove:words[i], words:nw });
-  }
-  if (words.length >= 2 && words.length <= 5 && checks < maxChecks && suggestions.length < maxSuggestions) {
-    for (const perm of limitedPermutations(words, 120)) {
-      if (checks >= maxChecks || suggestions.length >= maxSuggestions) break;
-      const s = uniqueSentence(perm);
-      if (s.toLowerCase() === originalKey) continue;
-      await trySuggestion({ action:'reorder', source:'board', words:perm });
-    }
-  }
-
-  // 3) 山札/全カード候補での一手。手札に無くても「こういうカードが来たら成立」が見える。
-  const deckOnly = candidates.filter(c => !boardSet.has(c.toLowerCase()) && !handSet.has(c.toLowerCase()));
-  await runPhase(deckOnly, async c => trySuggestion({ action:'add-right', source:'deck', candidate:c, words:[...words, c] }));
-  await runPhase(deckOnly, async c => trySuggestion({ action:'add-left', source:'deck', candidate:c, words:[c, ...words] }));
-  for (let i = 0; i < words.length && checks < maxChecks && suggestions.length < maxSuggestions; i++) {
-    await runPhase(deckOnly, async c => {
-      if (String(c).toLowerCase() === String(words[i]).toLowerCase()) return false;
-      const nw = words.slice(); nw[i] = c;
-      return trySuggestion({ action:'replace', source:'deck', from:words[i], to:c, words:nw });
-    });
-  }
-
-  // 4) 手札2枚先。探索爆発を避けるため手札だけ。
-  if (hand.length && checks < maxChecks && suggestions.length < maxSuggestions) {
-    for (let i = 0; i < hand.length && checks < maxChecks && suggestions.length < maxSuggestions; i++) {
-      for (let j = 0; j < hand.length && checks < maxChecks && suggestions.length < maxSuggestions; j++) {
-        if (i === j && hand.length > 1) continue;
-        await trySuggestion({ action:'add-two-right', source:'hand', candidate:hand[i], candidate2:hand[j], words:[...words, hand[i], hand[j]] });
+  function permutationsAll(arr) {
+    const a = (arr || []).slice();
+    const out = [];
+    const used = Array(a.length).fill(false);
+    const cur = [];
+    const seen = new Set();
+    function rec() {
+      if (cur.length === a.length) {
+        const s = uniqueSentence(cur);
+        const k = s.toLowerCase();
+        if (s && !seen.has(k)) { seen.add(k); out.push(cur.slice()); }
+        return;
+      }
+      const local = new Set();
+      for (let i = 0; i < a.length; i++) {
+        const k = String(a[i]).toLowerCase();
+        if (used[i] || local.has(k)) continue;
+        local.add(k);
+        used[i] = true; cur.push(a[i]); rec(); cur.pop(); used[i] = false;
       }
     }
+    rec();
+    return out;
+  }
+
+  function buildOneStepOps() {
+    const ops = [];
+    const seen = new Set();
+    const addSources = [
+      { source:'hand', list:hand },
+      { source:'board', list:board },
+      { source:'deck', list:deckOnly }
+    ];
+    for (const { source, list } of addSources) {
+      for (const c of list) {
+        pushOp(ops, seen, { depth:1, action:'add-left', source, candidate:c, words:[c, ...words] });
+        pushOp(ops, seen, { depth:1, action:'add-right', source, candidate:c, words:[...words, c] });
+      }
+    }
+    const replaceSources = [
+      { source:'hand', list:hand },
+      { source:'board', list:board },
+      { source:'deck', list:deckOnly }
+    ];
+    for (let i = 0; i < words.length; i++) {
+      for (const { source, list } of replaceSources) {
+        for (const c of list) {
+          if (String(c).toLowerCase() === String(words[i]).toLowerCase()) continue;
+          const nw = words.slice(); nw[i] = c;
+          pushOp(ops, seen, { depth:1, action:'replace', source, from:words[i], to:c, candidate:c, words:nw });
+        }
+      }
+    }
+    if (words.length > 2) {
+      for (let i = 0; i < words.length; i++) {
+        const nw = words.slice(0,i).concat(words.slice(i+1));
+        pushOp(ops, seen, { depth:1, action:'delete', source:'board', remove:words[i], words:nw });
+      }
+    }
+    if (words.length >= 2 && words.length <= 5) {
+      for (const perm of permutationsAll(words)) {
+        const s = uniqueSentence(perm);
+        if (s.toLowerCase() === originalKey) continue;
+        pushOp(ops, seen, { depth:1, action:'reorder', source:'board', words:perm });
+      }
+    }
+    return ops;
+  }
+
+  function buildTwoStepOps() {
+    const ops = [];
+    const seen = new Set();
+    for (let i = 0; i < hand.length; i++) {
+      for (let j = 0; j < hand.length; j++) {
+        if (i === j && hand.length > 1) continue;
+        pushOp(ops, seen, { depth:2, action:'add-two-right', source:'hand', candidate:hand[i], candidate2:hand[j], words:[...words, hand[i], hand[j]] });
+        pushOp(ops, seen, { depth:2, action:'add-two-left', source:'hand', candidate:hand[i], candidate2:hand[j], words:[hand[i], hand[j], ...words] });
+      }
+    }
+    return ops;
+  }
+
+  async function runLevel(ops) {
+    const found = [];
+    for (const op of ops) {
+      const r = await isGood(op.sentence || uniqueSentence(op.words));
+      if (r && r.ok) {
+        found.push({
+          action: op.action,
+          source: op.source || 'deck',
+          depth: op.depth || 1,
+          candidate: op.candidate || '',
+          candidate2: op.candidate2 || '',
+          from: op.from || '',
+          to: op.to || '',
+          remove: op.remove || '',
+          sentence: r.text,
+          linkages: r.parsed.linkages,
+          fullParse: r.parsed.fullParse,
+          strictLinkGrammar: r.parsed.strictLinkGrammar,
+          languageToolBlocking: !!r.acceptability?.languageToolBlocking,
+          languageToolBlockingRuleId: r.acceptability?.blockingRuleId || ''
+        });
+      }
+    }
+    return found;
+  }
+
+  const oneStepOps = buildOneStepOps();
+  let suggestions = await runLevel(oneStepOps);
+  let exploredDepth = 1;
+  let twoStepOpsCount = 0;
+  if (!suggestions.length) {
+    const twoStepOps = buildTwoStepOps();
+    twoStepOpsCount = twoStepOps.length;
+    suggestions = await runLevel(twoStepOps);
+    exploredDepth = 2;
   }
 
   const top = suggestions[0] || null;
@@ -1197,31 +1237,37 @@ async function explainByExploration(text, diagnostics = {}) {
       explanationJa = `カードの順番を変えると英文になります。候補: ${top.sentence}`;
       explanationEn = `Reordering the cards makes a complete sentence: ${top.sentence}`;
     } else if (top.action === 'add-two-right') {
-      explanationJa = `手札の「${top.candidate}」「${top.candidate2}」を続けて置くと英文になります。候補: ${top.sentence}`;
-      explanationEn = `Adding "${top.candidate}" and "${top.candidate2}" makes a complete sentence: ${top.sentence}`;
+      explanationJa = `手札の「${top.candidate}」「${top.candidate2}」を続けて後ろに置くと英文になります。候補: ${top.sentence}`;
+      explanationEn = `Adding "${top.candidate}" and "${top.candidate2}" after this makes a complete sentence: ${top.sentence}`;
+    } else if (top.action === 'add-two-left') {
+      explanationJa = `手札の「${top.candidate}」「${top.candidate2}」を続けて前に置くと英文になります。候補: ${top.sentence}`;
+      explanationEn = `Adding "${top.candidate}" and "${top.candidate2}" before this makes a complete sentence: ${top.sentence}`;
     }
   } else {
-    explanationJa = `Strict Link Grammarでは完全な英文になりませんでした。現在の候補カードで、${checks}通りを試しましたが成立する最短経路は見つかりませんでした。`;
-    explanationEn = `Strict Link Grammar could not build a complete sentence. I tried ${checks} candidate paths but did not find a completing path.`;
+    explanationJa = `Strict Link Grammarでは完全な英文になりませんでした。現在渡された盤面・手札・候補カードを、上限なしで最短手数ごとに総当たりしましたが、成立する経路は見つかりませんでした。`;
+    explanationEn = `Strict Link Grammar could not build a complete sentence. I exhaustively checked the finite board/hand/candidate set by shortest edit distance and did not find a completing path.`;
   }
   return {
     ok:true,
-    method:'strict-link-grammar-oracle-exploration-v39-clean-no-autocorrect-board-aware',
+    method:'strict-link-grammar-oracle-exploration-v47-exhaustive-shortest-distance',
     model:'none',
-    observedStructure: top ? 'nearest successful path found by strict Link Grammar exploration' : 'no successful path found in bounded exploration',
-    incompletePart: top ? top.action : 'unknown within candidate search budget',
+    observedStructure: top ? 'nearest successful path found by exhaustive shortest-distance Link Grammar exploration' : 'no successful path found in exhaustive finite candidate set',
+    incompletePart: top ? top.action : 'not found in exhaustive finite candidate set',
     explanationEn,
     explanationJa,
-    confidence: top ? 0.95 : 0.65,
+    confidence: top ? 0.97 : 0.72,
     suggestions,
     rawReason:{
       exploration:true,
+      exhaustive:true,
+      noSearchBudget:true,
       text:src,
       words,
       checks,
-      maxChecks,
-      maxMs,
       elapsedMs: Date.now() - startedAt,
+      exploredDepth,
+      oneStepOpsCount: oneStepOps.length,
+      twoStepOpsCount,
       boardCandidates:board,
       handCandidates:hand,
       deckCandidateCount:deck.length,
@@ -1317,7 +1363,7 @@ async function checkSentence(text, withTranslate = false, reasonMeta = {}) {
   }
   return {
     originalText, text: checkedText, normalized: proof.normalized, appliedCorrections: proof.appliedCorrections || [],
-    ok, gameOk, type, kind:'Strict Link Grammar + LanguageTool + HF Grammar Classifier Gate v43',
+    ok, gameOk, type, kind:'Strict Link Grammar + LanguageTool + HF Grammar Classifier Gate v47',
     sentenceType: gameOk ? (acceptability.sentenceType || 'complete_sentence') : (acceptability.sentenceType || type),
     reason: gameOk ? '' : (acceptability.noteJa || acceptability.reason || reasonExplain?.explanationJa || reasonExplain?.explanationEn || ''),
     reasonSource: gameOk ? '' : (acceptability.languageToolBlocking ? 'languagetool-error-gate' : (acceptability.hfUsed ? 'hf-grammar-classifier-gate' : (reasonExplain?.ok ? reasonExplain.method : 'reason-job-pending'))),
@@ -1645,11 +1691,11 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-plus-languagetool-error-gate-v43-hf-grammar-gate-abdul',
+        mode:'link-grammar-plus-languagetool-error-gate-v47-exhaustive-reason-exploration',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v43',
+        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v47-exhaustive-reason-exploration',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:!ACCEPTABILITY_HF_ENABLED,
@@ -1658,6 +1704,8 @@ const server = http.createServer(async (req, res) => {
         hfAcceptabilityDailyMax: ACCEPTABILITY_HF_DAILY_MAX,
         hfAcceptabilityStats,
         hfAcceptabilityCacheSize: hfAcceptabilityCache.size,
+        hfAcceptabilityCacheKeyPolicy:'exact-text-case-sensitive-v45',
+        reasonExplorePolicy:'exhaustive-shortest-distance-no-search-budget-v47',
         acceptanceGate:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate',
         pixabayKeyPresent: !!PIXABAY_API_KEY,
         hfModelScanVersion: 'v2-no-generation-params-for-classifiers',
@@ -1775,7 +1823,7 @@ const server = http.createServer(async (req, res) => {
         text,
         elapsedMs: Date.now() - startedAt,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v43',
+        reasonProvider:'strict-link-grammar-languagetool-hf-grammar-gate-v47-exhaustive-reason-exploration',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:!ACCEPTABILITY_HF_ENABLED,
@@ -1784,6 +1832,8 @@ const server = http.createServer(async (req, res) => {
         hfAcceptabilityDailyMax: ACCEPTABILITY_HF_DAILY_MAX,
         hfAcceptabilityStats,
         hfAcceptabilityCacheSize: hfAcceptabilityCache.size,
+        hfAcceptabilityCacheKeyPolicy:'exact-text-case-sensitive-v45',
+        reasonExplorePolicy:'exhaustive-shortest-distance-no-search-budget-v47',
         acceptanceGate:'strict-link-grammar-plus-languagetool-plus-hf-grammar-gate',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,

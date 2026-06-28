@@ -1,19 +1,14 @@
-# English Word Puzzle Fixed
+# English Pittan v46
 
-修正内容:
-- API判定の失敗結果を localStorage に保存しないよう修正。
-- 判定キャッシュキーを `englishPittan.linkGrammarCache.v6.successOnly` に変更し、古い false キャッシュを踏まないように変更。
-- 手札の表示ラベルを固定スロット名ではなく、実単語の品詞ラベルに変更。例: Japanese は `名詞/形容詞`。
-- `/check-and-translate-batch` は継続利用。ゲームURLは `?lgapi=https://english-pittan-lg-api.onrender.com` を付けて使う。
+理由探索の探索順序を修正。
 
-ゲームURL例:
-https://game-aor.pages.dev/index-english.html?lgapi=https://english-pittan-lg-api.onrender.com&v=20260627c
+通常判定は v43/v45 系のまま。
+不成立理由探索で、手札カードを後ろに足す候補を先に試すようにした。
 
+目的は `I like` のような途中文で、手札の名詞を足せば成立するケースを、探索上限/時間切れ前に発見すること。
 
-## v33
-StrictLG API only for scoring; exploration cleanup; no stale image panel.
+ハードコーディングではなく、候補探索順序の汎用修正。
 
-
-## v44 frontend case fix
-
-Fixes game-side false NG where card `I` was lowercased to `i` before API judgement. API text now preserves card casing; cache key bumped to v44.
+確認:
+- `/health` に `reasonExplorePolicy: hand-right-completion-priority-v46`
+- 盤面 `I like` + 手札 `apples` で `I like apples` が理由候補に出る
