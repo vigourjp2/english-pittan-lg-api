@@ -694,6 +694,80 @@ async function scanHfModels(text, modelFilter = '') {
 }
 
 
+function inferAcceptabilityFromHfSummary(summary) {
+  const labels = Array.isArray(summary?.labels) ? summary.labels : [];
+  const top = summary?.top || labels.slice().sort((a,b)=>(Number(b.score)||0)-(Number(a.score)||0))[0] || null;
+  const generated = String(summary?.generatedText || '').trim();
+  const hay = [top?.label, ...labels.map(x=>x?.label), generated].filter(Boolean).join(' ').toLowerCase();
+  const score = Number(top?.score || 0);
+  let acceptable = null;
+  let reason = 'unknown-output';
+
+  if (/\bunacceptable\b|\bnot acceptable\b|\bincorrect\b|\bungrammatical\b|\bbad\b|\berror\b/.test(hay)) {
+    acceptable = false; reason = 'negative-label';
+  } else if (/\bacceptable\b|\bcorrect\b|\bgrammatical\b|\bgood\b|\bok\b/.test(hay)) {
+    acceptable = true; reason = 'positive-label';
+  } else if (/\blabel_0\b/.test(hay)) {
+    acceptable = false; reason = 'label_0-assumed-unacceptable';
+  } else if (/\blabel_1\b/.test(hay)) {
+    acceptable = true; reason = 'label_1-assumed-acceptable';
+  }
+
+  return {
+    model: summary?.model || '',
+    ok: !!summary?.ok,
+    provider: summary?.provider || '',
+    kind: summary?.kind || '',
+    acceptable,
+    confidence: score || null,
+    reason,
+    top,
+    labels: labels.slice(0, 8),
+    generatedText: generated,
+    error: summary?.error || '',
+    attempts: summary?.attempts || undefined
+  };
+}
+
+async function diagnoseAcceptabilityWithModels(text, modelFilter = '') {
+  const src = normalizeText(text);
+  const parsed = await runLinkParser(src);
+  const lt = await languageToolErrorGate(src);
+  const baseAccept = localAcceptabilityFromLinkParserAndLt(src, parsed, lt);
+  const hfScan = await scanHfModels(src, modelFilter);
+  const modelJudgements = (hfScan.results || []).map(inferAcceptabilityFromHfSummary);
+  const usable = modelJudgements.filter(x => x.ok && x.acceptable !== null);
+  const rejected = usable.filter(x => x.acceptable === false);
+  const accepted = usable.filter(x => x.acceptable === true);
+  let preview = {
+    ok: !!(baseAccept.ok && baseAccept.gameOk !== false && baseAccept.type === 'complete_sentence'),
+    gate: baseAccept.gate,
+    reason: baseAccept.reason || baseAccept.noteJa || '',
+    note: 'HF acceptability models are diagnostic only in v42; /check is not changed by this endpoint.'
+  };
+  if (preview.ok && rejected.length > 0) {
+    preview = {
+      ok: false,
+      gate: 'acceptability-model-diagnostic-rejected',
+      reason: `acceptability diagnostic rejected by ${rejected[0].model}`,
+      rejectedBy: rejected.map(x => ({ model:x.model, confidence:x.confidence, reason:x.reason, top:x.top })).slice(0, 5),
+      note: 'diagnostic only: not yet used as the game gate'
+    };
+  }
+  return {
+    ok:true,
+    version:'v42-acceptability-diagnose-only',
+    text:src,
+    usedForCorrection:false,
+    linkGrammar:{ ok:strictLinkGrammarGameOk(parsed), fullParse:parsed.fullParse, strictLinkGrammar:parsed.strictLinkGrammar, linkages:parsed.linkages, nullCount:parsed.nullCount, code:parsed.code },
+    languageTool:lt,
+    baseGate:baseAccept,
+    hfDiagnostic:{ tokenPresent:!!HF_TOKEN, modelFilter:modelFilter || '', scanVersion:hfScan.version, count:hfScan.count, models:hfScan.models, judgements:modelJudgements, acceptedCount:accepted.length, rejectedCount:rejected.length, usableCount:usable.length },
+    finalGatePreview:preview
+  };
+}
+
+
 function strictLinkGrammarGameOk(parsed) {
   return !!(
     parsed &&
@@ -1114,7 +1188,7 @@ async function checkSentence(text, withTranslate = false, reasonMeta = {}) {
   }
   return {
     originalText, text: checkedText, normalized: proof.normalized, appliedCorrections: proof.appliedCorrections || [],
-    ok, gameOk, type, kind:'Strict Link Grammar + LanguageTool Error Gate + Clean Exploration Reason Queue v41',
+    ok, gameOk, type, kind:'Strict Link Grammar + LanguageTool Error Gate + Acceptability Diagnose v42',
     sentenceType: gameOk ? (acceptability.sentenceType || 'complete_sentence') : (acceptability.sentenceType || type),
     reason: gameOk ? '' : (acceptability.noteJa || acceptability.reason || reasonExplain?.explanationJa || reasonExplain?.explanationEn || ''),
     reasonSource: gameOk ? '' : (acceptability.languageToolBlocking ? 'languagetool-error-gate' : (reasonExplain?.ok ? reasonExplain.method : 'reason-job-pending')),
@@ -1442,11 +1516,11 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-plus-languagetool-error-gate-v41-no-autocorrect',
+        mode:'link-grammar-plus-languagetool-error-gate-v42-acceptability-diagnose',
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-languagetool-oracle-exploration-v41',
+        reasonProvider:'strict-link-grammar-languagetool-oracle-exploration-v42-diagnostic',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:true,
@@ -1506,6 +1580,11 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, await sentenceImageForText(text, { avoid:url.searchParams.get('avoid') || '' }));
     }
 
+    if (url.pathname === '/diagnose-acceptability' || url.pathname === '/diagnose-models') {
+      const text = await getTextFromReq(req, url);
+      if (!text) return send(res, 400, { ok:false, error:'empty text' });
+      return send(res, 200, await diagnoseAcceptabilityWithModels(text, url.searchParams.get('model') || ''));
+    }
     if (url.pathname === '/hf-model-scan' || url.pathname === '/hf-model-scan-v2') {
       const text = await getTextFromReq(req, url);
       if (!text) return send(res, 400, { ok:false, error:'empty text' });
@@ -1525,7 +1604,7 @@ const server = http.createServer(async (req, res) => {
         text,
         elapsedMs: Date.now() - startedAt,
         hfTokenPresent: !!HF_TOKEN,
-        reasonProvider:'strict-link-grammar-languagetool-oracle-exploration-v41',
+        reasonProvider:'strict-link-grammar-languagetool-oracle-exploration-v42-diagnostic',
         quotaFree:true,
         hfDisabledForReason:true,
         hfDisabledForAcceptability:true,
@@ -1610,4 +1689,4 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => console.log(`Strict Link Grammar + LanguageTool v41 No-Autocorrect API listening on ${PORT}`));
+server.listen(PORT, () => console.log(`Strict Link Grammar + LanguageTool v42 Acceptability Diagnose API listening on ${PORT}`));
