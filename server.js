@@ -2472,7 +2472,13 @@ body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-seri
     if (url.pathname === '/debug-judge' || url.pathname === '/judge-debug' || url.pathname === '/api-debug') {
       const out = await debugJudgeMatrix(url);
       if (out && out.__html) {
-        res.writeHead(200, { 'content-type':'text/html; charset=utf-8', 'cache-control':'no-store', ...corsHeaders });
+        res.writeHead(200, {
+          'content-type':'text/html; charset=utf-8',
+          'access-control-allow-origin': ALLOW_ORIGIN,
+          'access-control-allow-methods': 'GET,POST,OPTIONS',
+          'access-control-allow-headers': 'content-type',
+          'cache-control':'no-store'
+        });
         return res.end(out.__html);
       }
       return send(res, 200, out);
