@@ -77,7 +77,7 @@ const PHRASE_MAP = new Map();
 
 // Link Grammar Parser API連携。Cloudflare PagesだけではCライブラリを実行できないため、
 // 無料コンテナ等に置いたAPI URLを ?lgapi=https://... または localStorage で指定する。
-const IMAGE_INTEGRATION_VERSION='sentence-image-diversity-v44-case-preserve-frontend';
+const IMAGE_INTEGRATION_VERSION='sentence-image-v116-no-local-fragment-gate';
 // v101: 判定キャッシュは完全廃止。毎回ブラウザAPIへ確認する。
 const LINK_GRAMMAR_API_KEY='englishPittan.linkGrammarApi';
 let __storedLgApi=''; try{ __storedLgApi=localStorage.getItem(LINK_GRAMMAR_API_KEY)||''; }catch(e){ __storedLgApi=''; }
@@ -90,6 +90,12 @@ function clearEnglishJudgeCache(){
       if(k==='englishPittan.harperCache.v1' || k.startsWith('englishPittan.linkGrammarCache.')) localStorage.removeItem(k);
     });
   }catch(e){}
+}
+function isGameFragmentByCardPos(words){
+  // v116: local POS/word-shape fragment gate is intentionally disabled.
+  // Game judgement is delegated to the browser/API service result only.
+  // This function remains as a compatibility shim for existing call sites.
+  return false;
 }
 function evFromApiResult(data, words){
   const w=lowerWords(words);
@@ -533,6 +539,7 @@ async function hydrateJapaneseForMatches(matches){
 }
 function translateSequence(words,ev){ return ''; }
 
+let sentenceImageSeq=0;
 function sentenceImageCacheKey(sentence, jaText='') {
   return 'sentencePixabay:v7:' + norm([sentence || '']);
 }
@@ -591,6 +598,7 @@ function renderSentenceImageData(art, sentence, data){
   art.innerHTML=`<img src="${img}" alt="${esc(sentence)}" loading="lazy" referrerpolicy="no-referrer"><div class="sentenceImageCredit"><a href="${page}" target="_blank" rel="noopener">Pixabay</a> / ${tags}</div>`;
 }
 async function showSentenceGeneratedImage(matches, index=0) {
+  const myImageSeq=++sentenceImageSeq;
   const unique=[]; const seen=new Set();
   for(const m of (matches || [])){
     if(!m || !m.text) continue;
@@ -603,6 +611,7 @@ async function showSentenceGeneratedImage(matches, index=0) {
     seen.add(k); unique.push(m);
   }
   const m = unique[index] || unique[0];
+  if(myImageSeq!==sentenceImageSeq) return;
   if(!m){ const panel=$('sentenceImagePanel'); if(panel) panel.classList.remove('show'); return; }
   const panel=$('sentenceImagePanel'), title=$('sentenceImageTitle'), sub=$('sentenceImageSub'), art=$('sentenceImageArt');
   if(!panel || !title || !sub || !art) return;
@@ -614,6 +623,7 @@ async function showSentenceGeneratedImage(matches, index=0) {
   panel.classList.remove('show'); void panel.offsetWidth; panel.classList.add('show');
   const cached=sentenceImageCacheRead(cacheKey);
   if(cached && !sentenceImageIsRecentlyUsed(cached)){
+    if(myImageSeq!==sentenceImageSeq) return;
     renderSentenceImageData(art,sentence,cached);
     rememberSentenceImageId(cached.id);
     return;
@@ -621,6 +631,7 @@ async function showSentenceGeneratedImage(matches, index=0) {
   art.innerHTML='<div class="sentenceImageLoading">画像検索中...</div>';
   try{
     const data=await fetchSentenceImage(sentence);
+    if(myImageSeq!==sentenceImageSeq) return;
     if(data && data.ok && data.imageUrl){
       sentenceImageCacheWrite(cacheKey,data);
       renderSentenceImageData(art,sentence,data);
@@ -629,6 +640,7 @@ async function showSentenceGeneratedImage(matches, index=0) {
       art.innerHTML='<div class="sentenceImageFallback">画像が見つかりませんでした<br><small>'+esc(data?.query||data?.error||'')+'</small></div>';
     }
   }catch(e){
+    if(myImageSeq!==sentenceImageSeq) return;
     art.innerHTML='<div class="sentenceImageFallback">画像APIエラー<br><small>'+esc(String(e.message||e))+'</small></div>';
   }
 }
@@ -786,11 +798,9 @@ async function rescueAcceptedPrefixCandidates(routeCandidates, placeIndex){
       items.push({seg, words, text:displayEnglish(words), label:c.label});
     }
   }
-  // v108: 救済でもコンボを殺さない。
-  // 旧実装は短い候補から確認し、最初に1件OKが出た時点で break していた。
-  // そのため today 配置時に `like soccer today` が先に通ると、
-  // 同じ today を含む `I am happy today` / `I like soccer today` まで確認せずコンボ漏れした。
-  // 文そのもののハードコードではなく、今回置いたセルを含む候補だけを長い順にAPI確認し、OKを全部返す。
+  // v114: rescue must not kill combo chains.
+  // Keep only routes that include the newly placed cell, check longer routes first,
+  // and return every accepted result instead of stopping at the first accepted route.
   items.sort((a,b)=>b.words.length-a.words.length || a.seg[0].i-b.seg[0].i);
   const targets=items.slice(0,64);
   const acceptedKeys=new Set();
@@ -989,6 +999,9 @@ function highlightRoute(m,seq=0,duration=1600){
 
 function clearResultOverlays(){
   try{
+    // v113: invalidate any in-flight image popup from an older placement.
+    // Otherwise an old accepted fragment image can reappear beside a new NG message.
+    sentenceImageSeq++;
     const cp=$('comboPanel');
     if(cp){
       clearTimeout(cp._hideTimer);
@@ -997,6 +1010,9 @@ function clearResultOverlays(){
     }
     const ip=$('sentenceImagePanel');
     if(ip) ip.classList.remove('show');
+    const it=$('sentenceImageTitle'); if(it) it.textContent='';
+    const is=$('sentenceImageSub'); if(is) is.textContent='';
+    const ia=$('sentenceImageArt'); if(ia) ia.innerHTML='';
     routeFocusCells=[];
     failFocusCell=-1;
   }catch(e){ console.warn('clearResultOverlays failed', e); }
