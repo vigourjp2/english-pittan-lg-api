@@ -171,81 +171,15 @@ function reasonCandidateContext(){
   };
 }
 function fetchWithTimeout(url, options={}, timeoutMs=7500){
-  // v106: timeoutMs<=0 / Infinity means "do not abort".
-  // Heavy combo judging can legitimately take time on Render cold start or HF/API backlog.
-  // Do not cut a live judgement; show progress to the player instead.
-  const noTimeout = !Number.isFinite(timeoutMs) || Number(timeoutMs)<=0;
-  const ctrl = (!noTimeout && typeof AbortController!=='undefined') ? new AbortController() : null;
+  // v106: timeoutMs<=0 means no client-side abort.
+  // Used for the bulk combo judgement so late-but-valid API results are not discarded.
+  if(!Number.isFinite(Number(timeoutMs)) || Number(timeoutMs)<=0){
+    return fetch(url, options);
+  }
+  const ctrl = (typeof AbortController!=='undefined') ? new AbortController() : null;
   const timer = ctrl ? setTimeout(()=>{ try{ctrl.abort();}catch(e){} }, timeoutMs) : null;
   const opts = ctrl ? {...options, signal:ctrl.signal} : options;
   return fetch(url, opts).finally(()=>{ if(timer) clearTimeout(timer); });
-}
-
-let judgeProgressTimer=null;
-let judgeProgressStartedAt=0;
-let judgeProgressLast={phase:'', detail:'', total:0, checked:0};
-function ensureJudgeProgressUI(){
-  let box=document.getElementById('judgeProgressPanel');
-  if(box) return box;
-  const css=document.createElement('style');
-  css.id='judgeProgressStyle';
-  css.textContent=`
-    .judgeProgressPanel{position:fixed;left:50%;bottom:calc(18px + env(safe-area-inset-bottom));transform:translateX(-50%);z-index:90;width:min(560px,94vw);display:none;background:rgba(15,23,42,.97);border:2px solid rgba(56,189,248,.55);border-radius:18px;padding:12px;box-shadow:0 20px 70px rgba(0,0,0,.55),0 0 32px rgba(56,189,248,.22);color:#e0f2fe;pointer-events:none}
-    .judgeProgressPanel.show{display:block;animation:judgeProgressPop .18s ease both}
-    .judgeProgressTitle{font-size:15px;font-weight:1000;color:#fff;display:flex;justify-content:space-between;gap:8px;align-items:center}
-    .judgeProgressTitle small{font-size:11px;color:#bfdbfe;font-weight:900;white-space:nowrap}
-    .judgeProgressBar{margin-top:8px;height:10px;border-radius:999px;background:rgba(255,255,255,.12);overflow:hidden;border:1px solid rgba(255,255,255,.12)}
-    .judgeProgressBar i{display:block;height:100%;width:8%;border-radius:999px;background:linear-gradient(90deg,rgba(34,211,238,.95),rgba(59,130,246,.95));transition:width .25s ease}
-    .judgeProgressDetail{margin-top:7px;font-size:12px;line-height:1.45;color:#dbeafe;overflow-wrap:anywhere}
-    .judgeProgressHint{margin-top:5px;font-size:11px;line-height:1.35;color:#fde68a}
-    @keyframes judgeProgressPop{from{opacity:0;transform:translateX(-50%) translateY(8px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}`;
-  document.head.appendChild(css);
-  box=document.createElement('div');
-  box.id='judgeProgressPanel';
-  box.className='judgeProgressPanel';
-  box.innerHTML='<div class="judgeProgressTitle"><span id="judgeProgressTitle">API一括判定中</span><small id="judgeProgressElapsed">0秒</small></div><div class="judgeProgressBar"><i id="judgeProgressBar"></i></div><div class="judgeProgressDetail" id="judgeProgressDetail"></div><div class="judgeProgressHint" id="judgeProgressHint"></div>';
-  document.body.appendChild(box);
-  return box;
-}
-function showJudgeProgress(total=0, detail='候補を作成しています…'){
-  judgeProgressStartedAt=Date.now();
-  judgeProgressLast={phase:'候補作成', detail, total:Number(total)||0, checked:0};
-  const box=ensureJudgeProgressUI();
-  box.classList.add('show');
-  updateJudgeProgress(judgeProgressLast);
-  clearInterval(judgeProgressTimer);
-  judgeProgressTimer=setInterval(()=>updateJudgeProgress(judgeProgressLast),1000);
-}
-function updateJudgeProgress(info={}){
-  judgeProgressLast={...judgeProgressLast, ...info};
-  const box=ensureJudgeProgressUI();
-  const elapsed=Math.max(0,Math.floor((Date.now()-(judgeProgressStartedAt||Date.now()))/1000));
-  const total=Number(judgeProgressLast.total)||0;
-  const checked=Number(judgeProgressLast.checked)||0;
-  let pct=total>0 ? Math.max(6,Math.min(96,Math.round((checked/total)*100))) : 12;
-  const phase=judgeProgressLast.phase||'API一括判定中';
-  const detail=judgeProgressLast.detail||'';
-  const title=document.getElementById('judgeProgressTitle');
-  const elapsedEl=document.getElementById('judgeProgressElapsed');
-  const bar=document.getElementById('judgeProgressBar');
-  const det=document.getElementById('judgeProgressDetail');
-  const hint=document.getElementById('judgeProgressHint');
-  if(title) title.textContent=phase;
-  if(elapsedEl) elapsedEl.textContent=elapsed+'秒';
-  if(bar) bar.style.width=pct+'%';
-  if(det) det.textContent=detail || (total?`候補 ${checked}/${total} 件を確認中…`:'候補を確認中…');
-  if(hint){
-    if(elapsed>=60) hint.textContent='まだ待機中です。大量コンボ・Render起動直後・外部API混雑時は長くなります。判定は切らず、返答を待っています。';
-    else if(elapsed>=30) hint.textContent='30秒を超えましたが、仮配置は取り消しません。古い判定として捨てず、このまま結果を待ちます。';
-    else hint.textContent='候補をまとめてAPIへ送信中。コンボ漏れを防ぐため、途中で打ち切りません。';
-  }
-  try{ setMsg(`${phase}… ${elapsed}秒 / ${total?`候補${total}件`:''} ${elapsed>=30?'まだ待機中':''}`,'info'); }catch(e){}
-}
-function hideJudgeProgress(delay=600){
-  clearInterval(judgeProgressTimer);
-  judgeProgressTimer=null;
-  const box=document.getElementById('judgeProgressPanel');
-  if(box){ setTimeout(()=>box.classList.remove('show'),delay); }
 }
 async function singleApiCheckItem(base, item){
   const res=await fetchWithTimeout(base+'/check-and-translate',{
@@ -263,7 +197,7 @@ async function singleApiCheckItem(base, item){
       reasonDisabled:true,
       ...reasonCandidateContext()
     })
-  }, 0);
+  }, 7500);
   if(!res.ok) throw new Error('HTTP '+res.status);
   const data=await res.json();
   return data;
@@ -275,11 +209,10 @@ async function singleApiCheckText(text, seq=0){
   const base=linkGrammarApi.replace(/\/$/,'');
   return singleApiCheckItem(base,{text:displayEnglish(words),words,reasonPriorityEpoch:Date.now(),reasonPrioritySeq:seq});
 }
-async function batchApiCheckItems(base, items, reasonPriorityEpoch, onProgress=null){
-  // v106: タイムアウトで切らない。候補数・経過秒・現在フェーズをプレイヤーへ表示する。
-  // APIが遅い時に途中で捨てるとコンボ漏れになるため、fetch自体はabortしない。
-  const total=Array.isArray(items)?items.length:0;
-  if(onProgress) onProgress({phase:'API一括判定中', detail:`候補 ${total} 件をAPIへ送信しています…`, total, checked:Math.max(1,Math.floor(total*.08))});
+async function batchApiCheckItems(base, items, reasonPriorityEpoch){
+  // v85: 盤面候補を1件ずつ /check-and-translate へ直列送信しない。
+  // 1候補7.5秒×複数候補で12秒watchdogを踏むのがゲーム崩壊の主因だった。
+  // batchは成立判定だけ。翻訳/理由jobは後追いにして、1手の待ち時間を最小化する。
   const res=await fetchWithTimeout(base+'/check-and-translate-batch',{
     method:'POST',
     headers:{'content-type':'application/json'},
@@ -296,12 +229,10 @@ async function batchApiCheckItems(base, items, reasonPriorityEpoch, onProgress=n
       ...reasonCandidateContext()
     })
   }, 0);
-  if(onProgress) onProgress({phase:'API応答処理中', detail:'APIから返答が来ました。成立候補を整理しています…', total, checked:Math.max(total-1,1)});
   if(!res.ok) throw new Error('HTTP '+res.status);
   const data=await res.json();
   const arr=Array.isArray(data?.results)?data.results:[];
   const byId=new Map(arr.map(x=>[String(x.id),x]));
-  if(onProgress) onProgress({phase:'コンボ集計中', detail:`判定結果 ${arr.length}/${total} 件を盤面ルートへ戻しています…`, total, checked:total});
   return items.map((item,i)=>byId.get(String(item.id ?? i)) || null);
 }
 async function evaluateCandidatesByApi(routeCandidates){
@@ -329,22 +260,17 @@ async function evaluateCandidatesByApi(routeCandidates){
   if(!pending.length){ if(out.length) lastScanRejects=[]; else lastScanRejects=(lastScanRejects||[]).slice(0,1); return out; }
 
   try{
-    linkGrammarStatus='CHECK';
-    showJudgeProgress(pending.length, `盤面ルートから重複を除き、判定候補 ${pending.length} 件を作成しました。`);
-    renderSafe();
+    linkGrammarStatus='CHECK'; renderSafe();
     const base=linkGrammarApi.replace(/\/$/,'');
 
     let batchResults=[];
     try{
-      batchResults=await batchApiCheckItems(base,pending,reasonPriorityEpoch,updateJudgeProgress);
+      batchResults=await batchApiCheckItems(base,pending,reasonPriorityEpoch);
     }catch(e){
       // v85: batchが404/一時失敗の古いAPIでも遊べるよう、最後の保険だけ直列fallback。
       // 通常経路ではここへ来ない。reason jobは作らない。
       console.warn('batch judge failed; fallback to single checks', e);
-      updateJudgeProgress({phase:'個別判定へ切替中', detail:'一括APIが失敗したため、候補を1件ずつ確認します。時間はかかりますが打ち切りません。', total:pending.length, checked:0});
-      for(let pi=0; pi<pending.length; pi++){
-        const item=pending[pi];
-        updateJudgeProgress({phase:'個別判定中', detail:`候補 ${pi+1}/${pending.length}: ${item.text}`, total:pending.length, checked:pi});
+      for(const item of pending){
         try{ batchResults.push(await singleApiCheckItem(base,item)); }
         catch(err){ batchResults.push({reason:'API一時未応答', type:'api_error'}); }
       }
@@ -419,8 +345,8 @@ async function evaluateCandidatesByApi(routeCandidates){
     }
 
     scheduleReasonPolling(600);
-    linkGrammarStatus='ON'; hideJudgeProgress(); renderSafe();
-  }catch(e){console.warn('English API failed',e); linkGrammarStatus='ERR'; updateJudgeProgress({phase:'API判定エラー', detail:String(e?.message||e)}); hideJudgeProgress(2200); renderSafe();}
+    linkGrammarStatus='ON'; renderSafe();
+  }catch(e){console.warn('English API failed',e); linkGrammarStatus='ERR'; renderSafe();}
   return out;
 }
 
@@ -953,7 +879,6 @@ async function scanFromCell(placeIndex){
     if(seenCand.has(k)) continue;
     seenCand.add(k); uniq.push(c);
   }
-  showJudgeProgress(uniq.length, `盤面から ${uniq.length} 件の候補ルートを見つけました。重複除去後、外部APIへ確認します。`);
   let apiMatches=await evaluateCandidatesByApi(uniq);
   // v100: 成立0なら、古いNGキャッシュ/バッチ経路漏れを疑ってprefixを単体APIで再確認する。
   // `I am hungry today` がNGでも、prefixの `I am hungry` がOKならここで救済する。
@@ -1733,20 +1658,10 @@ async function placeTile(cellIndex){
       return false;
     }
   }
-  // v106: 判定が遅くてもタイムアウトで切らない。
-  // 30秒を超えたら進捗説明を強めるだけ。仮配置は保持し、APIの正式結果を待つ。
+  // v106: combo judgement timeout removed.
+  // Do not advance placementJudgeSeq or rollback after 30s; wait for the API result and score all returned combos.
   let placementTimedOut=false;
-  const placementStartedAt=Date.now();
-  let placementLockTimer=setInterval(()=>{
-    if(placementJudgeBusy && myJudgeSeq===placementJudgeSeq){
-      const sec=Math.floor((Date.now()-placementStartedAt)/1000);
-      if(sec>=30){
-        linkGrammarStatus='CHECK';
-        updateJudgeProgress({phase:'判定待機中', detail:`${sec}秒待機中。大量候補・外部API混雑・Render起動直後の可能性があります。コンボ漏れ防止のため、仮配置を戻さず結果を待っています。`});
-        renderSafe();
-      }
-    }
-  },5000);
+  let placementLockTimer=null;
   // v93: 新しい配置を始めたら、前回の成立コンボ/画像/経路ハイライトを必ず閉じる。
   // 採点前やNGになった時に古いGOOD表示が残って矛盾しないようにする。
   clearResultOverlays();
@@ -1766,7 +1681,7 @@ async function placeTile(cellIndex){
   // v14: 万一、古い非同期判定が後から戻ってきても画面・点数へ反映しない。
   if(myJudgeSeq!==placementJudgeSeq){
     console.warn('stale placeTile result ignored', {myJudgeSeq, placementJudgeSeq, placementTimedOut});
-    try{ clearInterval(placementLockTimer); }catch(e){}
+    try{ clearTimeout(placementLockTimer); }catch(e){}
     // v84: timeout後に古いAPI結果が返ってきても、点数・ターン・盤面へ絶対反映しない。
     // タイムアウト時点でrollback済みだが、未実行ならここでも保険で取り消す。
     if(placementTimedOut) rollbackTimedOutPlacement('古い判定結果を破棄しました。仮配置は取り消し済みです。');
@@ -1871,7 +1786,7 @@ async function placeTile(cellIndex){
   selectedHandIndex=-1;
   // v90: ここより下の broadcast/render/setMsg で例外が出ても操作ロックを残さない。
   // selectable 表示もこの後の render で正しく出るよう、描画前にbusyを解除する。
-  try{ clearInterval(placementLockTimer); }catch(e){}
+  try{ clearTimeout(placementLockTimer); }catch(e){}
   placementJudgeBusy=false;
   try{
     broadcast({type:'englishPlace',gameId:state.gameId,state:lightState(),cellIndex,by:clientId});
