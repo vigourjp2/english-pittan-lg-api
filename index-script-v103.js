@@ -18,7 +18,7 @@ try{
 }catch(e){ console.error('early start bind failed', e); }
 try{
 
-const APP_VERSION='v101-no-browser-judge-cache';
+const APP_VERSION='v108-place-card-combo-rescue';
 const $ = id => document.getElementById(id);
 const WS_URL = 'wss://mine-server-git2.vigourjp2.workers.dev/room/english';
 const N = 7;
@@ -445,7 +445,7 @@ function slotInfo(i,w){
 const targets = Array.from(EXACT.keys()).slice(0,24);
 let state = freshState(2);
 function freshState(playerCount=2){
-  return {version:1,gameId:'eng-'+Date.now().toString(36),turn:0,turnNo:1,playerCount,wordsMade:0,board:Array.from({length:N*N},()=>null),players:Array.from({length:playerCount},(_,i)=>({name:'Player '+(i+1),score:0,tiles:0,color:COLORS[i],hand:drawHand(i)})),log:[{t:Date.now(),text:'新規ゲーム開始',good:true}],statusText:'単語タイルを選んで空きマスに置く',statusClass:'info',lastJudgeMsg:'',lastJudgeClass:'info'};
+  return {version:1,gameId:'eng-'+Date.now().toString(36),turn:0,turnNo:1,playerCount,wordsMade:0,scoredRouteKeys:[],board:Array.from({length:N*N},()=>null),players:Array.from({length:playerCount},(_,i)=>({name:'Player '+(i+1),score:0,tiles:0,color:COLORS[i],hand:drawHand(i)})),log:[{t:Date.now(),text:'新規ゲーム開始',good:true}],statusText:'単語タイルを選んで空きマスに置く',statusClass:'info',lastJudgeMsg:'',lastJudgeClass:'info'};
 }
 function drawHand(seed=0){
   // 詰み対策：種類ごとの固定スロットで、常に「主語 / be・助 / 動詞 / 形容詞・ing / 名詞 / 追加」を1枚ずつ持つ。
@@ -786,18 +786,33 @@ async function rescueAcceptedPrefixCandidates(routeCandidates, placeIndex){
       items.push({seg, words, text:displayEnglish(words), label:c.label});
     }
   }
-  // 短い完成文を優先して救済する。NG理由を出すより先に、現在APIの正答を拾う。
-  items.sort((a,b)=>a.words.length-b.words.length || a.seg[0].i-b.seg[0].i);
-  for(const item of items.slice(0,32)){
-    try{
-      const data=await singleApiCheckItem(base,{text:item.text, words:item.words, wordMeta:wordMetaForApi(item.words), reasonPriorityEpoch:Date.now(), reasonPrioritySeq:0});
-      const ev=evFromApiResult(data,item.words);
-      if(ev){
-        out.push({...ev,cells:item.seg.map(s=>s.i),dir:item.label||'prefix-rescue',source:'api-prefix-rescue-v100'});
-      }
-    }catch(e){ console.warn('prefix rescue check failed', item.text, e); }
-    if(out.length) break;
+  // v108: 救済でもコンボを殺さない。
+  // 旧実装は短い候補から確認し、最初に1件OKが出た時点で break していた。
+  // そのため today 配置時に `like soccer today` が先に通ると、
+  // 同じ today を含む `I am happy today` / `I like soccer today` まで確認せずコンボ漏れした。
+  // 文そのもののハードコードではなく、今回置いたセルを含む候補だけを長い順にAPI確認し、OKを全部返す。
+  items.sort((a,b)=>b.words.length-a.words.length || a.seg[0].i-b.seg[0].i);
+  const targets=items.slice(0,64);
+  const acceptedKeys=new Set();
+  const concurrency=4;
+  let next=0;
+  async function worker(){
+    while(next<targets.length){
+      const item=targets[next++];
+      try{
+        const data=await singleApiCheckItem(base,{text:item.text, words:item.words, wordMeta:wordMetaForApi(item.words), reasonPriorityEpoch:Date.now(), reasonPrioritySeq:0});
+        const ev=evFromApiResult(data,item.words);
+        if(ev){
+          const k=item.seg.map(s=>s.i).join(',')+'|'+norm(item.words);
+          if(!acceptedKeys.has(k)){
+            acceptedKeys.add(k);
+            out.push({...ev,cells:item.seg.map(s=>s.i),dir:item.label||'prefix-rescue',source:'api-prefix-rescue-v108'});
+          }
+        }
+      }catch(e){ console.warn('prefix rescue check failed', item.text, e); }
+    }
   }
+  await Promise.all(Array.from({length:Math.min(concurrency,targets.length)}, worker));
   if(out.length){
     lastScanRejects=[];
   }
@@ -913,6 +928,29 @@ function selectScoringMatches(matches){
     String(a.text||'').localeCompare(String(b.text||''))
   );
 }
+
+function routeScoreKeyFromParts(cells, wordsOrText){
+  const cellsKey=(cells||[]).map(x=>String(x)).join(',');
+  const words=Array.isArray(wordsOrText) ? wordsOrText : String(wordsOrText||'').split(/\s+/).filter(Boolean);
+  return cellsKey+'|'+norm(words);
+}
+function routeScoreKey(m){
+  return routeScoreKeyFromParts(m?.cells||[], String(m?.text||'').split(/\s+/).filter(Boolean));
+}
+function scoredRouteSet(){
+  if(!Array.isArray(state.scoredRouteKeys)) state.scoredRouteKeys=[];
+  return new Set(state.scoredRouteKeys.map(String));
+}
+function rememberScoredRoutes(scoring){
+  if(!Array.isArray(state.scoredRouteKeys)) state.scoredRouteKeys=[];
+  const set=new Set(state.scoredRouteKeys.map(String));
+  for(const m of (scoring||[])){
+    const k=routeScoreKey(m);
+    if(k) set.add(k);
+  }
+  state.scoredRouteKeys=[...set].slice(-600);
+}
+
 function summarizeScoring(scoring){
   const groups=new Map();
   for(const m of scoring){
@@ -1628,7 +1666,8 @@ async function placeTile(cellIndex){
     scores:state.players.map(p=>p.score),
     tiles:state.players.map(p=>p.tiles),
     lastJudgeMsg:state.lastJudgeMsg||'',
-    lastJudgeClass:state.lastJudgeClass||'info'
+    lastJudgeClass:state.lastJudgeClass||'info',
+    scoredRouteKeys:Array.isArray(state.scoredRouteKeys)?state.scoredRouteKeys.slice():[]
   };
   function rollbackTimedOutPlacement(reasonText){
     try{
@@ -1641,6 +1680,7 @@ async function placeTile(cellIndex){
       state.turn=snap.turn;
       state.turnNo=snap.turnNo;
       state.wordsMade=snap.wordsMade;
+      state.scoredRouteKeys=Array.isArray(snap.scoredRouteKeys)?snap.scoredRouteKeys.slice():[];
       state.players.forEach((pl,i)=>{ if(Number.isFinite(snap.scores[i])) pl.score=snap.scores[i]; if(Number.isFinite(snap.tiles[i])) pl.tiles=snap.tiles[i]; });
       recentCells=[];
       routeFocusCells=[];
@@ -1693,7 +1733,10 @@ async function placeTile(cellIndex){
   let gained=1;
   if(made.length){
     failFocusCell=-1;
-    const scoring=selectScoringMatches(made);
+    let scoring=selectScoringMatches(made).filter(m=>!scoredRouteSet().has(routeScoreKey(m)));
+    if(!scoring.length){
+      made=[];
+    }else{
     await hydrateJapaneseForMatches(scoring);
     const {groups,comboInfo}=summarizeScoring(scoring);
     const useDelta=new Map();
@@ -1736,7 +1779,10 @@ async function placeTile(cellIndex){
     // 成功時に別NG候補を表示/理由解析すると、成功と失敗が混ざってゲームが崩壊して見えるため。
     lastScanRejects=[];
     lastReasonDisplayContext=null;
-  }else{
+    rememberScoredRoutes(scoring);
+    }
+  }
+  if(!made.length){
     // v88: 成立0でも即NG/罰点にしない。
     // まず「手札を1〜2枚続ければ英文として成立する作りかけ」かを、API batchで軽く確認する。
     // 例: I / I like / I am は採点前として盤面に残し、罰点なし。完全NGの時だけTOP1理由解析と罰点。
@@ -1855,7 +1901,7 @@ function recalcTiles(){state.players.forEach(p=>p.tiles=0);state.board.forEach(c
 function lightState(){return JSON.parse(JSON.stringify(state));}
 function applyState(s,why='同期'){
   if(!s||!Array.isArray(s.board)||!Array.isArray(s.players))return;
-  state=s;selectedHandIndex=-1;recentCells=[];failFocusCell=-1;recalcTiles();setMsg(why,'good');render();
+  state=s;if(!Array.isArray(state.scoredRouteKeys))state.scoredRouteKeys=[];selectedHandIndex=-1;recentCells=[];failFocusCell=-1;recalcTiles();setMsg(why,'good');render();
 }
 function passTurn(){const p=currentPlayer();addLog(`${p.name}: パス`,false);nextTurn();broadcast({type:'englishState',gameId:state.gameId,state:lightState(),reason:'pass'});render();}
 function swapHand(){const p=currentPlayer();p.hand=drawHand(99);p.handMeta=[];p.score=Math.max(0,p.score-5);addLog(`${p.name}: 手札入替 -5`,false);nextTurn();broadcast({type:'englishState',gameId:state.gameId,state:lightState(),reason:'swap'});render();}
