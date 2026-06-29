@@ -910,27 +910,54 @@ async function evaluateGameTextLightForReason(text, options = {}) {
   };
 }
 
+let __linkParserSeq = 0;
+
 function runLinkParser(text) {
   return new Promise((resolve) => {
     const args = ['en', '-batch', '-verbosity=0', '-graphics=0', '-null=0', '-islands-ok=0', '-spell=0'];
+    const lpId = ++__linkParserSeq;
     const lpStartedAt = Date.now();
     const lpInput = terminalSentence(text);
     const lpMemStart = process.memoryUsage();
     console.log('[link-parser-start]', {
+      id: lpId,
       len: lpInput.length,
       text: lpInput.slice(0, 160),
       rssMB: Math.round(lpMemStart.rss / 1024 / 1024),
       heapUsedMB: Math.round(lpMemStart.heapUsed / 1024 / 1024)
     });
+
+    const beforeSpawnAt = Date.now();
     const p = spawn('link-parser', args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    const spawnReturnMs = Date.now() - beforeSpawnAt;
+    const pid = p.pid || null;
+
     let out = '';
     let err = '';
-    p.stdout.on('data', d => out += d.toString());
-    p.stderr.on('data', d => err += d.toString());
+    let firstStdoutMs = null;
+    let firstStderrMs = null;
+    let wroteMs = null;
+    let endedMs = null;
+
+    p.stdout.on('data', d => {
+      if (firstStdoutMs === null) firstStdoutMs = Date.now() - lpStartedAt;
+      out += d.toString();
+    });
+    p.stderr.on('data', d => {
+      if (firstStderrMs === null) firstStderrMs = Date.now() - lpStartedAt;
+      err += d.toString();
+    });
     p.on('error', e => {
       const lpMemEnd = process.memoryUsage();
       console.log('[link-parser-end]', {
+        id: lpId,
+        pid,
         ms: Date.now() - lpStartedAt,
+        spawnReturnMs,
+        wroteMs,
+        endedMs,
+        firstStdoutMs,
+        firstStderrMs,
         ok: false,
         code: -1,
         error: String(e.message || e).slice(0, 300),
@@ -946,7 +973,14 @@ function runLinkParser(text) {
       const ok = !hardError && linkages > 0;
       const lpMemEnd = process.memoryUsage();
       console.log('[link-parser-end]', {
+        id: lpId,
+        pid,
         ms: Date.now() - lpStartedAt,
+        spawnReturnMs,
+        wroteMs,
+        endedMs,
+        firstStdoutMs,
+        firstStderrMs,
         ok,
         code,
         linkages,
@@ -967,7 +1001,9 @@ function runLinkParser(text) {
       });
     });
     p.stdin.write(lpInput + '\n');
+    wroteMs = Date.now() - lpStartedAt;
     p.stdin.end();
+    endedMs = Date.now() - lpStartedAt;
   });
 }
 
