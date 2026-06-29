@@ -913,12 +913,30 @@ async function evaluateGameTextLightForReason(text, options = {}) {
 function runLinkParser(text) {
   return new Promise((resolve) => {
     const args = ['en', '-batch', '-verbosity=0', '-graphics=0', '-null=0', '-islands-ok=0', '-spell=0'];
+    const lpStartedAt = Date.now();
+    const lpInput = terminalSentence(text);
+    const lpMemStart = process.memoryUsage();
+    console.log('[link-parser-start]', {
+      len: lpInput.length,
+      text: lpInput.slice(0, 160),
+      rssMB: Math.round(lpMemStart.rss / 1024 / 1024),
+      heapUsedMB: Math.round(lpMemStart.heapUsed / 1024 / 1024)
+    });
     const p = spawn('link-parser', args, { stdio: ['pipe', 'pipe', 'pipe'] });
     let out = '';
     let err = '';
     p.stdout.on('data', d => out += d.toString());
     p.stderr.on('data', d => err += d.toString());
     p.on('error', e => {
+      const lpMemEnd = process.memoryUsage();
+      console.log('[link-parser-end]', {
+        ms: Date.now() - lpStartedAt,
+        ok: false,
+        code: -1,
+        error: String(e.message || e).slice(0, 300),
+        rssMB: Math.round(lpMemEnd.rss / 1024 / 1024),
+        heapUsedMB: Math.round(lpMemEnd.heapUsed / 1024 / 1024)
+      });
       resolve({ ok:false, fullParse:false, strictLinkGrammar:false, linkages:0, nullCount:0, stdout:'', stderr:String(e.message || e), code:-1 });
     });
     p.on('close', code => {
@@ -926,6 +944,17 @@ function runLinkParser(text) {
       const m = out.match(/Found\s+(\d+)\s+linkages/i);
       const linkages = m ? Number(m[1]) : (hardError ? 0 : 1);
       const ok = !hardError && linkages > 0;
+      const lpMemEnd = process.memoryUsage();
+      console.log('[link-parser-end]', {
+        ms: Date.now() - lpStartedAt,
+        ok,
+        code,
+        linkages,
+        stdoutBytes: out.length,
+        stderrBytes: err.length,
+        rssMB: Math.round(lpMemEnd.rss / 1024 / 1024),
+        heapUsedMB: Math.round(lpMemEnd.heapUsed / 1024 / 1024)
+      });
       resolve({
         ok,
         fullParse: ok,
@@ -937,7 +966,7 @@ function runLinkParser(text) {
         code
       });
     });
-    p.stdin.write(terminalSentence(text) + '\n');
+    p.stdin.write(lpInput + '\n');
     p.stdin.end();
   });
 }
