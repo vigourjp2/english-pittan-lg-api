@@ -23,7 +23,7 @@ const ACCEPTABILITY_HF_SECONDARY_ENABLED = !/^false|0|off$/i.test(String(process
 const ACCEPTABILITY_HF_SECONDARY_MODEL = process.env.ACCEPTABILITY_HF_SECONDARY_MODEL || 'textattack/roberta-base-CoLA';
 const ACCEPTABILITY_HF_SECONDARY_REJECT_MIN_CONF = Math.max(0, Math.min(1, Number(process.env.ACCEPTABILITY_HF_SECONDARY_REJECT_MIN_CONF || 0.70)));
 const ACCEPTABILITY_HF_FAIL_CLOSED = /^true|1|on$/i.test(String(process.env.ACCEPTABILITY_HF_FAIL_CLOSED || 'false')); // unavailable external model fails open unless explicitly requested
-const LOCAL_POS_SEMANTIC_GATE_ENABLED = /^true|1|on$/i.test(String(process.env.LOCAL_POS_SEMANTIC_GATE_ENABLED || 'false')); // v105: local POS semantic gate is disabled by default. Game judgement is API/service based.
+const LOCAL_POS_SEMANTIC_GATE_ENABLED = /^true|1|on$/i.test(String(process.env.LOCAL_POS_SEMANTIC_GATE_ENABLED || 'false')); // v103: default off. Do not reject sentences by hand-written JS/POS patterns.
 const ACCEPTABILITY_HF_DAILY_MAX = Math.max(0, Number(process.env.ACCEPTABILITY_HF_DAILY_MAX || 80));
 const ACCEPTABILITY_HF_CACHE_MAX = Math.max(100, Number(process.env.ACCEPTABILITY_HF_CACHE_MAX || 2000));
 
@@ -629,8 +629,59 @@ function wordMetaFromMapForWords(words, diagnostics = {}) {
 function hasMetaPos(m, pos) { return Array.isArray(m?.pos) && m.pos.includes(pos); }
 function hasAnyMetaPos(m, poses) { return Array.isArray(m?.pos) && poses.some(p => m.pos.includes(p)); }
 function applyGameSemanticGate(text, acceptability, options = {}) {
-  // v105: No local JS/POS grammar veto here.
-  // Game judgement is kept to services: Link Grammar + LanguageTool + external acceptability API.
+  // v103: Do not use hand-written JS/POS grammar rules as the game judge.
+  // The final game gate is Link Grammar + LanguageTool + external acceptability API.
+  // This hook remains only for explicit local debugging when LOCAL_POS_SEMANTIC_GATE_ENABLED=true.
+  if (!LOCAL_POS_SEMANTIC_GATE_ENABLED) return acceptability;
+  if (!(acceptability?.ok && acceptability?.gameOk !== false && acceptability?.type === 'complete_sentence')) return acceptability;
+  const meta = normalizeWordMetaList(options.wordMeta);
+  if (!meta.length) return acceptability;
+  const rejectByPos = (kind, displayKind, noteJa, noteEn) => ({
+    ok:false,
+    gameOk:false,
+    type:kind,
+    method:(acceptability.method || 'strict-link-grammar-plus-languagetool') + '+game-semantic-pos-gate',
+    reason:noteEn || noteJa || kind,
+    sentenceType:'not_complete_sentence',
+    utteranceType:kind,
+    displayKind,
+    jaHint:'',
+    noteJa,
+    noteEn,
+    gate:'game-semantic-pos-metadata-gate-v98',
+    hfUsed:false,
+    languageToolBlocking:false,
+    semanticGateSource:'client-word-pos-metadata',
+    baseAcceptability:acceptability
+  });
+
+  const timeWords = meta.filter(m => m.pos.includes('advTime')).map(m => m.w);
+  if (timeWords.length >= 2) {
+    return rejectByPos(
+      'semantic_overlap',
+      '時間表現の重複',
+      `advTimeカード（${timeWords.join(' / ')}）が重複しています。ゲームの成立候補としては扱いません。`,
+      `Redundant advTime cards: ${timeWords.join(', ')}`
+    );
+  }
+
+  // v98: 単語名ではなくカードのposメタデータだけを見る。
+  // 先頭が ing/ving で、その後ろが独立した finite clause に見える候補は、
+  // 「eating I am hungry today」のような、補完候補として不自然な前置き断片を落とす。
+  // これは eating/hungry/I などの個別語ハードコードではない。
+  if (meta.length >= 3 && hasAnyMetaPos(meta[0], ['ving','ing'])) {
+    const tail = meta.slice(1);
+    const tailStartsWithSubject = hasAnyMetaPos(tail[0], ['subj','pron']);
+    const tailHasFinite = tail.slice(1).some(m => hasAnyMetaPos(m, ['be','bePast','modal','verb','verbWant']));
+    if (tailStartsWithSubject && tailHasFinite) {
+      return rejectByPos(
+        'dangling_ing_before_clause',
+        'ing断片の前置き',
+        'ingカードが、すでに主語＋定動詞を持つ文の前に断片として付いています。ゲームの成立候補としては扱いません。',
+        'A leading ing card is attached before an independent finite clause.'
+      );
+    }
+  }
   return acceptability;
 }
 async function hfAcceptabilityGate(text) {
@@ -1909,92 +1960,51 @@ async function checkSentenceBatch(req) {
     if (!seen.has(key)) seen.set(key, item);
   }
   const items = [...seen.values()];
-  const baseRows = Array(items.length).fill(null);
-  const concurrency = Math.max(1, Math.min(Number(process.env.BATCH_CONCURRENCY || 10), 16));
+  const results = [];
+  const concurrency = Math.max(1, Math.min(Number(process.env.BATCH_CONCURRENCY || 8), 12));
   let next = 0;
-
-  async function baseWorker() {
+  async function worker() {
     while (next < items.length) {
-      const ix = next++;
-      const item = items[ix];
+      const item = items[next++];
       try {
-        const originalText = normalizeText(item.text);
-        const parsed = await runLinkParser(originalText);
-        let ltGate = null;
-        if (strictLinkGrammarGameOk(parsed)) ltGate = await languageToolErrorGate(originalText);
-        const baseAcceptability = applyGameSemanticGate(
-          originalText,
-          localAcceptabilityFromLinkParserAndLt(originalText, parsed, ltGate),
-          { wordMeta:item.wordMeta }
-        );
-        baseRows[ix] = { item, originalText, parsed, ltGate, acceptability:baseAcceptability };
+        const checked = await checkSentence(item.text, j.translate !== false && j.withTranslate !== false, { reasonPriorityEpoch: j.reasonPriorityEpoch || j.reasonEpoch || Date.now(), reasonPrioritySeq: Number(item.id || 0), words:item.words, wordMeta:item.wordMeta, reasonBoardCandidates:j.reasonBoardCandidates || j.boardCandidates || [], reasonHandCandidates:j.reasonHandCandidates || j.handCandidates || [], reasonDeckCandidates:j.reasonDeckCandidates || j.reasonCandidates || j.deckCandidates || [], strictGameGate: j.strictGameGate === true || j.acceptabilityModelGate === true, acceptabilityModelGate: j.acceptabilityModelGate === true, reasonDisabled: j.reasonDisabled===true || j.disableReasonJob===true || j.reasonMode==='none' });
+        const accept = checked.acceptability || {};
+        const type = accept.type || (checked.gameOk ? 'complete_sentence' : (checked.fullParse ? 'fragment' : 'invalid'));
+        const gameOk = !!(checked.ok && checked.gameOk && (accept.gameOk !== false) && type === 'complete_sentence');
+        results.push({
+          id: item.id,
+          words: item.words,
+          originalText: checked.originalText,
+          text: String(checked.text || item.text).replace(/[.!?]$/,''),
+          ok: !!checked.ok,
+          gameOk,
+          validEnglish: !!checked.ok,
+          type,
+          sentenceType: checked.sentenceType || accept.sentenceType || type,
+          kind: checked.kind || 'API判定',
+          reason: checked.reason || checked.reasonExplain?.explanationJa || checked.reasonExplain?.explanationEn || '',
+          reasonSource: checked.reasonSource || checked.reasonExplain?.method || '',
+          reasonStatus: checked.reasonStatus || '',
+          reasonJobId: checked.reasonJobId || '',
+          reasonExplain: checked.reasonExplain || null,
+          ja: gameOk ? (checked.ja || checked.translation?.ja || '') : '',
+          fullParse: checked.fullParse,
+          strictLinkGrammar: checked.strictLinkGrammar,
+          linkages: checked.linkages,
+          nullCount: checked.nullCount,
+          normalized: checked.normalized,
+          appliedCorrections: checked.appliedCorrections || []
+        });
       } catch (e) {
-        baseRows[ix] = { item, originalText:item.text, error:String(e.message || e), acceptability:{ ok:false, gameOk:false, type:'error', reason:String(e.message || e), sentenceType:'error' } };
+        results.push({ id:item.id, words:item.words, text:item.text, ok:false, gameOk:false, validEnglish:false, type:'error', reason:String(e.message || e), ja:'' });
       }
     }
   }
-  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, baseWorker));
-
-  // v104: batchではHF外部判定を1候補ずつ呼ばない。まとめて呼び、26秒watchdogでコンボ漏れする主因を潰す。
-  const hfTargets = [];
-  const hfIndexes = [];
-  if (ACCEPTABILITY_HF_GAME_GATE_ENABLED) {
-    for (let i = 0; i < baseRows.length; i++) {
-      const a = baseRows[i]?.acceptability;
-      if (a?.ok && a.gameOk !== false && a.type === 'complete_sentence') {
-        hfTargets.push(baseRows[i].originalText);
-        hfIndexes.push(i);
-      }
-    }
-  }
-  if (hfTargets.length) {
-    const hfRows = await hfAcceptabilityGateBatch(hfTargets);
-    for (let k = 0; k < hfIndexes.length; k++) {
-      const ix = hfIndexes[k];
-      baseRows[ix].hfAcceptability = hfRows[k] || null;
-      baseRows[ix].acceptability = applyHfAcceptabilityToLocalAcceptability(baseRows[ix].acceptability, baseRows[ix].hfAcceptability);
-    }
-  }
-
-  const results = baseRows.map((row, i) => {
-    const item = row?.item || items[i] || { id:String(i), words:[], text:'' };
-    const accept = row?.acceptability || {};
-    const parsed = row?.parsed || {};
-    const originalText = normalizeText(row?.originalText || item.text);
-    const ok = !!accept.ok;
-    const type = accept.type || (ok ? 'complete_sentence' : (parsed.fullParse ? 'fragment' : 'invalid'));
-    const gameOk = !!(ok && accept.gameOk !== false && type === 'complete_sentence');
-    return {
-      id: item.id,
-      words: item.words,
-      originalText,
-      text: String(originalText || item.text).replace(/[.!?]$/,''),
-      ok,
-      gameOk,
-      validEnglish: ok,
-      type,
-      sentenceType: gameOk ? (accept.sentenceType || 'complete_sentence') : (accept.sentenceType || type),
-      kind: (ACCEPTABILITY_HF_GAME_GATE_ENABLED || j.strictGameGate === true || j.acceptabilityModelGate === true) ? 'Strict Link Grammar + LanguageTool + external acceptability API gate v105 batch' : 'Strict Link Grammar + LanguageTool Gate v105 batch',
-      reason: gameOk ? '' : (accept.noteJa || accept.reason || row?.error || ''),
-      reasonSource: gameOk ? '' : (accept.languageToolBlocking ? 'languagetool-error-gate' : (accept.hfUsed ? 'hf-grammar-classifier-gate' : (accept.gate || 'batch-game-gate'))),
-      reasonStatus: 'none',
-      reasonJobId: '',
-      reasonExplain: null,
-      ja: '',
-      fullParse: !!parsed.fullParse,
-      strictLinkGrammar: !!parsed.strictLinkGrammar,
-      linkages: Number(parsed.linkages || 0),
-      nullCount: Number(parsed.nullCount || 0),
-      normalized: false,
-      appliedCorrections: [],
-      acceptability: accept,
-      languageTool: row?.ltGate || null,
-      hfAcceptability: row?.hfAcceptability || null
-    };
-  });
-  return { ok:true, count:results.length, results, batchMode:'v105-parallel-linkgrammar-lt-plus-hf-batch-no-local-pos-gate' };
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
+  const order = new Map(items.map((x,i)=>[x.id,i]));
+  results.sort((a,b)=>(order.get(a.id)??0)-(order.get(b.id)??0));
+  return { ok:true, count:results.length, results };
 }
-
 
 
 function sentenceImageNorm(text) {
@@ -2374,115 +2384,6 @@ async function diagnoseCustomBenchmark(url) {
   };
 }
 
-
-async function debugJudgeMatrix(url) {
-  const rawTexts = [];
-  for (const t of url.searchParams.getAll('text')) if (String(t||'').trim()) rawTexts.push(String(t));
-  const packed = url.searchParams.get('texts') || url.searchParams.get('samples') || '';
-  if (packed) rawTexts.push(...String(packed).split('||'));
-  const texts = [...new Set(rawTexts.map(t => normalizeText(t)).filter(Boolean))].slice(0, 20);
-  const finalTexts = texts.length ? texts : [
-    'I am Japanese',
-    'I am happy today',
-    'I like English',
-    'I like soccer today',
-    'like soccer today',
-    'happy today'
-  ];
-  const rows = [];
-  for (const text of finalTexts) {
-    const row = { text };
-    try {
-      const parsed = await runLinkParser(text);
-      row.linkTest = {
-        ok: strictLinkGrammarGameOk(parsed),
-        fullParse: parsed.fullParse,
-        strictLinkGrammar: parsed.strictLinkGrammar,
-        linkages: parsed.linkages,
-        nullCount: parsed.nullCount,
-        code: parsed.code,
-        stderr: parsed.stderr || ''
-      };
-    } catch (e) { row.linkTest = { ok:false, error:String(e.message || e) }; }
-    try {
-      const proof = await proofreadEnglish(text);
-      row.proof = {
-        ok: proof.ok,
-        corrected: proof.corrected || proof.text || '',
-        normalized: proof.normalized,
-        matchesCount: proof.matchesCount,
-        appliedCorrections: proof.appliedCorrections || [],
-        note: proof.note || ''
-      };
-    } catch (e) { row.proof = { ok:false, error:String(e.message || e) }; }
-    try {
-      row.acceptability = await diagnoseAcceptabilityWithModels(text, url.searchParams.get('model') || '', true);
-    } catch (e) { row.acceptability = { ok:false, error:String(e.message || e) }; }
-    try {
-      row.final = await checkSentence(text, true, { reasonDisabled:true, reasonMode:'none', judgeSource:'manual-debug-judge-matrix' });
-    } catch (e) { row.final = { ok:false, error:String(e.message || e) }; }
-    rows.push(row);
-  }
-  const payload = {
-    ok:true,
-    endpoint:'/debug-judge',
-    note:'Open this URL in a browser. It compares Link Grammar, LanguageTool proof, HF acceptability scan, and final game check for each text.',
-    env:{
-      hfTokenPresent: !!HF_TOKEN,
-      acceptabilityHfEnabled: ACCEPTABILITY_HF_ENABLED,
-      acceptabilityHfGameGateEnabled: ACCEPTABILITY_HF_GAME_GATE_ENABLED,
-      acceptabilityHfModel: ACCEPTABILITY_HF_MODEL,
-      acceptabilityHfSecondaryEnabled: ACCEPTABILITY_HF_SECONDARY_ENABLED,
-      acceptabilityHfSecondaryModel: ACCEPTABILITY_HF_SECONDARY_MODEL,
-      acceptabilityHfFailClosed: ACCEPTABILITY_HF_FAIL_CLOSED
-    },
-    rows
-  };
-  const asJson = url.searchParams.get('format') === 'json' || url.searchParams.get('json') === '1';
-  if (asJson) return payload;
-  const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-  const yn = v => v === true ? 'OK' : v === false ? 'NG' : '—';
-  const summarizeAcc = acc => {
-    const r = (acc && acc.results && acc.results[0]) || {};
-    const rej = (r.rejectedBy || []).map(x => `${x.model}:${x.confidence ?? ''}`).join('<br>');
-    const acp = (r.acceptedBy || []).map(x => `${x.model}:${x.confidence ?? ''}`).join('<br>');
-    const una = (r.unavailable || []).map(x => `${x.model}:${esc(x.error || x.reason || '')}`).join('<br>');
-    return `<b>accepted</b><br>${acp || '—'}<hr><b>rejected</b><br>${rej || '—'}<hr><b>unavailable</b><br>${una || '—'}`;
-  };
-  const trs = rows.map(r => `<tr>
-<td><b>${esc(r.text)}</b></td>
-<td class="${r.linkTest?.ok?'ok':'ng'}">${yn(r.linkTest?.ok)}<br><small>full:${esc(r.linkTest?.fullParse)} linkages:${esc(r.linkTest?.linkages)} null:${esc(r.linkTest?.nullCount)}</small></td>
-<td class="${r.proof?.ok?'ok':'ng'}">${yn(r.proof?.ok)}<br><small>${esc(r.proof?.corrected || '')}<br>matches:${esc(r.proof?.matchesCount)}</small></td>
-<td>${summarizeAcc(r.acceptability)}</td>
-<td class="${(r.final?.gameOk ?? r.final?.ok)?'ok':'ng'}">${yn(r.final?.gameOk ?? r.final?.ok)}<br><small>${esc(r.final?.kind || '')}<br>${esc(r.final?.reason || r.final?.error || '')}</small></td>
-</tr>`).join('\n');
-  const html = `<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>English Pittan API Judge Debug</title><style>
-body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#08111f;color:#eaf2ff;margin:16px}h1{font-size:20px}table{border-collapse:collapse;width:100%;font-size:13px}th,td{border:1px solid #31435f;padding:8px;vertical-align:top}th{background:#14233a;position:sticky;top:0}.ok{background:#07351f}.ng{background:#451620;color:#ffd7df}small{color:#c8d8ee}code{background:#111d31;padding:2px 4px;border-radius:4px}hr{border:0;border-top:1px solid #31435f}</style></head><body>
-<h1>English Pittan API Judge Debug</h1>
-<p>1画面で <code>Link Grammar</code> / <code>LanguageTool proof</code> / <code>HF acceptability</code> / <code>Final game check</code> を比較。</p>
-<p>HF game gate: <b>${esc(ACCEPTABILITY_HF_GAME_GATE_ENABLED)}</b> / HF token: <b>${esc(!!HF_TOKEN)}</b></p>
-<table><thead><tr><th>text</th><th>link-test</th><th>proof</th><th>HF acceptability scan</th><th>final check</th></tr></thead><tbody>${trs}</tbody></table>
-<details><summary>raw JSON</summary><pre>${esc(JSON.stringify(payload,null,2))}</pre></details>
-</body></html>`;
-  return { __html: html };
-}
-
-
-
-    if (url.pathname === '/debug-judge' || url.pathname === '/judge-debug' || url.pathname === '/api-debug') {
-      const out = await debugJudgeMatrix(url);
-      if (out && out.__html) {
-        res.writeHead(200, {
-          'content-type':'text/html; charset=utf-8',
-          'access-control-allow-origin': ALLOW_ORIGIN,
-          'access-control-allow-methods': 'GET,POST,OPTIONS',
-          'access-control-allow-headers': 'content-type',
-          'cache-control':'no-store'
-        });
-        return res.end(out.__html);
-      }
-      return send(res, 200, out);
-    }
 
     if (url.pathname === '/sentence-image') {
       const text = url.searchParams.get('q') || url.searchParams.get('text') || '';
