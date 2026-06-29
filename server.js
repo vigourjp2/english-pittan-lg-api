@@ -1947,6 +1947,16 @@ async function checkSentenceBatch(req) {
   const items = [...seen.values()];
   const results = [];
   const concurrency = Math.max(1, Math.min(Number(process.env.BATCH_CONCURRENCY || 64), 512));
+  const startedAt = Date.now();
+  const memStart = process.memoryUsage();
+  console.log('[batch-start]', {
+    input: input.length,
+    unique: items.length,
+    concurrency,
+    env: process.env.BATCH_CONCURRENCY || null,
+    rssMB: Math.round(memStart.rss / 1024 / 1024),
+    heapUsedMB: Math.round(memStart.heapUsed / 1024 / 1024)
+  });
   let next = 0;
   async function worker() {
     while (next < items.length) {
@@ -1988,6 +1998,15 @@ async function checkSentenceBatch(req) {
   await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
   const order = new Map(items.map((x,i)=>[x.id,i]));
   results.sort((a,b)=>(order.get(a.id)??0)-(order.get(b.id)??0));
+  const memEnd = process.memoryUsage();
+  console.log('[batch-end]', {
+    input: input.length,
+    unique: items.length,
+    concurrency,
+    ms: Date.now() - startedAt,
+    rssMB: Math.round(memEnd.rss / 1024 / 1024),
+    heapUsedMB: Math.round(memEnd.heapUsed / 1024 / 1024)
+  });
   return { ok:true, count:results.length, results };
 }
 
