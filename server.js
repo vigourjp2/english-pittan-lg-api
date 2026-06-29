@@ -23,7 +23,7 @@ const ACCEPTABILITY_HF_SECONDARY_ENABLED = !/^false|0|off$/i.test(String(process
 const ACCEPTABILITY_HF_SECONDARY_MODEL = process.env.ACCEPTABILITY_HF_SECONDARY_MODEL || 'textattack/roberta-base-CoLA';
 const ACCEPTABILITY_HF_SECONDARY_REJECT_MIN_CONF = Math.max(0, Math.min(1, Number(process.env.ACCEPTABILITY_HF_SECONDARY_REJECT_MIN_CONF || 0.70)));
 const ACCEPTABILITY_HF_FAIL_CLOSED = /^true|1|on$/i.test(String(process.env.ACCEPTABILITY_HF_FAIL_CLOSED || 'false')); // unavailable external model fails open unless explicitly requested
-const LOCAL_POS_SEMANTIC_GATE_ENABLED = /^true|1|on$/i.test(String(process.env.LOCAL_POS_SEMANTIC_GATE_ENABLED || 'false')); // v103: default off. Do not reject sentences by hand-written JS/POS patterns.
+const LOCAL_POS_SEMANTIC_GATE_ENABLED = /^true|1|on$/i.test(String(process.env.LOCAL_POS_SEMANTIC_GATE_ENABLED || 'false')); // v105: local POS semantic gate is disabled by default. Game judgement is API/service based.
 const ACCEPTABILITY_HF_DAILY_MAX = Math.max(0, Number(process.env.ACCEPTABILITY_HF_DAILY_MAX || 80));
 const ACCEPTABILITY_HF_CACHE_MAX = Math.max(100, Number(process.env.ACCEPTABILITY_HF_CACHE_MAX || 2000));
 
@@ -629,59 +629,8 @@ function wordMetaFromMapForWords(words, diagnostics = {}) {
 function hasMetaPos(m, pos) { return Array.isArray(m?.pos) && m.pos.includes(pos); }
 function hasAnyMetaPos(m, poses) { return Array.isArray(m?.pos) && poses.some(p => m.pos.includes(p)); }
 function applyGameSemanticGate(text, acceptability, options = {}) {
-  // v103: Do not use hand-written JS/POS grammar rules as the game judge.
-  // The final game gate is Link Grammar + LanguageTool + external acceptability API.
-  // This hook remains only for explicit local debugging when LOCAL_POS_SEMANTIC_GATE_ENABLED=true.
-  if (!LOCAL_POS_SEMANTIC_GATE_ENABLED) return acceptability;
-  if (!(acceptability?.ok && acceptability?.gameOk !== false && acceptability?.type === 'complete_sentence')) return acceptability;
-  const meta = normalizeWordMetaList(options.wordMeta);
-  if (!meta.length) return acceptability;
-  const rejectByPos = (kind, displayKind, noteJa, noteEn) => ({
-    ok:false,
-    gameOk:false,
-    type:kind,
-    method:(acceptability.method || 'strict-link-grammar-plus-languagetool') + '+game-semantic-pos-gate',
-    reason:noteEn || noteJa || kind,
-    sentenceType:'not_complete_sentence',
-    utteranceType:kind,
-    displayKind,
-    jaHint:'',
-    noteJa,
-    noteEn,
-    gate:'game-semantic-pos-metadata-gate-v98',
-    hfUsed:false,
-    languageToolBlocking:false,
-    semanticGateSource:'client-word-pos-metadata',
-    baseAcceptability:acceptability
-  });
-
-  const timeWords = meta.filter(m => m.pos.includes('advTime')).map(m => m.w);
-  if (timeWords.length >= 2) {
-    return rejectByPos(
-      'semantic_overlap',
-      '時間表現の重複',
-      `advTimeカード（${timeWords.join(' / ')}）が重複しています。ゲームの成立候補としては扱いません。`,
-      `Redundant advTime cards: ${timeWords.join(', ')}`
-    );
-  }
-
-  // v98: 単語名ではなくカードのposメタデータだけを見る。
-  // 先頭が ing/ving で、その後ろが独立した finite clause に見える候補は、
-  // 「eating I am hungry today」のような、補完候補として不自然な前置き断片を落とす。
-  // これは eating/hungry/I などの個別語ハードコードではない。
-  if (meta.length >= 3 && hasAnyMetaPos(meta[0], ['ving','ing'])) {
-    const tail = meta.slice(1);
-    const tailStartsWithSubject = hasAnyMetaPos(tail[0], ['subj','pron']);
-    const tailHasFinite = tail.slice(1).some(m => hasAnyMetaPos(m, ['be','bePast','modal','verb','verbWant']));
-    if (tailStartsWithSubject && tailHasFinite) {
-      return rejectByPos(
-        'dangling_ing_before_clause',
-        'ing断片の前置き',
-        'ingカードが、すでに主語＋定動詞を持つ文の前に断片として付いています。ゲームの成立候補としては扱いません。',
-        'A leading ing card is attached before an independent finite clause.'
-      );
-    }
-  }
+  // v105: No local JS/POS grammar veto here.
+  // Game judgement is kept to services: Link Grammar + LanguageTool + external acceptability API.
   return acceptability;
 }
 async function hfAcceptabilityGate(text) {
@@ -1960,51 +1909,92 @@ async function checkSentenceBatch(req) {
     if (!seen.has(key)) seen.set(key, item);
   }
   const items = [...seen.values()];
-  const results = [];
-  const concurrency = Math.max(1, Math.min(Number(process.env.BATCH_CONCURRENCY || 8), 12));
+  const baseRows = Array(items.length).fill(null);
+  const concurrency = Math.max(1, Math.min(Number(process.env.BATCH_CONCURRENCY || 10), 16));
   let next = 0;
-  async function worker() {
+
+  async function baseWorker() {
     while (next < items.length) {
-      const item = items[next++];
+      const ix = next++;
+      const item = items[ix];
       try {
-        const checked = await checkSentence(item.text, j.translate !== false && j.withTranslate !== false, { reasonPriorityEpoch: j.reasonPriorityEpoch || j.reasonEpoch || Date.now(), reasonPrioritySeq: Number(item.id || 0), words:item.words, wordMeta:item.wordMeta, reasonBoardCandidates:j.reasonBoardCandidates || j.boardCandidates || [], reasonHandCandidates:j.reasonHandCandidates || j.handCandidates || [], reasonDeckCandidates:j.reasonDeckCandidates || j.reasonCandidates || j.deckCandidates || [], strictGameGate: j.strictGameGate === true || j.acceptabilityModelGate === true, acceptabilityModelGate: j.acceptabilityModelGate === true, reasonDisabled: j.reasonDisabled===true || j.disableReasonJob===true || j.reasonMode==='none' });
-        const accept = checked.acceptability || {};
-        const type = accept.type || (checked.gameOk ? 'complete_sentence' : (checked.fullParse ? 'fragment' : 'invalid'));
-        const gameOk = !!(checked.ok && checked.gameOk && (accept.gameOk !== false) && type === 'complete_sentence');
-        results.push({
-          id: item.id,
-          words: item.words,
-          originalText: checked.originalText,
-          text: String(checked.text || item.text).replace(/[.!?]$/,''),
-          ok: !!checked.ok,
-          gameOk,
-          validEnglish: !!checked.ok,
-          type,
-          sentenceType: checked.sentenceType || accept.sentenceType || type,
-          kind: checked.kind || 'API判定',
-          reason: checked.reason || checked.reasonExplain?.explanationJa || checked.reasonExplain?.explanationEn || '',
-          reasonSource: checked.reasonSource || checked.reasonExplain?.method || '',
-          reasonStatus: checked.reasonStatus || '',
-          reasonJobId: checked.reasonJobId || '',
-          reasonExplain: checked.reasonExplain || null,
-          ja: gameOk ? (checked.ja || checked.translation?.ja || '') : '',
-          fullParse: checked.fullParse,
-          strictLinkGrammar: checked.strictLinkGrammar,
-          linkages: checked.linkages,
-          nullCount: checked.nullCount,
-          normalized: checked.normalized,
-          appliedCorrections: checked.appliedCorrections || []
-        });
+        const originalText = normalizeText(item.text);
+        const parsed = await runLinkParser(originalText);
+        let ltGate = null;
+        if (strictLinkGrammarGameOk(parsed)) ltGate = await languageToolErrorGate(originalText);
+        const baseAcceptability = applyGameSemanticGate(
+          originalText,
+          localAcceptabilityFromLinkParserAndLt(originalText, parsed, ltGate),
+          { wordMeta:item.wordMeta }
+        );
+        baseRows[ix] = { item, originalText, parsed, ltGate, acceptability:baseAcceptability };
       } catch (e) {
-        results.push({ id:item.id, words:item.words, text:item.text, ok:false, gameOk:false, validEnglish:false, type:'error', reason:String(e.message || e), ja:'' });
+        baseRows[ix] = { item, originalText:item.text, error:String(e.message || e), acceptability:{ ok:false, gameOk:false, type:'error', reason:String(e.message || e), sentenceType:'error' } };
       }
     }
   }
-  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
-  const order = new Map(items.map((x,i)=>[x.id,i]));
-  results.sort((a,b)=>(order.get(a.id)??0)-(order.get(b.id)??0));
-  return { ok:true, count:results.length, results };
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, baseWorker));
+
+  // v104: batchではHF外部判定を1候補ずつ呼ばない。まとめて呼び、26秒watchdogでコンボ漏れする主因を潰す。
+  const hfTargets = [];
+  const hfIndexes = [];
+  if (ACCEPTABILITY_HF_GAME_GATE_ENABLED) {
+    for (let i = 0; i < baseRows.length; i++) {
+      const a = baseRows[i]?.acceptability;
+      if (a?.ok && a.gameOk !== false && a.type === 'complete_sentence') {
+        hfTargets.push(baseRows[i].originalText);
+        hfIndexes.push(i);
+      }
+    }
+  }
+  if (hfTargets.length) {
+    const hfRows = await hfAcceptabilityGateBatch(hfTargets);
+    for (let k = 0; k < hfIndexes.length; k++) {
+      const ix = hfIndexes[k];
+      baseRows[ix].hfAcceptability = hfRows[k] || null;
+      baseRows[ix].acceptability = applyHfAcceptabilityToLocalAcceptability(baseRows[ix].acceptability, baseRows[ix].hfAcceptability);
+    }
+  }
+
+  const results = baseRows.map((row, i) => {
+    const item = row?.item || items[i] || { id:String(i), words:[], text:'' };
+    const accept = row?.acceptability || {};
+    const parsed = row?.parsed || {};
+    const originalText = normalizeText(row?.originalText || item.text);
+    const ok = !!accept.ok;
+    const type = accept.type || (ok ? 'complete_sentence' : (parsed.fullParse ? 'fragment' : 'invalid'));
+    const gameOk = !!(ok && accept.gameOk !== false && type === 'complete_sentence');
+    return {
+      id: item.id,
+      words: item.words,
+      originalText,
+      text: String(originalText || item.text).replace(/[.!?]$/,''),
+      ok,
+      gameOk,
+      validEnglish: ok,
+      type,
+      sentenceType: gameOk ? (accept.sentenceType || 'complete_sentence') : (accept.sentenceType || type),
+      kind: (ACCEPTABILITY_HF_GAME_GATE_ENABLED || j.strictGameGate === true || j.acceptabilityModelGate === true) ? 'Strict Link Grammar + LanguageTool + external acceptability API gate v105 batch' : 'Strict Link Grammar + LanguageTool Gate v105 batch',
+      reason: gameOk ? '' : (accept.noteJa || accept.reason || row?.error || ''),
+      reasonSource: gameOk ? '' : (accept.languageToolBlocking ? 'languagetool-error-gate' : (accept.hfUsed ? 'hf-grammar-classifier-gate' : (accept.gate || 'batch-game-gate'))),
+      reasonStatus: 'none',
+      reasonJobId: '',
+      reasonExplain: null,
+      ja: '',
+      fullParse: !!parsed.fullParse,
+      strictLinkGrammar: !!parsed.strictLinkGrammar,
+      linkages: Number(parsed.linkages || 0),
+      nullCount: Number(parsed.nullCount || 0),
+      normalized: false,
+      appliedCorrections: [],
+      acceptability: accept,
+      languageTool: row?.ltGate || null,
+      hfAcceptability: row?.hfAcceptability || null
+    };
+  });
+  return { ok:true, count:results.length, results, batchMode:'v105-parallel-linkgrammar-lt-plus-hf-batch-no-local-pos-gate' };
 }
+
 
 
 function sentenceImageNorm(text) {
