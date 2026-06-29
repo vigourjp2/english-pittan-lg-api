@@ -1946,7 +1946,7 @@ async function checkSentenceBatch(req) {
   }
   const items = [...seen.values()];
   const results = [];
-  const concurrency = Math.max(1, Math.min(Number(process.env.BATCH_CONCURRENCY || 8), 12));
+  const concurrency = Math.max(1, Math.min(Number(process.env.BATCH_CONCURRENCY || 64), 512));
   let next = 0;
   async function worker() {
     while (next < items.length) {
