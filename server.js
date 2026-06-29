@@ -2375,6 +2375,109 @@ async function diagnoseCustomBenchmark(url) {
 }
 
 
+async function debugJudgeMatrix(url) {
+  const rawTexts = [];
+  for (const t of url.searchParams.getAll('text')) if (String(t||'').trim()) rawTexts.push(String(t));
+  const packed = url.searchParams.get('texts') || url.searchParams.get('samples') || '';
+  if (packed) rawTexts.push(...String(packed).split('||'));
+  const texts = [...new Set(rawTexts.map(t => normalizeText(t)).filter(Boolean))].slice(0, 20);
+  const finalTexts = texts.length ? texts : [
+    'I am Japanese',
+    'I am happy today',
+    'I like English',
+    'I like soccer today',
+    'like soccer today',
+    'happy today'
+  ];
+  const rows = [];
+  for (const text of finalTexts) {
+    const row = { text };
+    try {
+      const parsed = await runLinkParser(text);
+      row.linkTest = {
+        ok: strictLinkGrammarGameOk(parsed),
+        fullParse: parsed.fullParse,
+        strictLinkGrammar: parsed.strictLinkGrammar,
+        linkages: parsed.linkages,
+        nullCount: parsed.nullCount,
+        code: parsed.code,
+        stderr: parsed.stderr || ''
+      };
+    } catch (e) { row.linkTest = { ok:false, error:String(e.message || e) }; }
+    try {
+      const proof = await proofreadEnglish(text);
+      row.proof = {
+        ok: proof.ok,
+        corrected: proof.corrected || proof.text || '',
+        normalized: proof.normalized,
+        matchesCount: proof.matchesCount,
+        appliedCorrections: proof.appliedCorrections || [],
+        note: proof.note || ''
+      };
+    } catch (e) { row.proof = { ok:false, error:String(e.message || e) }; }
+    try {
+      row.acceptability = await diagnoseAcceptabilityWithModels(text, url.searchParams.get('model') || '', true);
+    } catch (e) { row.acceptability = { ok:false, error:String(e.message || e) }; }
+    try {
+      row.final = await checkSentence(text, true, { reasonDisabled:true, reasonMode:'none', judgeSource:'manual-debug-judge-matrix' });
+    } catch (e) { row.final = { ok:false, error:String(e.message || e) }; }
+    rows.push(row);
+  }
+  const payload = {
+    ok:true,
+    endpoint:'/debug-judge',
+    note:'Open this URL in a browser. It compares Link Grammar, LanguageTool proof, HF acceptability scan, and final game check for each text.',
+    env:{
+      hfTokenPresent: !!HF_TOKEN,
+      acceptabilityHfEnabled: ACCEPTABILITY_HF_ENABLED,
+      acceptabilityHfGameGateEnabled: ACCEPTABILITY_HF_GAME_GATE_ENABLED,
+      acceptabilityHfModel: ACCEPTABILITY_HF_MODEL,
+      acceptabilityHfSecondaryEnabled: ACCEPTABILITY_HF_SECONDARY_ENABLED,
+      acceptabilityHfSecondaryModel: ACCEPTABILITY_HF_SECONDARY_MODEL,
+      acceptabilityHfFailClosed: ACCEPTABILITY_HF_FAIL_CLOSED
+    },
+    rows
+  };
+  const asJson = url.searchParams.get('format') === 'json' || url.searchParams.get('json') === '1';
+  if (asJson) return payload;
+  const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const yn = v => v === true ? 'OK' : v === false ? 'NG' : '—';
+  const summarizeAcc = acc => {
+    const r = (acc && acc.results && acc.results[0]) || {};
+    const rej = (r.rejectedBy || []).map(x => `${x.model}:${x.confidence ?? ''}`).join('<br>');
+    const acp = (r.acceptedBy || []).map(x => `${x.model}:${x.confidence ?? ''}`).join('<br>');
+    const una = (r.unavailable || []).map(x => `${x.model}:${esc(x.error || x.reason || '')}`).join('<br>');
+    return `<b>accepted</b><br>${acp || '—'}<hr><b>rejected</b><br>${rej || '—'}<hr><b>unavailable</b><br>${una || '—'}`;
+  };
+  const trs = rows.map(r => `<tr>
+<td><b>${esc(r.text)}</b></td>
+<td class="${r.linkTest?.ok?'ok':'ng'}">${yn(r.linkTest?.ok)}<br><small>full:${esc(r.linkTest?.fullParse)} linkages:${esc(r.linkTest?.linkages)} null:${esc(r.linkTest?.nullCount)}</small></td>
+<td class="${r.proof?.ok?'ok':'ng'}">${yn(r.proof?.ok)}<br><small>${esc(r.proof?.corrected || '')}<br>matches:${esc(r.proof?.matchesCount)}</small></td>
+<td>${summarizeAcc(r.acceptability)}</td>
+<td class="${(r.final?.gameOk ?? r.final?.ok)?'ok':'ng'}">${yn(r.final?.gameOk ?? r.final?.ok)}<br><small>${esc(r.final?.kind || '')}<br>${esc(r.final?.reason || r.final?.error || '')}</small></td>
+</tr>`).join('\n');
+  const html = `<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>English Pittan API Judge Debug</title><style>
+body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#08111f;color:#eaf2ff;margin:16px}h1{font-size:20px}table{border-collapse:collapse;width:100%;font-size:13px}th,td{border:1px solid #31435f;padding:8px;vertical-align:top}th{background:#14233a;position:sticky;top:0}.ok{background:#07351f}.ng{background:#451620;color:#ffd7df}small{color:#c8d8ee}code{background:#111d31;padding:2px 4px;border-radius:4px}hr{border:0;border-top:1px solid #31435f}</style></head><body>
+<h1>English Pittan API Judge Debug</h1>
+<p>1画面で <code>Link Grammar</code> / <code>LanguageTool proof</code> / <code>HF acceptability</code> / <code>Final game check</code> を比較。</p>
+<p>HF game gate: <b>${esc(ACCEPTABILITY_HF_GAME_GATE_ENABLED)}</b> / HF token: <b>${esc(!!HF_TOKEN)}</b></p>
+<table><thead><tr><th>text</th><th>link-test</th><th>proof</th><th>HF acceptability scan</th><th>final check</th></tr></thead><tbody>${trs}</tbody></table>
+<details><summary>raw JSON</summary><pre>${esc(JSON.stringify(payload,null,2))}</pre></details>
+</body></html>`;
+  return { __html: html };
+}
+
+
+
+    if (url.pathname === '/debug-judge' || url.pathname === '/judge-debug' || url.pathname === '/api-debug') {
+      const out = await debugJudgeMatrix(url);
+      if (out && out.__html) {
+        res.writeHead(200, { 'content-type':'text/html; charset=utf-8', 'cache-control':'no-store', ...corsHeaders });
+        return res.end(out.__html);
+      }
+      return send(res, 200, out);
+    }
+
     if (url.pathname === '/sentence-image') {
       const text = url.searchParams.get('q') || url.searchParams.get('text') || '';
       if (!text) return send(res, 400, { ok:false, error:'missing q' });
