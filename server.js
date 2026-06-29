@@ -88,18 +88,9 @@ function isNonRetryableReasonError(err) {
 
 
 function withReasonTimeout(promise, timeoutMs, label) {
-  let timer = null;
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => {
-      timer = setTimeout(() => {
-        const err = new Error(`${label || 'reason operation'} timed out after ${timeoutMs}ms`);
-        err.retryable = false;
-        err.reasonTimeout = true;
-        reject(err);
-      }, timeoutMs);
-    })
-  ]).finally(() => { if (timer) clearTimeout(timer); });
+  // v104: サーバ側の理由/判定処理タイムアウトを撤廃。
+  // 旧実装は Promise.race で遅い外部I/Oを失敗扱いにし、batch結果に error を混ぜていた。
+  return promise;
 }
 
 function expireStaleRunningReasonJobs() {
@@ -429,25 +420,21 @@ async function getTextFromReq(req, url) {
   return normalizeText(text);
 }
 
-async function fetchTextWithTimeout(url, options = {}, timeoutMs = 10000) {
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), timeoutMs);
-  try {
-    const r = await fetch(url, { ...options, signal: ac.signal });
-    const raw = await r.text();
-    if (!r.ok) {
-      let body = null;
-      try { body = raw ? JSON.parse(raw) : null; } catch { body = raw; }
-      const msg = body?.error?.message || body?.error || body?.message || raw || `HTTP ${r.status}`;
-      const e = new Error(msg);
-      e.status = r.status;
-      e.body = body;
-      throw e;
-    }
-    return raw;
-  } finally {
-    clearTimeout(timer);
+async function fetchTextWithTimeout(url, options = {}, timeoutMs = 0) {
+  // v104: API判定経路のfetchタイムアウトを撤廃。
+  // 関数名は互換維持。timeoutMsは受け取るがAbortには使わない。
+  const r = await fetch(url, options);
+  const raw = await r.text();
+  if (!r.ok) {
+    let body = null;
+    try { body = raw ? JSON.parse(raw) : null; } catch { body = raw; }
+    const msg = body?.error?.message || body?.error || body?.message || raw || `HTTP ${r.status}`;
+    const e = new Error(msg);
+    e.status = r.status;
+    e.body = body;
+    throw e;
   }
+  return raw;
 }
 
 async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 10000) {
@@ -925,19 +912,16 @@ async function evaluateGameTextLightForReason(text, options = {}) {
 
 function runLinkParser(text) {
   return new Promise((resolve) => {
-    const args = ['en', '-batch', '-verbosity=0', '-graphics=0', '-null=0', '-islands-ok=0', '-spell=0', '-timeout=3'];
+    const args = ['en', '-batch', '-verbosity=0', '-graphics=0', '-null=0', '-islands-ok=0', '-spell=0'];
     const p = spawn('link-parser', args, { stdio: ['pipe', 'pipe', 'pipe'] });
     let out = '';
     let err = '';
-    const timer = setTimeout(() => { try { p.kill('SIGKILL'); } catch {} }, LINK_TIMEOUT_MS);
     p.stdout.on('data', d => out += d.toString());
     p.stderr.on('data', d => err += d.toString());
     p.on('error', e => {
-      clearTimeout(timer);
       resolve({ ok:false, fullParse:false, strictLinkGrammar:false, linkages:0, nullCount:0, stdout:'', stderr:String(e.message || e), code:-1 });
     });
     p.on('close', code => {
-      clearTimeout(timer);
       const hardError = /\+\+\+\+\+ error/i.test(out) || /No complete linkages found/i.test(out) || code !== 0;
       const m = out.match(/Found\s+(\d+)\s+linkages/i);
       const linkages = m ? Number(m[1]) : (hardError ? 0 : 1);
@@ -1951,7 +1935,8 @@ async function checkSentenceBatch(req) {
   let j = {};
   try { j = JSON.parse(raw || '{}'); } catch { j = {}; }
   const input = Array.isArray(j?.candidates) ? j.candidates : [];
-  const max = Math.max(1, Math.min(Number(j?.limit || 120), 240));
+  // v104: 一括判定の240件上限を撤廃。フロントが作った候補を全件API判定する。
+  const max = input.length;
   const seen = new Map();
   for (let i = 0; i < input.length && seen.size < max; i++) {
     const item = normalizeCandidateItem(input[i], i);

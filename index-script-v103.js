@@ -170,11 +170,11 @@ function reasonCandidateContext(){
     reasonWordMetaMap:wordMetaForApi([...new Set(all.map(String))])
   };
 }
-function fetchWithTimeout(url, options={}, timeoutMs=7500){
-  const ctrl = (typeof AbortController!=='undefined') ? new AbortController() : null;
-  const timer = ctrl ? setTimeout(()=>{ try{ctrl.abort();}catch(e){} }, timeoutMs) : null;
-  const opts = ctrl ? {...options, signal:ctrl.signal} : options;
-  return fetch(url, opts).finally(()=>{ if(timer) clearTimeout(timer); });
+function fetchWithTimeout(url, options={}, timeoutMs=0){
+  // v104: API判定のブラウザ側タイムアウトを撤廃。
+  // Render cold start / Link Grammar / 外部判定が遅いだけで Abort され、
+  // batch失敗→単体fallback→誤NG/ロールバックに落ちるのを防ぐ。
+  return fetch(url, options);
 }
 async function singleApiCheckItem(base, item){
   const res=await fetchWithTimeout(base+'/check-and-translate',{
@@ -213,7 +213,7 @@ async function batchApiCheckItems(base, items, reasonPriorityEpoch){
     headers:{'content-type':'application/json'},
     body:JSON.stringify({
       candidates:items.map((item,i)=>({id:item.id ?? String(i), text:item.text, words:item.words, wordMeta:item.wordMeta || wordMetaForApi(item.words)})),
-      limit:240,
+      // v104: サーバ側へ240件上限を要求しない。候補漏れによる一括判定の取りこぼしを防ぐ。
       translate:false,
       withTranslate:false,
       reasonMode:'none',
@@ -1653,19 +1653,11 @@ async function placeTile(cellIndex){
       return false;
     }
   }
-  // v76/v84: API/ネットワーク/Render cold start で判定Promiseが戻らない時も、操作ロックを永久化しない。
-  // タイムアウト時は世代番号を進め、後から戻った古い判定結果は反映せず、仮配置も取り消す。
+  // v104: API一括判定の30秒watchdogを撤廃。
+  // ここで仮配置を巻き戻すと、遅れて返った正常なbatch結果を捨ててしまい、
+  // 成立文がタイムアウトNGになる。配置ロックはAPI応答完了まで維持する。
   let placementTimedOut=false;
-  let placementLockTimer=setTimeout(()=>{
-    if(placementJudgeBusy && myJudgeSeq===placementJudgeSeq){
-      placementTimedOut=true;
-      placementJudgeSeq++;
-      placementJudgeBusy=false;
-      linkGrammarStatus='ERR';
-      rollbackTimedOutPlacement('判定タイムアウト。API一括判定が30秒以内に返りませんでした。仮配置を取り消しました。APIのhealthを確認してください。');
-      render();
-    }
-  },30000);
+  let placementLockTimer=null;
   // v93: 新しい配置を始めたら、前回の成立コンボ/画像/経路ハイライトを必ず閉じる。
   // 採点前やNGになった時に古いGOOD表示が残って矛盾しないようにする。
   clearResultOverlays();
@@ -1673,7 +1665,7 @@ async function placeTile(cellIndex){
   p.hand[selectedHandIndex]=drawOneForSlot(selectedHandIndex);
   if(Array.isArray(p.handMeta)) p.handMeta[selectedHandIndex]=null;
   // 種類別固定スロットなのでソートしない。各枠を維持する。
-  setMsg('API一括判定中…。候補をまとめて確認しています。','info');
+  setMsg('API一括判定中…。候補を全件確認しています。','info');
   render();
   let made=[];
   try{
