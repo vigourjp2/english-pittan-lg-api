@@ -18,7 +18,7 @@ try{
 }catch(e){ console.error('early start bind failed', e); }
 try{
 
-const APP_VERSION='v101-no-browser-judge-cache';
+const APP_VERSION='v105-multiplayer-turn-othello-attack-chance';
 const $ = id => document.getElementById(id);
 const WS_URL = 'wss://mine-server-git2.vigourjp2.workers.dev/room/english';
 const N = 7;
@@ -440,7 +440,7 @@ function slotInfo(i,w){
 const targets = Array.from(EXACT.keys()).slice(0,24);
 let state = freshState(2);
 function freshState(playerCount=2){
-  return {version:1,gameId:'eng-'+Date.now().toString(36),turn:0,turnNo:1,playerCount,wordsMade:0,board:Array.from({length:N*N},()=>null),players:Array.from({length:playerCount},(_,i)=>({name:'Player '+(i+1),score:0,tiles:0,color:COLORS[i],hand:drawHand(i)})),log:[{t:Date.now(),text:'新規ゲーム開始',good:true}],statusText:'単語タイルを選んで空きマスに置く',statusClass:'info',lastJudgeMsg:'',lastJudgeClass:'info'};
+  return {version:1,gameId:'eng-'+Date.now().toString(36),turn:0,turnNo:1,playerCount,wordsMade:0,board:Array.from({length:N*N},()=>null),players:Array.from({length:playerCount},(_,i)=>({name:'Player '+(i+1),clientId:null,score:0,tiles:0,color:COLORS[i],hand:drawHand(i)})),log:[{t:Date.now(),text:'新規ゲーム開始',good:true}],statusText:'単語タイルを選んで空きマスに置く',statusClass:'info',lastJudgeMsg:'',lastJudgeClass:'info'};
 }
 function drawHand(seed=0){
   // 詰み対策：種類ごとの固定スロットで、常に「主語 / be・助 / 動詞 / 形容詞・ing / 名詞 / 追加」を1枚ずつ持つ。
@@ -456,6 +456,87 @@ function addLog(text,good=true){state.log.unshift({t:Date.now(),text,good});stat
 function idx(x,y){return y*N+x}
 function xy(i){return {x:i%N,y:Math.floor(i/N)}}
 function currentPlayer(){return state.players[state.turn%state.playerCount]}
+function playerIndexForClient(id=clientId){
+  const cid=String(id||'');
+  if(!cid || !state || !Array.isArray(state.players)) return -1;
+  return state.players.findIndex(p=>String(p?.clientId||'')===cid);
+}
+function localPlayerIndex(){
+  const found=playerIndexForClient(clientId);
+  if(found>=0) return found;
+  if(state?.playerCount===1) return 0;
+  return -1;
+}
+function localPlayer(){
+  const i=localPlayerIndex();
+  return i>=0 ? state.players[i] : null;
+}
+function claimLocalPlayerSeat(preferIndex=0, announce=true){
+  if(!state || !Array.isArray(state.players)) return -1;
+  const existing=playerIndexForClient(clientId);
+  if(existing>=0){
+    state.players[existing].name=safeName();
+    return existing;
+  }
+  let target=-1;
+  if(Number.isInteger(preferIndex) && state.players[preferIndex] && !state.players[preferIndex].clientId) target=preferIndex;
+  if(target<0) target=state.players.findIndex(p=>!p.clientId);
+  if(target<0) return -1;
+  state.players[target].clientId=clientId;
+  state.players[target].name=safeName();
+  if(announce) broadcast({type:'englishState',gameId:state.gameId,state:lightState(),reason:'seat-claim'});
+  return target;
+}
+function isOnlineGame(){ return !!(socket && socket.readyState===WebSocket.OPEN); }
+function isMyTurn(){
+  if(!state || state.playerCount<=1) return true;
+  // 未接続時は1端末で交代プレイできるようにする。オンライン接続中だけ担当プレイヤーを厳密判定。
+  if(!isOnlineGame()) return true;
+  return localPlayerIndex() === (state.turn%state.playerCount);
+}
+function isBoardEmpty(){ return !state.board.some(Boolean); }
+function cornerIndexes(){ return [0,N-1,N*(N-1),N*N-1]; }
+function isAttackCorner(i){ return cornerIndexes().includes(i) && i!==0; }
+function isAttackChanceActiveFor(pi=state.turn%state.playerCount){
+  return !!(state.attackChance && state.attackChance.playerIndex===pi);
+}
+function hasAdjacentCard(cellIndex){
+  const p=xy(cellIndex);
+  for(let dy=-1;dy<=1;dy++){
+    for(let dx=-1;dx<=1;dx++){
+      if(dx===0 && dy===0) continue;
+      const x=p.x+dx,y=p.y+dy;
+      if(x>=0&&y>=0&&x<N&&y<N&&state.board[idx(x,y)]) return true;
+    }
+  }
+  return false;
+}
+function canPlaceAt(cellIndex){
+  const pi=state.turn%state.playerCount;
+  const attack=isAttackChanceActiveFor(pi);
+  const occupied=!!state.board[cellIndex];
+  if(occupied && !attack) return {ok:false,msg:'そこは埋まってる'};
+  if(isBoardEmpty()) return cellIndex===0 ? {ok:true} : {ok:false,msg:'最初の1枚は左上の隅だけです'};
+  if(!occupied && !hasAdjacentCard(cellIndex)) return {ok:false,msg:'既存カードに隣接した場所だけ置けます'};
+  if(occupied && attack) return {ok:true,overwrite:true};
+  return {ok:true};
+}
+function advanceAfterPlacement(cellIndex, wasAttackChance){
+  const pi=state.turn%state.playerCount;
+  const earnsAttack=!wasAttackChance && isAttackCorner(cellIndex);
+  if(wasAttackChance){
+    state.attackChance=null;
+    nextTurn();
+  }else if(earnsAttack){
+    state.attackChance={playerIndex:pi,earnedAt:Date.now(),corner:cellIndex};
+    state.turnNo++;
+    addLog(`${state.players[pi]?.name||'Player'}: アタックチャンス獲得！もう1回置けます`,true);
+    setMsg('アタックチャンス！続けてもう1枚置けます。既存カードへの上書きも可能です。','good');
+  }else{
+    state.attackChance=null;
+    nextTurn();
+  }
+}
 function wordPos(w){
   const k=String(w||'').toLowerCase();
   if(POS[k]) return POS[k];
@@ -1598,9 +1679,19 @@ async function placeTile(cellIndex){
     setMsg('判定中…。結果が出てから次のカードを置いてください。','info');
     return;
   }
+  if(!isMyTurn()){
+    const tp=currentPlayer();
+    setMsg(`今は${tp?.name||'他プレイヤー'}のターンです。自分のターンまで待ってください。`,'bad');
+    selectedHandIndex=-1;
+    render();
+    return;
+  }
+  const placementRule=canPlaceAt(cellIndex);
+  if(!placementRule.ok){setMsg(placementRule.msg,'bad');return;}
   if(selectedHandIndex<0){setMsg('先に手札を選んで！','bad');return;}
-  if(state.board[cellIndex]){setMsg('そこは埋まってる','bad');return;}
   const p=currentPlayer();
+  const actorIndex=state.turn%state.playerCount;
+  const wasAttackChance=isAttackChanceActiveFor(actorIndex);
   const word=p.hand[selectedHandIndex];
   if(!word){setMsg('その手札は空','bad');return;}
   activeJudgeWordForReason=String(word||'');
@@ -1661,7 +1752,7 @@ async function placeTile(cellIndex){
   // v93: 新しい配置を始めたら、前回の成立コンボ/画像/経路ハイライトを必ず閉じる。
   // 採点前やNGになった時に古いGOOD表示が残って矛盾しないようにする。
   clearResultOverlays();
-  state.board[cellIndex]={w:word,owner:state.turn%state.playerCount,baseOwner:state.turn%state.playerCount,at:Date.now(),useCount:0,unusedPenaltyApplied:false};
+  state.board[cellIndex]={w:word,owner:actorIndex,baseOwner:actorIndex,at:Date.now(),useCount:0,unusedPenaltyApplied:false,overwritten:!!placementRule.overwrite};
   p.hand[selectedHandIndex]=drawOneForSlot(selectedHandIndex);
   if(Array.isArray(p.handMeta)) p.handMeta[selectedHandIndex]=null;
   // 種類別固定スロットなのでソートしない。各枠を維持する。
@@ -1712,7 +1803,7 @@ async function placeTile(cellIndex){
     useDelta.forEach((delta,i)=>{
       const cell=state.board[i];
       if(cell){
-        cell.owner=state.turn%state.playerCount;
+        cell.owner=actorIndex;
         cell.useCount=useCountOf(cell)+delta;
         cell.unusedPenaltyApplied=false;
       }
@@ -1778,7 +1869,7 @@ async function placeTile(cellIndex){
   }
   p.score+=gained;
   recalcTiles();
-  nextTurn();
+  advanceAfterPlacement(cellIndex, wasAttackChance);
   selectedHandIndex=-1;
   // v90: ここより下の broadcast/render/setMsg で例外が出ても操作ロックを残さない。
   // selectable 表示もこの後の render で正しく出るよう、描画前にbusyを解除する。
@@ -1809,6 +1900,7 @@ function thirdPersonFormOf(word){
 }
 function toggleSelectedThirdPerson(){
   if(placementJudgeBusy){setMsg('判定中…。結果が出てから手札を変化してください。','info');return;}
+  if(!isMyTurn()){setMsg('自分のターンではありません','bad');return;}
   const p=currentPlayer();
   if(!p){return;}
   if(selectedHandIndex<0){setMsg('先に変化したい手札を選んで！','bad');return;}
@@ -1850,21 +1942,32 @@ function nextTurn(){state.turn=(state.turn+1)%state.playerCount;state.turnNo++;}
 function recalcTiles(){state.players.forEach(p=>p.tiles=0);state.board.forEach(c=>{if(c&&state.players[c.owner])state.players[c.owner].tiles++;});}
 function lightState(){return JSON.parse(JSON.stringify(state));}
 function applyState(s,why='同期'){
-  if(!s||!Array.isArray(s.board)||!Array.isArray(s.players))return;
-  state=s;selectedHandIndex=-1;recentCells=[];failFocusCell=-1;recalcTiles();setMsg(why,'good');render();
+  if(!s||!Array.isArray(s.board)||!Array.isArray(s.players))return false;
+  const incomingHadSeat=Array.isArray(s.players) && s.players.some(p=>String(p?.clientId||'')===clientId);
+  state=s;selectedHandIndex=-1;recentCells=[];failFocusCell=-1;
+  if(state.playerCount>1) claimLocalPlayerSeat(-1,false);
+  const hasSeat=playerIndexForClient(clientId)>=0;
+  recalcTiles();setMsg(why,'good');render();
+  return hasSeat && !incomingHadSeat;
 }
-function passTurn(){const p=currentPlayer();addLog(`${p.name}: パス`,false);nextTurn();broadcast({type:'englishState',gameId:state.gameId,state:lightState(),reason:'pass'});render();}
-function swapHand(){const p=currentPlayer();p.hand=drawHand(99);p.handMeta=[];p.score=Math.max(0,p.score-5);addLog(`${p.name}: 手札入替 -5`,false);nextTurn();broadcast({type:'englishState',gameId:state.gameId,state:lightState(),reason:'swap'});render();}
-function newGame(broadcastIt=true){clearEnglishJudgeCache();displayedRejectReasonRequestKeys=new Set();displayedRejectReasonPlacementKeys=new Set();const pc=Number($('playerCount').value)||2;state=freshState(pc);const name=safeName();state.players[0].name=name;localStorage.englishName=name;selectedHandIndex=-1;recentCells=[];failFocusCell=-1; if(broadcastIt)broadcast({type:'englishNewGame',gameId:state.gameId,state:lightState()});render();setMsg(state.playerCount===1?'1人練習開始。手札は種類別に常備。英文を作ると英語→日本語で読み上げる':'新規ゲーム開始。手札は種類別に常備。','good');}
+function passTurn(){if(!isMyTurn()){setMsg('自分のターンではありません','bad');return;}const p=currentPlayer();addLog(`${p.name}: パス`,false);state.attackChance=null;nextTurn();broadcast({type:'englishState',gameId:state.gameId,state:lightState(),reason:'pass'});render();}
+function swapHand(){if(!isMyTurn()){setMsg('自分のターンではありません','bad');return;}const p=currentPlayer();p.hand=drawHand(99);p.handMeta=[];p.score=Math.max(0,p.score-5);addLog(`${p.name}: 手札入替 -5`,false);state.attackChance=null;nextTurn();broadcast({type:'englishState',gameId:state.gameId,state:lightState(),reason:'swap'});render();}
+function newGame(broadcastIt=true){clearEnglishJudgeCache();displayedRejectReasonRequestKeys=new Set();displayedRejectReasonPlacementKeys=new Set();const pc=Number($('playerCount').value)||2;state=freshState(pc);const name=safeName();state.players[0].name=name;state.players[0].clientId=clientId;localStorage.englishName=name;selectedHandIndex=-1;recentCells=[];failFocusCell=-1;state.attackChance=null; if(broadcastIt)broadcast({type:'englishNewGame',gameId:state.gameId,state:lightState()});render();setMsg(state.playerCount===1?'1人練習開始。最初の1枚は左上です。':'新規ゲーム開始。P1を自分に割当。参加者は接続時に空き席へ割り当てます。','good');}
 function render(){
   $('turnNo').textContent=state.turnNo;$('wordsMade').textContent=state.wordsMade;$('filledNo').textContent=state.board.filter(Boolean).length;$('roomNo').textContent='english';$('myId').textContent=clientId;
-  const tp=currentPlayer();$('turnPlayer').textContent=tp?tp.name:'-';$('turnPlayer').style.color=tp?tp.color:'#fff';
-  const b=$('board');b.innerHTML='';state.board.forEach((c,i)=>{const d=document.createElement('button');d.className='cell '+(!c?'empty ':'')+(recentCells.includes(i)?'recent hit ':'');d.type='button';const routeNo=routeFocusCells.indexOf(i);if(routeNo>=0)d.classList.add('routeHit');if(i===failFocusCell)d.classList.add('failFocus');if(!c&&selectedHandIndex>=0&&!placementJudgeBusy)d.classList.add('selectable');if(c){const ownerColor=state.players[c.owner]?.color||'#fff';const cnt=useCountOf(c);const uc=useColor(cnt, ownerColor);if(uc.rainbow)d.classList.add('rainbow');if(cnt<=0)d.classList.add('unused');const usedLabel=cnt>0?`×${cnt}`:'前';d.innerHTML=`<span class="owner" style="background:${ownerColor}"></span>${routeNo>=0?`<span class="routeStep">${routeNo+1}</span>`:''}<span class="word">${esc(c.w)}</span><span class="useCount">${usedLabel}</span>${cnt<=0?'<span class="unusedMark">採点前</span>':''}<span class="pts">P${(c.owner||0)+1}</span>`;d.style.background=`linear-gradient(180deg, ${uc.bg}, ${hexAlpha(ownerColor,.13)}, rgba(255,255,255,.05))`;d.style.borderColor=uc.border;d.style.color=uc.text;} d.onclick=()=>placeTile(i);b.appendChild(d);});
-  const h=$('hand');h.innerHTML='';(tp?.hand||[]).forEach((w,i)=>{const pos=handInfo(w);const t=document.createElement('button');t.type='button';t.className='tile cat-'+pos.key+' '+(i===selectedHandIndex?'on':'');t.innerHTML=`<span>${esc(w)}</span><small>${esc(displayHandLabel(w))}</small>`;t.onclick=()=>{if(placementJudgeBusy){setMsg('判定中…。成立確定ではありません。結果が出るまで操作ロック中。','info');return;}selectedHandIndex=i;render();refreshFailReasonWithSelectedHand();};h.appendChild(t);});
-  $('selectedInfo').textContent=selectedHandIndex>=0?`選択: ${(tp.hand||[])[selectedHandIndex]}${(tp.handMeta&&tp.handMeta[selectedHandIndex])?'（3単現）':''}`:'未選択';
-  const ps=$('players');ps.innerHTML='';state.players.forEach((p,i)=>{const row=document.createElement('div');row.className='player '+(i===state.turn?'current':'');row.innerHTML=`<span class="dot" style="background:${p.color}"></span><span class="pname">${esc(p.name)} <small>陣地${p.tiles||0}</small></span><span class="pscore">${p.score}</span>`;ps.appendChild(row);});
+  const tp=currentPlayer();
+  const online=isOnlineGame();
+  const lp=online ? localPlayer() : tp;
+  const lpIndex=online ? localPlayerIndex() : (state.turn%state.playerCount);
+  const myTurn=isMyTurn();
+  const attackNow=isAttackChanceActiveFor(state.turn%state.playerCount);
+  $('turnPlayer').textContent=tp?`${tp.name}${attackNow?'（アタックチャンス）':''}`:'-';$('turnPlayer').style.color=tp?tp.color:'#fff';
+  const b=$('board');b.innerHTML='';state.board.forEach((c,i)=>{const d=document.createElement('button');const rule=canPlaceAt(i);d.className='cell '+(!c?'empty ':'')+(recentCells.includes(i)?'recent hit ':'');d.type='button';const routeNo=routeFocusCells.indexOf(i);if(routeNo>=0)d.classList.add('routeHit');if(i===failFocusCell)d.classList.add('failFocus');if(rule.ok&&selectedHandIndex>=0&&!placementJudgeBusy&&myTurn)d.classList.add('selectable');if(c){const ownerColor=state.players[c.owner]?.color||'#fff';if(c.pendingSentence)d.classList.add('unused');d.innerHTML=`<span class="owner" style="background:${ownerColor}"></span>${routeNo>=0?`<span class="routeStep">${routeNo+1}</span>`:''}<span class="word">${esc(c.w)}</span>${c.pendingSentence?'<span class="unusedMark">採点前</span>':''}<span class="pts">P${(c.owner||0)+1}</span>`;d.style.background=`linear-gradient(180deg, ${hexAlpha(ownerColor,.42)}, ${hexAlpha(ownerColor,.18)}, rgba(255,255,255,.05))`;d.style.borderColor=hexAlpha(ownerColor,.86);d.style.color='#fff';} d.onclick=()=>placeTile(i);b.appendChild(d);});
+  const h=$('hand');h.innerHTML='';(lp?.hand||[]).forEach((w,i)=>{const pos=handInfo(w);const t=document.createElement('button');t.type='button';t.className='tile cat-'+pos.key+' '+(i===selectedHandIndex?'on':'')+(!myTurn?' used':'');t.innerHTML=`<span>${esc(w)}</span><small>${esc(displayHandLabel(w))}</small>`;t.onclick=()=>{if(placementJudgeBusy){setMsg('判定中…。成立確定ではありません。結果が出るまで操作ロック中。','info');return;}if(!myTurn){setMsg(`今は${tp?.name||'他プレイヤー'}のターンです`,'bad');return;}selectedHandIndex=i;render();refreshFailReasonWithSelectedHand();};h.appendChild(t);});
+  $('selectedInfo').textContent=lpIndex<0?'観戦中（空きプレイヤー枠なし）':(selectedHandIndex>=0?`${online?'P':'現在P'}${lpIndex+1} 選択: ${(lp.hand||[])[selectedHandIndex]}${(lp.handMeta&&lp.handMeta[selectedHandIndex])?'（3単現）':''}`:`P${lpIndex+1} ${myTurn?'手札を選択':'待機中'}`);
+  const ps=$('players');ps.innerHTML='';state.players.forEach((p,i)=>{const row=document.createElement('div');row.className='player '+(i===state.turn?'current':'')+(p.clientId===clientId?' me':'');row.innerHTML=`<span class="dot" style="background:${p.color}"></span><span class="pname">${esc(p.name)} <small>${p.clientId===clientId?'自分 / ':''}陣地${p.tiles||0}${state.attackChance?.playerIndex===i?' / AC':''}</small></span><span class="pscore">${p.score}</span>`;ps.appendChild(row);});
   const log=$('log');log.innerHTML='';state.log.forEach(x=>{const div=document.createElement('div');div.className='logItem';div.innerHTML=`<span class="${x.good?'goodText':'badText'}">●</span> ${esc(x.text)}`;log.appendChild(div);});
-  $('targetList').innerHTML=`<span class="chip">StrictLG:${esc(linkGrammarStatus)}</span><span class="chip">判定:StrictLG+LT API</span><span class="chip">今回置いたカード必須</span><span class="chip">画像は成立後のみ</span>`+targets.slice(0,10).map(t=>`<span class="chip">${esc(t)}</span>`).join('');
+  $('targetList').innerHTML=`<span class="chip">StrictLG:${esc(linkGrammarStatus)}</span><span class="chip">判定:StrictLG+LT API</span><span class="chip">ターン本人のみ操作</span><span class="chip">初手左上・以降隣接</span><span class="chip">角でAC</span>`+targets.slice(0,10).map(t=>`<span class="chip">${esc(t)}</span>`).join('');
   {const m=$('msg'); if(m){
     let t=state.statusText||''; let c=state.statusClass||'info';
     const generic=/成立なし|つなげ方/.test(t);
@@ -1885,7 +1988,7 @@ function connect(){
   if(socket&&(socket.readyState===WebSocket.OPEN||socket.readyState===WebSocket.CONNECTING))return;
   clearTimeout(retryTimer);clearInterval(heartbeat);setMp('CONNECTING','info');
   socket=new WebSocket(WS_URL);
-  socket.addEventListener('open',()=>{setMp('ONLINE','good');setMsg('オンライン接続成功。同じURLの人と同期','good');broadcast({type:'join',x:0,y:0,z:0,yaw:0,pitch:0});broadcast({type:'englishHello',wantState:true,gameId:state.gameId});heartbeat=setInterval(()=>broadcast({type:'ping'}),10000);});
+  socket.addEventListener('open',()=>{setMp('ONLINE','good');setMsg('オンライン接続成功。同じURLの人と同期','good');broadcast({type:'join',x:0,y:0,z:0,yaw:0,pitch:0});claimLocalPlayerSeat(-1,false);broadcast({type:'englishHello',wantState:true,gameId:state.gameId});heartbeat=setInterval(()=>broadcast({type:'ping'}),10000);});
   socket.addEventListener('message',ev=>{rx++;$('rx').textContent=rx;handleNet(ev.data);});
   socket.addEventListener('close',()=>{clearInterval(heartbeat);setMp('RETRY','bad');retryTimer=setTimeout(connect,3000);});
   socket.addEventListener('error',()=>setMp('ERROR','bad'));
@@ -1895,10 +1998,10 @@ function eachPayload(msg,cb,depth=0){if(!msg||depth>3)return;if(typeof msg==='st
 function handleNet(raw){eachPayload(raw,(msg)=>{
   if(!msg||msg.clientId===clientId)return;
   if(msg.type==='englishHello'&&msg.wantState){broadcast({type:'englishState',gameId:state.gameId,state:lightState(),reason:'hello-sync'});return;}
-  if(msg.type==='englishNewGame'&&msg.state){applyState(msg.state,'相手が新規ゲーム開始');return;}
+  if(msg.type==='englishNewGame'&&msg.state){const claimed=applyState(msg.state,'相手が新規ゲーム開始'); if(claimed) broadcast({type:'englishState',gameId:state.gameId,state:lightState(),reason:'seat-claim-sync'});return;}
   if((msg.type==='englishState'||msg.type==='englishPlace')&&msg.state){
     const incomingTurn=Number(msg.state.turnNo)||0;
-    if(msg.state.gameId!==state.gameId || incomingTurn>=state.turnNo){applyState(msg.state,'オンライン同期');}
+    if(msg.state.gameId!==state.gameId || incomingTurn>=state.turnNo){const claimed=applyState(msg.state,'オンライン同期'); if(claimed) broadcast({type:'englishState',gameId:state.gameId,state:lightState(),reason:'seat-claim-sync'});}
   }
 });}
 
@@ -1911,7 +2014,7 @@ $('passBtn').onclick=passTurn;
 $('drawBtn').onclick=swapHand;
 $('thirdBtn').onclick=toggleSelectedThirdPerson;
 $('nameInput').value=localStorage.englishName||('P-'+clientId);
-$('nameInput').addEventListener('change',()=>{localStorage.englishName=safeName();state.players[0].name=safeName();broadcast({type:'englishState',gameId:state.gameId,state:lightState(),reason:'rename'});render();});
+$('nameInput').addEventListener('change',()=>{localStorage.englishName=safeName();const pi=claimLocalPlayerSeat(0,false);if(pi>=0)state.players[pi].name=safeName();broadcast({type:'englishState',gameId:state.gameId,state:lightState(),reason:'rename'});render();});
 $('playerCount').addEventListener('change',()=>newGame(false));
 newGame(false);render();
 }catch(__bootErr){
