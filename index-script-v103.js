@@ -17,7 +17,7 @@ try{
 }catch(e){ console.error('early start bind failed', e); }
 try{
 
-const APP_VERSION='v111-server-authoritative-seats';
+const APP_VERSION='v113-board-full-winner';
 const $ = id => document.getElementById(id);
 const N = 7;
 const COLORS = ['#38bdf8','#f472b6','#a3e635','#facc15'];
@@ -464,7 +464,7 @@ function slotInfo(i,w){
 const targets = Array.from(EXACT.keys()).slice(0,24);
 let state = freshState(2);
 function freshState(playerCount=2){
-  return {version:1,roomHostId:null,roomCreatedAt:null,gameId:'eng-'+Date.now().toString(36),turn:0,turnNo:1,playerCount,wordsMade:0,board:Array.from({length:N*N},()=>null),players:Array.from({length:playerCount},(_,i)=>({name:'Player '+(i+1),clientId:null,score:0,tiles:0,color:COLORS[i],hand:drawHand(i)})),log:[{t:Date.now(),text:'新規ゲーム開始',good:true}],statusText:'単語タイルを選んで空きマスに置く',statusClass:'info',lastJudgeMsg:'',lastJudgeClass:'info'};
+  return {version:1,roomHostId:null,roomCreatedAt:null,gameId:'eng-'+Date.now().toString(36),turn:0,turnNo:1,playerCount,wordsMade:0,board:Array.from({length:N*N},()=>null),players:Array.from({length:playerCount},(_,i)=>({name:'Player '+(i+1),clientId:null,score:0,tiles:0,color:COLORS[i],hand:drawHand(i)})),log:[{t:Date.now(),text:'新規ゲーム開始',good:true}],statusText:'単語タイルを選んで空きマスに置く',statusClass:'info',lastJudgeMsg:'',lastJudgeClass:'info',gameOver:false,winnerIndex:null,winnerIndexes:[],endedAt:null,endReason:''};
 }
 function drawHand(seed=0){
   // 詰み対策：種類ごとの固定スロットで、常に「主語 / be・助 / 動詞 / 形容詞・ing / 名詞 / 追加」を1枚ずつ持つ。
@@ -642,6 +642,7 @@ function hasAdjacentCard(cellIndex){
   return false;
 }
 function canPlaceAt(cellIndex){
+  if(state?.gameOver) return {ok:false,msg:'ゲーム終了済みです。新規ゲームで再開してください'};
   const pi=state.turn%state.playerCount;
   const attack=isAttackChanceActiveFor(pi);
   const occupied=!!state.board[cellIndex];
@@ -1809,6 +1810,12 @@ async function placeTile(cellIndex){
     setMsg('判定中…。結果が出てから次のカードを置いてください。','info');
     return;
   }
+  if(state?.gameOver){
+    setMsg('ゲーム終了済みです。新規ゲームで再開してください。','bad');
+    selectedHandIndex=-1;
+    render();
+    return;
+  }
   if(!isMyTurn()){
     const tp=currentPlayer();
     setMsg(`今は${tp?.name||'他プレイヤー'}のターンです。自分のターンまで待ってください。`,'bad');
@@ -1999,7 +2006,11 @@ async function placeTile(cellIndex){
   }
   p.score+=gained;
   recalcTiles();
-  advanceAfterPlacement(cellIndex, wasAttackChance);
+  if(isBoardFull()){
+    finishGame('board-full');
+  }else{
+    advanceAfterPlacement(cellIndex, wasAttackChance);
+  }
   selectedHandIndex=-1;
   // v90: ここより下の broadcast/render/setMsg で例外が出ても操作ロックを残さない。
   // selectable 表示もこの後の render で正しく出るよう、描画前にbusyを解除する。
@@ -2029,6 +2040,7 @@ function thirdPersonFormOf(word){
   return w+'s';
 }
 function toggleSelectedThirdPerson(){
+  if(state?.gameOver){setMsg('ゲーム終了済みです。新規ゲームで再開してください','bad');return;}
   if(placementJudgeBusy){setMsg('判定中…。結果が出てから手札を変化してください。','info');return;}
   if(!isMyTurn()){setMsg('自分のターンではありません','bad');return;}
   const p=currentPlayer();
@@ -2070,6 +2082,73 @@ function toggleSelectedThirdPerson(){
 function drawOne(){return WORDS[Math.floor(Math.random()*WORDS.length)].w}
 function nextTurn(){state.turn=(state.turn+1)%state.playerCount;state.turnNo++;}
 function recalcTiles(){state.players.forEach(p=>p.tiles=0);state.board.forEach(c=>{if(c&&state.players[c.owner])state.players[c.owner].tiles++;});}
+function isBoardFull(){return !!(state?.board?.length) && state.board.every(Boolean);}
+function sortedPlayersForWin(){
+  return (state.players||[]).map((p,i)=>({i,name:p?.name||`Player ${i+1}`,color:p?.color||COLORS[i]||'#fff',tiles:Number(p?.tiles||0),score:Number(p?.score||0)}))
+    .sort((a,b)=>(b.tiles-a.tiles)||(b.score-a.score)||(a.i-b.i));
+}
+function finishGame(reason='board-full'){
+  recalcTiles();
+  const ranking=sortedPlayersForWin();
+  const top=ranking[0];
+  if(!top) return false;
+  const winners=ranking.filter(x=>x.tiles===top.tiles && x.score===top.score);
+  state.gameOver=true;
+  state.winnerIndex=top.i;
+  state.winnerIndexes=winners.map(x=>x.i);
+  state.endedAt=Date.now();
+  state.endReason=reason;
+  state.attackChance=null;
+  selectedHandIndex=-1;
+  const label=winners.length>1 ? `DRAW: ${winners.map(x=>playerDisplay(x.i)).join(' / ')}` : `WINNER: ${playerDisplay(top.i)}`;
+  addLog(`${label} / 陣地${top.tiles} / ${top.score}点`,true);
+  setMsg(`${label}！ 陣地${top.tiles} / ${top.score}点`, 'good');
+  playWinnerFx(ranking);
+  return true;
+}
+function ensureWinnerOverlay(){
+  let el=document.getElementById('winnerOverlay');
+  if(el) return el;
+  el=document.createElement('div');
+  el.id='winnerOverlay';
+  el.style.cssText='position:fixed;inset:0;z-index:90;display:none;align-items:center;justify-content:center;padding:18px;background:radial-gradient(circle at 50% 20%,rgba(250,204,21,.20),rgba(3,7,18,.76) 45%,rgba(3,7,18,.92));backdrop-filter:blur(6px);pointer-events:none;';
+  el.innerHTML='<div id="winnerCard" style="width:min(620px,94vw);border-radius:28px;padding:22px;text-align:center;background:linear-gradient(135deg,rgba(15,23,42,.96),rgba(30,41,59,.92));border:2px solid rgba(250,204,21,.72);box-shadow:0 30px 100px rgba(0,0,0,.65),0 0 55px rgba(250,204,21,.35);"><div id="winnerTitle" style="font-size:38px;font-weight:1000;letter-spacing:.04em;color:#fde68a;text-shadow:0 3px 16px rgba(0,0,0,.5);">WINNER!</div><div id="winnerName" style="font-size:28px;font-weight:1000;margin-top:8px;"></div><div id="winnerScore" style="font-size:18px;font-weight:900;color:#bbf7d0;margin-top:8px;"></div><div id="winnerRank" style="margin-top:14px;display:grid;gap:6px;"></div><div style="margin-top:16px;font-size:13px;color:#dbeafe;">盤面がすべて埋まったためゲーム終了。陣地数優先、同数なら得点で判定。</div></div>';
+  document.body.appendChild(el);
+  return el;
+}
+function updateWinnerOverlay(){
+  const el=ensureWinnerOverlay();
+  if(!state?.gameOver){ el.style.display='none'; return; }
+  const ranking=sortedPlayersForWin();
+  const top=ranking[0];
+  const winners=Array.isArray(state.winnerIndexes)&&state.winnerIndexes.length ? state.winnerIndexes : [state.winnerIndex];
+  const draw=winners.length>1;
+  el.style.display='flex';
+  const title=document.getElementById('winnerTitle');
+  const name=document.getElementById('winnerName');
+  const score=document.getElementById('winnerScore');
+  const rank=document.getElementById('winnerRank');
+  if(title) title.textContent=draw?'DRAW!':'WINNER!';
+  if(name){ name.textContent=draw?winners.map(i=>playerDisplay(i)).join(' / '):playerDisplay(top?.i??state.winnerIndex??0); name.style.color=top?.color||'#fde68a'; }
+  if(score) score.textContent=top?`陣地 ${top.tiles} / 得点 ${top.score}`:'';
+  if(rank) rank.innerHTML=ranking.map((r,idx)=>`<div style="display:grid;grid-template-columns:42px 1fr auto;gap:8px;align-items:center;padding:8px 10px;border-radius:13px;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.12);"><b style="color:#fde68a">#${idx+1}</b><span style="text-align:left;color:${r.color};font-weight:1000">${esc(playerDisplay(r.i))}</span><span style="font-weight:1000">陣地${r.tiles} / ${r.score}点</span></div>`).join('');
+}
+function playWinnerFx(ranking){
+  try{playChime(true);setTimeout(()=>playChime(true),260);}catch(e){}
+  const top=ranking?.[0];
+  const fx=$('fxBanner');
+  if(fx){
+    fx.classList.add('combo');
+    fx.querySelector('.fxBig').textContent='WINNER!';
+    $('fxEn').textContent=top?playerDisplay(top.i):'GAME SET';
+    $('fxJa').textContent=top?`陣地 ${top.tiles} / 得点 ${top.score}`:'盤面がすべて埋まりました';
+    $('fxPts').textContent='GAME SET';
+    fx.classList.remove('show');void fx.offsetWidth;fx.classList.add('show');
+  }
+  updateWinnerOverlay();
+  const cx=innerWidth/2, cy=innerHeight*.36;
+  for(let i=0;i<72;i++){const sp=document.createElement('i');sp.className='spark';sp.style.left=cx+'px';sp.style.top=cy+'px';const a=Math.random()*Math.PI*2,d=70+Math.random()*220;sp.style.setProperty('--dx',Math.cos(a)*d+'px');sp.style.setProperty('--dy',Math.sin(a)*d+'px');document.body.appendChild(sp);setTimeout(()=>sp.remove(),1100);}
+}
 function lightState(){return JSON.parse(JSON.stringify(state));}
 function roomHostIdOf(s){ return String(s?.roomHostId || ''); }
 function roomCreatedAtOf(s){ return Number(s?.roomCreatedAt || 0); }
@@ -2125,8 +2204,8 @@ function applyState(s,why='同期'){
   setMsg(`${why} / 自分は${hasSeat?playerTag(playerIndexForClient(clientId)):'席割当待ち'}です`,'good');render();
   return hasSeat && !incomingHadSeat;
 }
-function passTurn(){if(!isMyTurn()){setMsg('自分のターンではありません','bad');return;}const p=currentPlayer();addLog(`${p.name}: パス`,false);state.attackChance=null;nextTurn();broadcast({type:'englishState',gameId:state.gameId,state:lightState(),reason:'pass'});render();}
-function swapHand(){if(!isMyTurn()){setMsg('自分のターンではありません','bad');return;}const p=currentPlayer();p.hand=drawHand(99);p.handMeta=[];p.score=Math.max(0,p.score-5);addLog(`${p.name}: 手札入替 -5`,false);state.attackChance=null;nextTurn();broadcast({type:'englishState',gameId:state.gameId,state:lightState(),reason:'swap'});render();}
+function passTurn(){if(state?.gameOver){setMsg('ゲーム終了済みです。新規ゲームで再開してください','bad');return;}if(!isMyTurn()){setMsg('自分のターンではありません','bad');return;}const p=currentPlayer();addLog(`${p.name}: パス`,false);state.attackChance=null;nextTurn();broadcast({type:'englishState',gameId:state.gameId,state:lightState(),reason:'pass'});render();}
+function swapHand(){if(state?.gameOver){setMsg('ゲーム終了済みです。新規ゲームで再開してください','bad');return;}if(!isMyTurn()){setMsg('自分のターンではありません','bad');return;}const p=currentPlayer();p.hand=drawHand(99);p.handMeta=[];p.score=Math.max(0,p.score-5);addLog(`${p.name}: 手札入替 -5`,false);state.attackChance=null;nextTurn();broadcast({type:'englishState',gameId:state.gameId,state:lightState(),reason:'swap'});render();}
 function newGame(broadcastIt=true){
   if(broadcastIt && isOnlineGame() && !canHostControl()){
     setMsg('新規ゲーム開始はP1端末だけです。P2以降はP1の開始を待ってください。','bad');
@@ -2139,15 +2218,16 @@ function render(){
   const online=isOnlineGame();
   const lp=online ? localPlayer() : tp;
   const lpIndex=online ? localPlayerIndex() : (state.turn%state.playerCount);
-  const myTurn=isMyTurn();
-  const attackNow=isAttackChanceActiveFor(state.turn%state.playerCount);
+  const myTurn=isMyTurn() && !state.gameOver;
+  const attackNow=!state.gameOver && isAttackChanceActiveFor(state.turn%state.playerCount);
   $('turnPlayer').textContent=tp?`${playerDisplay(state.turn%state.playerCount)}${attackNow?'（アタックチャンス）':''}`:'-';$('turnPlayer').style.color=tp?tp.color:'#fff';
   const b=$('board');b.innerHTML='';state.board.forEach((c,i)=>{const d=document.createElement('button');const rule=canPlaceAt(i);d.className='cell '+(!c?'empty ':'')+(recentCells.includes(i)?'recent hit ':'');d.type='button';const routeNo=routeFocusCells.indexOf(i);if(routeNo>=0)d.classList.add('routeHit');if(i===failFocusCell)d.classList.add('failFocus');if(rule.ok&&selectedHandIndex>=0&&!placementJudgeBusy&&myTurn)d.classList.add('selectable');if(c){const ownerColor=state.players[c.owner]?.color||'#fff';if(c.pendingSentence)d.classList.add('unused');d.innerHTML=`<span class="owner" style="background:${ownerColor}"></span>${routeNo>=0?`<span class="routeStep">${routeNo+1}</span>`:''}<span class="word">${esc(c.w)}</span>${c.pendingSentence?'<span class="unusedMark">採点前</span>':''}<span class="pts">P${(c.owner||0)+1}</span>`;d.style.background=`linear-gradient(180deg, ${hexAlpha(ownerColor,.42)}, ${hexAlpha(ownerColor,.18)}, rgba(255,255,255,.05))`;d.style.borderColor=hexAlpha(ownerColor,.86);d.style.color='#fff';} d.onclick=()=>placeTile(i);b.appendChild(d);});
-  const h=$('hand');h.innerHTML='';(lp?.hand||[]).forEach((w,i)=>{const pos=handInfo(w);const t=document.createElement('button');t.type='button';t.className='tile cat-'+pos.key+' '+(i===selectedHandIndex?'on':'')+(!myTurn?' used':'');t.innerHTML=`<span>${esc(w)}</span><small>${esc(displayHandLabel(w))}</small>`;t.onclick=()=>{if(placementJudgeBusy){setMsg('判定中…。成立確定ではありません。結果が出るまで操作ロック中。','info');return;}if(!myTurn){setMsg(`ちょっと待って。今は${playerDisplay(state.turn%state.playerCount)}のターンです。あなたは${lpIndex>=0?playerTag(lpIndex):'観戦'}です。`,'bad');return;}selectedHandIndex=i;render();refreshFailReasonWithSelectedHand();};h.appendChild(t);});
+  const h=$('hand');h.innerHTML='';(lp?.hand||[]).forEach((w,i)=>{const pos=handInfo(w);const t=document.createElement('button');t.type='button';t.className='tile cat-'+pos.key+' '+(i===selectedHandIndex?'on':'')+(!myTurn?' used':'');t.innerHTML=`<span>${esc(w)}</span><small>${esc(displayHandLabel(w))}</small>`;t.onclick=()=>{if(state?.gameOver){setMsg('ゲーム終了済みです。新規ゲームで再開してください。','bad');return;}if(placementJudgeBusy){setMsg('判定中…。成立確定ではありません。結果が出るまで操作ロック中。','info');return;}if(!myTurn){setMsg(`ちょっと待って。今は${playerDisplay(state.turn%state.playerCount)}のターンです。あなたは${lpIndex>=0?playerTag(lpIndex):'観戦'}です。`,'bad');return;}selectedHandIndex=i;render();refreshFailReasonWithSelectedHand();};h.appendChild(t);});
   $('selectedInfo').textContent=lpIndex<0?'観戦中（空きプレイヤー枠なし）':(selectedHandIndex>=0?`${playerTag(lpIndex)} 選択: ${(lp.hand||[])[selectedHandIndex]}${(lp.handMeta&&lp.handMeta[selectedHandIndex])?'（3単現）':''}`:`${playerTag(lpIndex)} ${myTurn?'手札を選択':'待機中'}`);
   const ps=$('players');ps.innerHTML='';state.players.forEach((p,i)=>{const row=document.createElement('div');row.className='player '+(i===state.turn?'current':'')+(p.clientId===clientId?' me':'');row.style.borderColor=hexAlpha(p.color,.70);row.innerHTML=`<span class="dot" style="background:${p.color}"></span><span class="pname"><b style="color:${p.color}">${playerTag(i)}</b> ${esc(p.name||'')} <small>${p.clientId===clientId?'自分 / ':''}陣地${p.tiles||0}${state.attackChance?.playerIndex===i?' / AC':''}</small></span><span class="pscore">${p.score}</span>`;ps.appendChild(row);});
   const log=$('log');log.innerHTML='';state.log.forEach(x=>{const div=document.createElement('div');div.className='logItem';div.innerHTML=`<span class="${x.good?'goodText':'badText'}">●</span> ${esc(x.text)}`;log.appendChild(div);});
   $('targetList').innerHTML=`<span class="chip">StrictLG:${esc(linkGrammarStatus)}</span><span class="chip">判定:StrictLG+LT API</span><span class="chip">ターン本人のみ操作</span><span class="chip">初手左上・以降隣接</span><span class="chip">角でAC</span>`+targets.slice(0,10).map(t=>`<span class="chip">${esc(t)}</span>`).join('');
+  updateWinnerOverlay();
   {const m=$('msg'); if(m){
     let t=state.statusText||''; let c=state.statusClass||'info';
     const generic=/成立なし|つなげ方/.test(t);
