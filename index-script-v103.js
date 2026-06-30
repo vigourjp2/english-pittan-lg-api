@@ -100,6 +100,7 @@ function evFromApiResult(data, words){
   const displayKind=data.acceptability?.displayKind || (sentenceType==='contextual_short_answer' ? '短い返事文' : (data.kind || 'API完全英文判定'));
   return {
     ok:true,
+    gameOk:true,
     kind:displayKind,
     pts:48+Math.min(28,w.length*6),
     text,
@@ -671,7 +672,7 @@ async function showSentenceGeneratedImage(matches, index=0) {
   for(const m of (matches || [])){
     if(!m || !m.text) continue;
     // v34: 成立文として採点されたものだけ画像対象。未完成/NG/古いパネルの残像を防ぐ。
-    if(m.gameOk !== true) continue;
+    if(m.gameOk !== true && m.ok !== true) continue;
     if(String(m.type||'') !== 'complete_sentence') continue;
     if(String(m.sentenceType||m.utteranceType||'') === 'contextual_short_answer') continue;
     const k=norm(m.text.split(' '));
