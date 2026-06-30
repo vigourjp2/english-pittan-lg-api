@@ -102,7 +102,7 @@ function defaultWsUrl(){
   let stored=''; try{ stored=localStorage.getItem('englishPittan.wsUrl')||''; }catch(e){}
   const explicit=(qs.get('ws')||stored||'').trim();
   if(explicit) return explicit;
-  return 'wss://mine-server-git2.vigourjp2.workers.dev/room/english';
+  return 'wss://english-pittan-room.vigourjp2.workers.dev/room/english';
 }
 const WS_URL = defaultWsUrl();
 let linkGrammarStatus=linkGrammarApi ? 'READY' : 'OFF';
