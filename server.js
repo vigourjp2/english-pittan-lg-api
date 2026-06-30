@@ -1,7 +1,240 @@
 import http from 'node:http';
 import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 
 const PORT = Number(process.env.PORT || 8787);
+// v111: authoritative multiplayer room server for /room/english.
+// Browser clients no longer decide P1/P2 locally. The room server assigns seats by join order.
+const englishRooms = new Map();
+let englishWsConnSeq = 1;
+
+function wsAcceptKey(key) {
+  return crypto.createHash('sha1').update(String(key || '') + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+}
+function wsSend(socket, obj) {
+  if (!socket || socket.destroyed) return false;
+  let payload;
+  try { payload = Buffer.from(JSON.stringify(obj)); } catch { return false; }
+  const len = payload.length;
+  let header;
+  if (len < 126) {
+    header = Buffer.from([0x81, len]);
+  } else if (len < 65536) {
+    header = Buffer.alloc(4);
+    header[0] = 0x81; header[1] = 126; header.writeUInt16BE(len, 2);
+  } else {
+    header = Buffer.alloc(10);
+    header[0] = 0x81; header[1] = 127; header.writeBigUInt64BE(BigInt(len), 2);
+  }
+  try { socket.write(Buffer.concat([header, payload])); return true; } catch { return false; }
+}
+function wsClose(socket, code = 1000, reason = '') {
+  try {
+    const reasonBuf = Buffer.from(String(reason || '').slice(0, 80));
+    const payload = Buffer.alloc(2 + reasonBuf.length);
+    payload.writeUInt16BE(code, 0); reasonBuf.copy(payload, 2);
+    const header = Buffer.from([0x88, payload.length]);
+    socket.write(Buffer.concat([header, payload]));
+  } catch {}
+  try { socket.end(); } catch {}
+}
+function parseWsFrames(holder, chunk, onText) {
+  holder.buffer = holder.buffer && holder.buffer.length ? Buffer.concat([holder.buffer, chunk]) : Buffer.from(chunk);
+  let buf = holder.buffer;
+  let off = 0;
+  while (buf.length - off >= 2) {
+    const b0 = buf[off], b1 = buf[off + 1];
+    const opcode = b0 & 0x0f;
+    const masked = !!(b1 & 0x80);
+    let len = b1 & 0x7f;
+    let p = off + 2;
+    if (len === 126) {
+      if (buf.length - p < 2) break;
+      len = buf.readUInt16BE(p); p += 2;
+    } else if (len === 127) {
+      if (buf.length - p < 8) break;
+      const big = buf.readBigUInt64BE(p); p += 8;
+      if (big > BigInt(8 * 1024 * 1024)) throw new Error('ws frame too large');
+      len = Number(big);
+    }
+    let mask;
+    if (masked) {
+      if (buf.length - p < 4) break;
+      mask = buf.subarray(p, p + 4); p += 4;
+    }
+    if (buf.length - p < len) break;
+    let payload = Buffer.from(buf.subarray(p, p + len));
+    if (masked) for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i % 4];
+    p += len;
+    off = p;
+    if (opcode === 0x8) throw new Error('ws close');
+    if (opcode === 0x9) continue;
+    if (opcode === 0x1) onText(payload.toString('utf8'));
+  }
+  holder.buffer = off < buf.length ? buf.subarray(off) : Buffer.alloc(0);
+}
+function getEnglishRoom(roomId) {
+  const id = String(roomId || 'english').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40) || 'english';
+  let r = englishRooms.get(id);
+  if (!r) {
+    r = { id, createdAt: Date.now(), playerCount: 2, seats: [], clients: new Set(), state: null, updateSeq: 0 };
+    englishRooms.set(id, r);
+  }
+  return r;
+}
+function normalizePlayerCount(n) {
+  n = Number(n || 2);
+  if (!Number.isFinite(n)) n = 2;
+  return Math.max(2, Math.min(4, Math.floor(n)));
+}
+function roomHostId(room) { return room.seats[0]?.clientId || null; }
+function seatIndexForClient(room, clientId) {
+  const cid = String(clientId || '');
+  if (!cid) return -1;
+  return room.seats.findIndex(s => s && s.clientId === cid);
+}
+function cleanupRoom(room) {
+  for (const c of Array.from(room.clients)) {
+    if (!c.socket || c.socket.destroyed) room.clients.delete(c);
+  }
+  // Keep seat ownership briefly across reloads by clientId. Do not remove seats immediately.
+  if (room.clients.size === 0 && Date.now() - (room.lastActiveAt || room.createdAt) > 30 * 60 * 1000) {
+    englishRooms.delete(room.id);
+  }
+}
+function assignSeat(room, client) {
+  cleanupRoom(room);
+  const cid = String(client.clientId || '');
+  if (!cid) return -1;
+  const existing = seatIndexForClient(room, cid);
+  if (existing >= 0) {
+    room.seats[existing] = { clientId: cid, name: client.name || room.seats[existing].name || `Player ${existing + 1}` };
+    client.seatIndex = existing;
+    return existing;
+  }
+  for (let i = 0; i < room.playerCount; i++) {
+    if (!room.seats[i]) {
+      room.seats[i] = { clientId: cid, name: client.name || `Player ${i + 1}` };
+      client.seatIndex = i;
+      return i;
+    }
+  }
+  client.seatIndex = -1;
+  return -1;
+}
+function stampRoomState(room, state) {
+  if (!state || !Array.isArray(state.players)) return state;
+  state.playerCount = normalizePlayerCount(state.playerCount || room.playerCount);
+  room.playerCount = normalizePlayerCount(state.playerCount);
+  state.roomHostId = roomHostId(room);
+  state.roomCreatedAt = room.createdAt;
+  state.serverUpdateSeq = room.updateSeq;
+  for (let i = 0; i < room.playerCount; i++) {
+    if (!state.players[i]) state.players[i] = { name: `Player ${i + 1}`, clientId: null, score: 0, tiles: 0 };
+    const seat = room.seats[i];
+    state.players[i].clientId = seat?.clientId || null;
+    if (seat?.name) state.players[i].name = seat.name;
+  }
+  return state;
+}
+function sendSeatAssigned(room, client, reason = 'seat-assigned') {
+  const state = room.state ? stampRoomState(room, structuredClone(room.state)) : null;
+  wsSend(client.socket, {
+    type: 'seatAssigned',
+    server: true,
+    roomId: room.id,
+    roomHostId: roomHostId(room),
+    roomCreatedAt: room.createdAt,
+    seatIndex: client.seatIndex,
+    playerCount: room.playerCount,
+    seats: room.seats.map((s, i) => s ? { seatIndex: i, clientId: s.clientId, name: s.name } : null),
+    state,
+    needNewGame: !state && client.seatIndex === 0,
+    reason,
+    time: Date.now()
+  });
+}
+function broadcastRoom(room, obj, exceptClient = null) {
+  cleanupRoom(room);
+  const msg = { server: true, roomId: room.id, roomHostId: roomHostId(room), roomCreatedAt: room.createdAt, time: Date.now(), ...obj };
+  for (const c of room.clients) {
+    if (exceptClient && c === exceptClient) continue;
+    wsSend(c.socket, msg);
+  }
+}
+function canClientUpdateRoom(room, client, msg) {
+  if (client.seatIndex < 0) return { ok: false, reason: '観戦中の端末は操作できません。' };
+  if (msg.type === 'englishNewGame') {
+    return client.seatIndex === 0 ? { ok: true } : { ok: false, reason: '新規ゲームはP1だけです。' };
+  }
+  if (!room.state) {
+    return client.seatIndex === 0 ? { ok: true } : { ok: false, reason: 'P1の新規ゲーム開始待ちです。' };
+  }
+  const turn = Number(room.state.turn || 0) % normalizePlayerCount(room.state.playerCount || room.playerCount);
+  if (client.seatIndex !== turn) {
+    return { ok: false, reason: `ちょっと待って。今はP${turn + 1}のターンです。あなたはP${client.seatIndex + 1}です。` };
+  }
+  return { ok: true };
+}
+function handleEnglishRoomMessage(room, client, raw) {
+  let msg;
+  try { msg = JSON.parse(raw); } catch { return; }
+  if (!msg || typeof msg !== 'object') return;
+  room.lastActiveAt = Date.now();
+  const cid = String(msg.clientId || client.clientId || '').slice(0, 80);
+  if (cid && !client.clientId) client.clientId = cid;
+  if (msg.name) client.name = String(msg.name).trim().slice(0, 18);
+  if (!client.clientId) return;
+  if (msg.playerCount) room.playerCount = normalizePlayerCount(msg.playerCount);
+  if (client.seatIndex == null || client.seatIndex < 0 || seatIndexForClient(room, client.clientId) < 0) {
+    assignSeat(room, client);
+    sendSeatAssigned(room, client, 'join-order');
+    broadcastRoom(room, { type: 'roomPresence', seats: room.seats.map((s, i) => s ? { seatIndex: i, clientId: s.clientId, name: s.name } : null) }, client);
+  }
+  if (msg.type === 'ping') { wsSend(client.socket, { type: 'pong', server: true, time: Date.now() }); return; }
+  if (msg.type === 'englishJoin' || msg.type === 'join' || msg.type === 'englishHello' || msg.type === 'englishSeatRequest') {
+    sendSeatAssigned(room, client, msg.type);
+    return;
+  }
+  if (msg.state && (msg.type === 'englishNewGame' || msg.type === 'englishState' || msg.type === 'englishPlace')) {
+    const allowed = canClientUpdateRoom(room, client, msg);
+    if (!allowed.ok) {
+      wsSend(client.socket, { type: 'actionRejected', server: true, reason: allowed.reason, seatIndex: client.seatIndex, roomId: room.id, time: Date.now() });
+      if (room.state) wsSend(client.socket, { type: 'englishState', server: true, reason: 'authoritative-resync', state: stampRoomState(room, structuredClone(room.state)), time: Date.now() });
+      return;
+    }
+    room.updateSeq++;
+    room.state = stampRoomState(room, structuredClone(msg.state));
+    broadcastRoom(room, { type: 'englishState', reason: msg.reason || msg.type, state: stampRoomState(room, structuredClone(room.state)) });
+    return;
+  }
+  // Unknown messages are deliberately not rebroadcast. The room server is authoritative for game state only.
+}
+function handleEnglishRoomUpgrade(req, socket) {
+  const key = req.headers['sec-websocket-key'];
+  if (!key) { socket.destroy(); return; }
+  const url = new URL(req.url, 'http://localhost');
+  const roomId = (url.pathname.split('/').filter(Boolean)[1] || 'english');
+  const room = getEnglishRoom(roomId);
+  const accept = wsAcceptKey(key);
+  socket.write([
+    'HTTP/1.1 101 Switching Protocols',
+    'Upgrade: websocket',
+    'Connection: Upgrade',
+    `Sec-WebSocket-Accept: ${accept}`,
+    'Access-Control-Allow-Origin: *',
+    '', ''
+  ].join('\r\n'));
+  const client = { id: 'ws' + englishWsConnSeq++, socket, room, clientId: '', name: '', seatIndex: -1, buffer: Buffer.alloc(0), connectedAt: Date.now() };
+  room.clients.add(client);
+  socket.on('data', chunk => {
+    try { parseWsFrames(client, chunk, text => handleEnglishRoomMessage(room, client, text)); }
+    catch { try { room.clients.delete(client); } catch {} wsClose(socket); }
+  });
+  socket.on('close', () => { room.clients.delete(client); cleanupRoom(room); });
+  socket.on('error', () => { room.clients.delete(client); cleanupRoom(room); });
+}
+
 const ALLOW_ORIGIN = process.env.ALLOW_ORIGIN || '*';
 const MAX_CHARS = Number(process.env.MAX_CHARS || 180);
 const LINK_TIMEOUT_MS = Number(process.env.LINK_TIMEOUT_MS || 3500);
@@ -2631,4 +2864,12 @@ async function diagnoseCustomBenchmark(url) {
   }
 });
 
-server.listen(PORT, () => console.log(`Strict Link Grammar + LanguageTool v50 Browser Context Debug API listening on ${PORT}`));
+server.on('upgrade', (req, socket) => {
+  try {
+    const url = new URL(req.url || '/', 'http://localhost');
+    if (url.pathname.startsWith('/room/')) return handleEnglishRoomUpgrade(req, socket);
+  } catch {}
+  try { socket.destroy(); } catch {}
+});
+
+server.listen(PORT, () => console.log(`Strict Link Grammar + LanguageTool v111 API + English room WebSocket listening on ${PORT}`));

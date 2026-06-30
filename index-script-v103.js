@@ -1,4 +1,3 @@
-
 (() => {
 'use strict';
 // v75: boot guard. Start button must not die if later initialization throws.
@@ -18,9 +17,8 @@ try{
 }catch(e){ console.error('early start bind failed', e); }
 try{
 
-const APP_VERSION='v106-online-seat-election-toast';
+const APP_VERSION='v111-server-authoritative-seats';
 const $ = id => document.getElementById(id);
-const WS_URL = 'wss://mine-server-git2.vigourjp2.workers.dev/room/english';
 const N = 7;
 const COLORS = ['#38bdf8','#f472b6','#a3e635','#facc15'];
 const __crypto = (typeof globalThis!=='undefined' && globalThis.crypto) ? globalThis.crypto : null;
@@ -29,6 +27,10 @@ let roomStateReceived=false;
 let onlineEstablished=false;
 let onlineJoinTimer=null;
 let onlinePeerIds=new Set();
+let desiredSeatIndex=null;
+let serverSeatIndex=-1;
+let serverRoomId='english';
+let serverAuthoritative=false;
 try{
   clientId = localStorage.englishClientId || '';
   if(!clientId){
@@ -95,6 +97,14 @@ const IMAGE_INTEGRATION_VERSION='sentence-image-diversity-v44-case-preserve-fron
 const LINK_GRAMMAR_API_KEY='englishPittan.linkGrammarApi';
 let __storedLgApi=''; try{ __storedLgApi=localStorage.getItem(LINK_GRAMMAR_API_KEY)||''; }catch(e){ __storedLgApi=''; }
 let linkGrammarApi=(new URL(location.href).searchParams.get('lgapi') || __storedLgApi || 'https://english-pittan-lg-api.onrender.com').trim();
+function defaultWsUrl(){
+  const qs=new URL(location.href).searchParams;
+  let stored=''; try{ stored=localStorage.getItem('englishPittan.wsUrl')||''; }catch(e){}
+  const explicit=(qs.get('ws')||stored||'').trim();
+  if(explicit) return explicit;
+  return 'wss://mine-server-git2.vigourjp2.workers.dev/room/english';
+}
+const WS_URL = defaultWsUrl();
 let linkGrammarStatus=linkGrammarApi ? 'READY' : 'OFF';
 function clearEnglishJudgeCache(){
   // v101: 旧版の判定キャッシュを掃除するだけ。新規保存はしない。
@@ -454,7 +464,7 @@ function slotInfo(i,w){
 const targets = Array.from(EXACT.keys()).slice(0,24);
 let state = freshState(2);
 function freshState(playerCount=2){
-  return {version:1,roomHostId:null,gameId:'eng-'+Date.now().toString(36),turn:0,turnNo:1,playerCount,wordsMade:0,board:Array.from({length:N*N},()=>null),players:Array.from({length:playerCount},(_,i)=>({name:'Player '+(i+1),clientId:null,score:0,tiles:0,color:COLORS[i],hand:drawHand(i)})),log:[{t:Date.now(),text:'新規ゲーム開始',good:true}],statusText:'単語タイルを選んで空きマスに置く',statusClass:'info',lastJudgeMsg:'',lastJudgeClass:'info'};
+  return {version:1,roomHostId:null,roomCreatedAt:null,gameId:'eng-'+Date.now().toString(36),turn:0,turnNo:1,playerCount,wordsMade:0,board:Array.from({length:N*N},()=>null),players:Array.from({length:playerCount},(_,i)=>({name:'Player '+(i+1),clientId:null,score:0,tiles:0,color:COLORS[i],hand:drawHand(i)})),log:[{t:Date.now(),text:'新規ゲーム開始',good:true}],statusText:'単語タイルを選んで空きマスに置く',statusClass:'info',lastJudgeMsg:'',lastJudgeClass:'info'};
 }
 function drawHand(seed=0){
   // 詰み対策：種類ごとの固定スロットで、常に「主語 / be・助 / 動詞 / 形容詞・ing / 名詞 / 追加」を1枚ずつ持つ。
@@ -493,19 +503,50 @@ function playerDisplay(i){
   const nm=String(p?.name||'').trim();
   return nm && nm!==playerTag(i) ? `${playerTag(i)} ${nm}` : playerTag(i);
 }
+function normalizeSeatText(v){
+  return String(v||'')
+    .replace(/[Ｐｐ]/g,'P')
+    .replace(/[０-９]/g,ch=>String(ch.charCodeAt(0)-0xFF10))
+    .trim()
+    .toUpperCase();
+}
+function preferredPlayerIndexFromName(){
+  const raw=normalizeSeatText(($('nameInput')&&$('nameInput').value)||safeName()||'');
+  const compact=raw.replace(/\s+/g,'');
+  const m=/^P([1-4])$/.exec(compact) || /(?:^|[^A-Z0-9])P([1-4])(?:[^0-9]|$)/.exec(compact);
+  return m ? Math.max(0, Math.min(3, Number(m[1])-1)) : -1;
+}
+function desiredPlayerIndex(){
+  const live=preferredPlayerIndexFromName();
+  if(live>=0){ desiredSeatIndex=live; return live; }
+  if(Number.isInteger(desiredSeatIndex) && desiredSeatIndex>=0) return desiredSeatIndex;
+  return -1;
+}
+function onlinePlayerCount(){
+  const sel=Number($('playerCount').value)||2;
+  return Math.max(2, sel);
+}
+function ensureOnlinePlayerCount(){
+  const pc=Number($('playerCount').value)||1;
+  if(pc<2){
+    $('playerCount').value='2';
+    setMsg('ONLINE対戦なので人数を2人対戦に切り替えました。P1端末とP2端末の両方でONLINEにしてください。','info');
+  }
+}
 function canHostControl(){
   if(!isOnlineGame()) return true;
-  const li=localPlayerIndex();
-  return li===0;
+  return serverAuthoritative ? serverSeatIndex===0 : localPlayerIndex()===0;
 }
 function clearLocalClientSeats(){
   if(!state||!Array.isArray(state.players)) return;
   state.players.forEach(p=>{ if(String(p?.clientId||'')===String(clientId)) p.clientId=null; });
 }
 function startOnlineRoomAsHost(){
-  const pc=Number($('playerCount').value)||2;
+  ensureOnlinePlayerCount();
+  const pc=onlinePlayerCount();
   state=freshState(pc);
   state.roomHostId=clientId;
+  state.roomCreatedAt=Date.now();
   state.players[0].clientId=clientId;
   state.players[0].name=safeName();
   localStorage.englishName=safeName();
@@ -517,13 +558,15 @@ function startOnlineRoomAsHost(){
 }
 function maybeStartOnlineRoomAfterDiscovery(){
   if(roomStateReceived||onlineEstablished) return;
+  ensureOnlinePlayerCount();
   const ids=Array.from(onlinePeerIds||[]).filter(Boolean).sort();
   const leader=ids[0]||clientId;
   if(String(leader)===String(clientId)){
     startOnlineRoomAsHost();
   }else{
     clearLocalClientSeats();
-    setMsg('相手の部屋状態を待っています。数秒待っても進まなければ両端末を再読み込みしてください。','info');
+    requestSeat('leader-wait');
+    setMsg('部屋ホストの状態を待っています。席はホストから割り当てられます。','info');
     render();
   }
 }
@@ -533,6 +576,7 @@ function playerIndexForClient(id=clientId){
   return state.players.findIndex(p=>String(p?.clientId||'')===cid);
 }
 function localPlayerIndex(){
+  if(isOnlineGame() && serverAuthoritative && serverSeatIndex>=0) return serverSeatIndex;
   const found=playerIndexForClient(clientId);
   if(found>=0) return found;
   if(state?.playerCount===1) return 0;
@@ -544,18 +588,32 @@ function localPlayer(){
 }
 function claimLocalPlayerSeat(preferIndex=0, announce=true){
   if(!state || !Array.isArray(state.players)) return -1;
+  // v109: 名前欄の P1/P2 で席を決めない。席はオンライン部屋の空き順で決める。
   const existing=playerIndexForClient(clientId);
   if(existing>=0){
     state.players[existing].name=safeName();
     return existing;
   }
-  let target=-1;
-  if(Number.isInteger(preferIndex) && state.players[preferIndex] && !state.players[preferIndex].clientId) target=preferIndex;
-  if(target<0) target=state.players.findIndex(p=>!p.clientId);
+  let target=state.players.findIndex(p=>!p.clientId);
   if(target<0) return -1;
   state.players[target].clientId=clientId;
   state.players[target].name=safeName();
   if(announce) broadcast({type:'englishState',gameId:state.gameId,state:lightState(),reason:'seat-claim'});
+  return target;
+}
+function assignRemoteSeat(remoteId, remoteName=''){
+  if(!state || !Array.isArray(state.players)) return -1;
+  const rid=String(remoteId||'');
+  if(!rid || rid===String(clientId)) return -1;
+  const existing=state.players.findIndex(p=>String(p?.clientId||'')===rid);
+  if(existing>=0){
+    if(remoteName) state.players[existing].name=String(remoteName).trim().slice(0,18);
+    return existing;
+  }
+  const target=state.players.findIndex(p=>!p.clientId);
+  if(target<0) return -1;
+  state.players[target].clientId=rid;
+  state.players[target].name=String(remoteName||('Player '+(target+1))).trim().slice(0,18);
   return target;
 }
 function isOnlineGame(){ return !!(socket && socket.readyState===WebSocket.OPEN); }
@@ -563,6 +621,7 @@ function isMyTurn(){
   if(!state || state.playerCount<=1) return true;
   // 未接続時は1端末で交代プレイできるようにする。オンライン接続中だけ担当プレイヤーを厳密判定。
   if(!isOnlineGame()) return true;
+  if(serverAuthoritative && serverSeatIndex<0) return false;
   return localPlayerIndex() === (state.turn%state.playerCount);
 }
 function isBoardEmpty(){ return !state.board.some(Boolean); }
@@ -2012,19 +2071,58 @@ function drawOne(){return WORDS[Math.floor(Math.random()*WORDS.length)].w}
 function nextTurn(){state.turn=(state.turn+1)%state.playerCount;state.turnNo++;}
 function recalcTiles(){state.players.forEach(p=>p.tiles=0);state.board.forEach(c=>{if(c&&state.players[c.owner])state.players[c.owner].tiles++;});}
 function lightState(){return JSON.parse(JSON.stringify(state));}
+function roomHostIdOf(s){ return String(s?.roomHostId || ''); }
+function roomCreatedAtOf(s){ return Number(s?.roomCreatedAt || 0); }
+function compareRoomAuthority(a,b){
+  const ah=roomHostIdOf(a), bh=roomHostIdOf(b);
+  if(ah && !bh) return -1;
+  if(!ah && bh) return 1;
+  if(!ah && !bh) return 0;
+  const at=roomCreatedAtOf(a), bt=roomCreatedAtOf(b);
+  if(at && bt && Math.abs(at-bt)>50) return at<bt ? -1 : 1;
+  if(ah!==bh) return ah<bh ? -1 : 1;
+  return 0;
+}
+function isLocalRoomHost(){ return isOnlineGame() && String(state?.roomHostId||'')===String(clientId); }
+function requestSeat(reason='seat-request'){
+  if(!isOnlineGame()) return false;
+  return broadcast({type:'englishSeatRequest',wantState:true,gameId:state?.gameId||'',roomHostId:state?.roomHostId||'',reason});
+}
+function shouldAcceptIncomingRoom(s){
+  if(!s||!Array.isArray(s.players)) return false;
+  const incomingHost=roomHostIdOf(s), currentHost=roomHostIdOf(state);
+  const incomingHasMe=Array.isArray(s.players)&&s.players.some(p=>String(p?.clientId||'')===String(clientId));
+  const currentHasMe=playerIndexForClient(clientId)>=0;
+  if(!onlineEstablished || !currentHost) return true;
+  if(incomingHost && currentHost && incomingHost!==currentHost){
+    return compareRoomAuthority(s,state)<0;
+  }
+  if(incomingHost && currentHost && incomingHost===currentHost){
+    if(s.gameId!==state.gameId) return true;
+    const incomingTurn=Number(s.turnNo)||0;
+    const currentTurn=Number(state.turnNo)||0;
+    return incomingHasMe || !currentHasMe || incomingTurn>=currentTurn;
+  }
+  return !currentHost && !!incomingHost;
+}
 function applyState(s,why='同期'){
   if(!s||!Array.isArray(s.board)||!Array.isArray(s.players))return false;
   roomStateReceived=true;onlineEstablished=true;
+  if(serverAuthoritative && serverSeatIndex>=0){
+    s.playerCount = Math.max(2, Math.min(4, Number(s.playerCount||s.players.length||2)));
+  }
   if(onlineJoinTimer){clearTimeout(onlineJoinTimer);onlineJoinTimer=null;}
-  const incomingHadSeat=Array.isArray(s.players) && s.players.some(p=>String(p?.clientId||'')===clientId);
+  const incomingHadSeat=Array.isArray(s.players) && s.players.some(p=>String(p?.clientId||'')===String(clientId));
   state=s;selectedHandIndex=-1;recentCells=[];failFocusCell=-1;
   if(!state.roomHostId){
     const host=(state.players||[]).find(p=>p&&p.clientId);
     state.roomHostId=host?.clientId||null;
   }
-  if(state.playerCount>1) claimLocalPlayerSeat(-1,false);
+  if(!state.roomCreatedAt) state.roomCreatedAt=Date.now();
   const hasSeat=playerIndexForClient(clientId)>=0;
-  recalcTiles();setMsg(`${why} / 自分は${hasSeat?playerTag(playerIndexForClient(clientId)):'観戦'}です`,'good');render();
+  recalcTiles();
+  if(!hasSeat && isOnlineGame() && !serverAuthoritative) requestSeat('apply-state-no-seat');
+  setMsg(`${why} / 自分は${hasSeat?playerTag(playerIndexForClient(clientId)):'席割当待ち'}です`,'good');render();
   return hasSeat && !incomingHadSeat;
 }
 function passTurn(){if(!isMyTurn()){setMsg('自分のターンではありません','bad');return;}const p=currentPlayer();addLog(`${p.name}: パス`,false);state.attackChance=null;nextTurn();broadcast({type:'englishState',gameId:state.gameId,state:lightState(),reason:'pass'});render();}
@@ -2034,7 +2132,7 @@ function newGame(broadcastIt=true){
     setMsg('新規ゲーム開始はP1端末だけです。P2以降はP1の開始を待ってください。','bad');
     return;
   }
-  clearEnglishJudgeCache();displayedRejectReasonRequestKeys=new Set();displayedRejectReasonPlacementKeys=new Set();const pc=Number($('playerCount').value)||2;state=freshState(pc);state.roomHostId=isOnlineGame()?clientId:null;const name=safeName();state.players[0].name=name;state.players[0].clientId=clientId;localStorage.englishName=name;selectedHandIndex=-1;recentCells=[];failFocusCell=-1;state.attackChance=null; if(broadcastIt)broadcast({type:'englishNewGame',gameId:state.gameId,state:lightState()});render();setMsg(state.playerCount===1?'1人練習開始。最初の1枚は左上です。':'新規ゲーム開始。この端末はP1です。P2以降はONLINE接続だけして待機してください。','good');}
+  clearEnglishJudgeCache();displayedRejectReasonRequestKeys=new Set();displayedRejectReasonPlacementKeys=new Set();if(isOnlineGame())ensureOnlinePlayerCount();const pc=isOnlineGame()?onlinePlayerCount():(Number($('playerCount').value)||2);const prevRoomCreatedAt=state?.roomCreatedAt||Date.now();state=freshState(pc);state.roomHostId=isOnlineGame()?clientId:null;state.roomCreatedAt=isOnlineGame()?prevRoomCreatedAt:null;const name=safeName();const mySeat=(isOnlineGame()&&serverAuthoritative&&serverSeatIndex>=0)?serverSeatIndex:0;state.players[mySeat].name=name;state.players[mySeat].clientId=clientId;localStorage.englishName=name;selectedHandIndex=-1;recentCells=[];failFocusCell=-1;state.attackChance=null; if(broadcastIt)broadcast({type:'englishNewGame',gameId:state.gameId,state:lightState()});render();setMsg(state.playerCount===1?'1人練習開始。最初の1枚は左上です。':'新規ゲーム開始。この端末が部屋ホストP1です。以降の参加者はホストから席を受け取ります。','good');}
 function render(){
   $('turnNo').textContent=state.turnNo;$('wordsMade').textContent=state.wordsMade;$('filledNo').textContent=state.board.filter(Boolean).length;$('roomNo').textContent='english';$('myId').textContent=clientId;
   const tp=currentPlayer();
@@ -2064,46 +2162,82 @@ function setMp(text,cls){$('mp').textContent=text;$('mp').className=cls;}
 function broadcast(obj){
   if(suppressBroadcast) return false;
   if(!socket||socket.readyState!==WebSocket.OPEN) return false;
-  try{obj.clientId=clientId;obj.name=safeName();obj.time=Date.now();socket.send(JSON.stringify(obj));return true;}catch(e){return false;}
+  try{obj.clientId=clientId;obj.name=safeName();obj.seatIndex=serverSeatIndex;obj.playerCount=onlinePlayerCount();obj.appVersion=APP_VERSION;obj.time=Date.now();socket.send(JSON.stringify(obj));return true;}catch(e){return false;}
 }
 function connect(){
   if(socket&&(socket.readyState===WebSocket.OPEN||socket.readyState===WebSocket.CONNECTING))return;
   clearTimeout(retryTimer);clearInterval(heartbeat);setMp('CONNECTING','info');
   socket=new WebSocket(WS_URL);
-  socket.addEventListener('open',()=>{setMp('ONLINE','good');roomStateReceived=false;onlineEstablished=false;onlinePeerIds=new Set([clientId]);setMsg('ONLINE接続。部屋の状態を確認中…','info');broadcast({type:'join',x:0,y:0,z:0,yaw:0,pitch:0});broadcast({type:'englishHello',wantState:true,gameId:state.gameId,helloOnly:true});clearTimeout(onlineJoinTimer);onlineJoinTimer=setTimeout(maybeStartOnlineRoomAfterDiscovery,900);heartbeat=setInterval(()=>broadcast({type:'ping'}),10000);});
+  socket.addEventListener('open',()=>{ensureOnlinePlayerCount();setMp('ONLINE','good');roomStateReceived=false;onlineEstablished=false;serverAuthoritative=false;serverSeatIndex=-1;onlinePeerIds=new Set([clientId]);setMsg('ONLINE接続。サーバーから席番号を取得中…','info');broadcast({type:'englishJoin',wantState:true,gameId:state.gameId});clearTimeout(onlineJoinTimer);heartbeat=setInterval(()=>broadcast({type:'ping'}),10000);});
   socket.addEventListener('message',ev=>{rx++;$('rx').textContent=rx;handleNet(ev.data);});
-  socket.addEventListener('close',()=>{clearInterval(heartbeat);setMp('RETRY','bad');retryTimer=setTimeout(connect,3000);});
+  socket.addEventListener('close',()=>{clearInterval(heartbeat);serverAuthoritative=false;serverSeatIndex=-1;setMp('RETRY','bad');retryTimer=setTimeout(connect,3000);});
   socket.addEventListener('error',()=>setMp('ERROR','bad'));
 }
 function parse(raw){try{return JSON.parse(raw)}catch{return null}}
 function eachPayload(msg,cb,depth=0){if(!msg||depth>3)return;if(typeof msg==='string'){eachPayload(parse(msg),cb,depth+1);return;}if(Array.isArray(msg)){msg.forEach(x=>eachPayload(x,cb,depth+1));return;}cb(msg);['payload','data','message','state'].forEach(k=>{if(msg[k]&&msg[k]!==msg)eachPayload(msg[k],cb,depth+1);});}
 function handleNet(raw){eachPayload(raw,(msg)=>{
-  if(!msg||msg.clientId===clientId)return;
-  if(msg.clientId) onlinePeerIds.add(String(msg.clientId));
-  if(msg.type==='englishHello'&&msg.wantState){
-    if(onlineEstablished && state && state.roomHostId){broadcast({type:'englishState',gameId:state.gameId,state:lightState(),reason:'hello-sync'});}
+  if(!msg) return;
+  if(msg.type==='seatAssigned'){
+    serverAuthoritative=true;
+    serverSeatIndex=Number.isFinite(Number(msg.seatIndex))?Number(msg.seatIndex):-1;
+    serverRoomId=String(msg.roomId||'english');
+    onlineEstablished=true;roomStateReceived=!!msg.state;
+    if(onlineJoinTimer){clearTimeout(onlineJoinTimer);onlineJoinTimer=null;}
+    if(Array.isArray(msg.seats)){ onlinePeerIds=new Set(msg.seats.filter(Boolean).map(s=>String(s.clientId)).filter(Boolean)); }
+    if(msg.state){ applyState(msg.state,'サーバー同期'); }
+    else if(msg.needNewGame && serverSeatIndex===0){ startOnlineRoomAsHost(); }
+    else { setMsg(`ONLINE接続完了。自分は${serverSeatIndex>=0?playerTag(serverSeatIndex):'観戦'}です。P1の開始を待っています。`,'good'); render(); }
     return;
   }
-  if(msg.type==='englishNewGame'&&msg.state){const claimed=applyState(msg.state,'部屋に参加'); if(claimed) broadcast({type:'englishState',gameId:state.gameId,state:lightState(),reason:'seat-claim-sync'});return;}
+  if(msg.type==='actionRejected'){
+    setMsg(msg.reason||'サーバーで操作が拒否されました。','bad');
+    if(msg.state) applyState(msg.state,'サーバー再同期');
+    return;
+  }
+  if(msg.type==='roomPresence'){
+    if(Array.isArray(msg.seats)) onlinePeerIds=new Set(msg.seats.filter(Boolean).map(s=>String(s.clientId)).filter(Boolean));
+    return;
+  }
+  if(msg.type==='pong') return;
+  if(!msg.server && msg.clientId===clientId)return;
+  if(msg.clientId) onlinePeerIds.add(String(msg.clientId));
+  if((msg.type==='englishHello'||msg.type==='englishSeatRequest')&&msg.wantState){
+    if(serverAuthoritative){ broadcast({type:'englishJoin',wantState:true,gameId:state?.gameId||''}); return; }
+    if(isLocalRoomHost()){
+      const before=JSON.stringify((state.players||[]).map(p=>p.clientId||''));
+      assignRemoteSeat(msg.clientId,msg.name);
+      const after=JSON.stringify((state.players||[]).map(p=>p.clientId||''));
+      broadcast({type:'englishState',gameId:state.gameId,state:lightState(),reason:before===after?'host-sync':'host-seat-assign'});
+    }else if(onlineEstablished && state && state.roomHostId){
+      requestSeat('non-host-forward-request');
+    }
+    return;
+  }
+  if(msg.type==='englishNewGame'&&msg.state){
+    if(serverAuthoritative || shouldAcceptIncomingRoom(msg.state)) applyState(msg.state,'部屋に参加');
+    else if(isLocalRoomHost()) broadcast({type:'englishState',gameId:state.gameId,state:lightState(),reason:'reject-foreign-newgame-resync'});
+    return;
+  }
   if((msg.type==='englishState'||msg.type==='englishPlace')&&msg.state){
-    const incomingTurn=Number(msg.state.turnNo)||0;
-    const incomingHost=String(msg.state.roomHostId||'');
-    const currentHost=String(state.roomHostId||'');
-    const hostWins = incomingHost && (!currentHost || incomingHost<=currentHost);
-    if(msg.state.gameId!==state.gameId || incomingTurn>=state.turnNo || hostWins){const claimed=applyState(msg.state,'オンライン同期'); if(claimed) broadcast({type:'englishState',gameId:state.gameId,state:lightState(),reason:'seat-claim-sync'});}
+    if(serverAuthoritative || shouldAcceptIncomingRoom(msg.state)){
+      applyState(msg.state,'オンライン同期');
+    }else if(isLocalRoomHost()){
+      broadcast({type:'englishState',gameId:state.gameId,state:lightState(),reason:'authoritative-resync'});
+    }
   }
 });}
 
+
 // v70: persistent hand completion polling removed. Reason polling must not enqueue extra jobs.
 $('startBtn').onclick=()=>{clearEnglishJudgeCache();try{unlockSpeech();}catch(e){console.warn('unlockSpeech unavailable',e);}$('start').style.display='none';render();checkReasonApiHealth('ブラウザAPI確認');};
-$('connectBtn').onclick=()=>{try{unlockSpeech();}catch(e){console.warn('unlockSpeech unavailable',e);}connect();};
+$('connectBtn').onclick=()=>{try{unlockSpeech();}catch(e){console.warn('unlockSpeech unavailable',e);}ensureOnlinePlayerCount();connect();};
 $('newGameBtn').onclick=()=>newGame(true);
 $('resetBtn').onclick=()=>{if(isOnlineGame()&&!canHostControl()){setMsg('盤面リセットはP1端末だけです。P2以降は待機してください。','bad');return;}if(confirm('盤面をリセットしてオンラインにも送信する？'))newGame(true);};
 $('passBtn').onclick=passTurn;
 $('drawBtn').onclick=swapHand;
 $('thirdBtn').onclick=toggleSelectedThirdPerson;
 $('nameInput').value=localStorage.englishName||('P-'+clientId);
-$('nameInput').addEventListener('change',()=>{localStorage.englishName=safeName();const pi=claimLocalPlayerSeat(0,false);if(pi>=0)state.players[pi].name=safeName();broadcast({type:'englishState',gameId:state.gameId,state:lightState(),reason:'rename'});render();});
+$('nameInput').addEventListener('change',()=>{localStorage.englishName=safeName();const pi=localPlayerIndex();if(pi>=0)state.players[pi].name=safeName();broadcast({type:'englishState',gameId:state.gameId,state:lightState(),reason:'rename'});render();});
 $('playerCount').addEventListener('change',()=>{if(isOnlineGame()){setMsg('人数変更は接続前、またはP1が新規ゲーム開始時に行ってください。','bad');return;}newGame(false);});
 newGame(false);render();
 }catch(__bootErr){
@@ -2126,4 +2260,3 @@ if(sentenceImageCloseBtn){
   sentenceImageCloseBtn.addEventListener('pointerdown', closeSentenceImagePanel);
   sentenceImageCloseBtn.addEventListener('touchstart', closeSentenceImagePanel, {passive:false});
 }
-
