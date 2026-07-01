@@ -994,39 +994,15 @@ async function rescueAcceptedPrefixCandidates(routeCandidates, placeIndex){
   }
   // 短い完成文を優先して救済する。NG理由を出すより先に、現在APIの正答を拾う。
   items.sort((a,b)=>a.words.length-b.words.length || a.seg[0].i-b.seg[0].i);
-  // v122: prefix rescueも1件ずつ /check-and-translate へ投げない。
-  // v121のAPI側batch高速化は /check-and-translate-batch にしか効かないため、
-  // ここが単体APIのままだと、成立0の局面で0.7〜1.0秒×最大32回の遅延が残る。
-  // まとめてbatchへ渡して、最初に成立したprefixだけ採用する。
-  const rescueItems=items.slice(0,32).map((item,i)=>({
-    ...item,
-    id:String(i),
-    wordMeta:wordMetaForApi(item.words),
-    reasonPriorityEpoch:Date.now(),
-    reasonPrioritySeq:i
-  }));
-  try{
-    const rows=await batchApiCheckItems(base,rescueItems,Date.now());
-    for(let i=0;i<rescueItems.length;i++){
-      const item=rescueItems[i];
-      const ev=evFromApiResult(rows[i],item.words);
+  for(const item of items.slice(0,32)){
+    try{
+      const data=await singleApiCheckItem(base,{text:item.text, words:item.words, wordMeta:wordMetaForApi(item.words), reasonPriorityEpoch:Date.now(), reasonPrioritySeq:0});
+      const ev=evFromApiResult(data,item.words);
       if(ev){
-        out.push({...ev,cells:item.seg.map(s=>s.i),dir:item.label||'prefix-rescue',source:'api-prefix-rescue-v122-batch'});
-        break;
+        out.push({...ev,cells:item.seg.map(s=>s.i),dir:item.label||'prefix-rescue',source:'api-prefix-rescue-v100'});
       }
-    }
-  }catch(e){
-    console.warn('prefix rescue batch failed; fallback to first 4 single checks', e);
-    for(const item of rescueItems.slice(0,4)){
-      try{
-        const data=await singleApiCheckItem(base,{text:item.text, words:item.words, wordMeta:item.wordMeta, reasonPriorityEpoch:item.reasonPriorityEpoch, reasonPrioritySeq:item.reasonPrioritySeq});
-        const ev=evFromApiResult(data,item.words);
-        if(ev){
-          out.push({...ev,cells:item.seg.map(s=>s.i),dir:item.label||'prefix-rescue',source:'api-prefix-rescue-v122-single-fallback'});
-          break;
-        }
-      }catch(err){ console.warn('prefix rescue fallback check failed', item.text, err); }
-    }
+    }catch(e){ console.warn('prefix rescue check failed', item.text, e); }
+    if(out.length) break;
   }
   if(out.length){
     lastScanRejects=[];
