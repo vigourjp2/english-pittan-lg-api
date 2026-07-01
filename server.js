@@ -1145,26 +1145,53 @@ async function evaluateGameTextLightForReason(text, options = {}) {
 
 let __linkParserSeq = 0;
 
-function runLinkParser(text) {
-  return new Promise((resolve) => {
-    const args = ['en', '-batch', '-verbosity=0', '-graphics=0', '-null=0', '-islands-ok=0', '-spell=0'];
-    const lpId = ++__linkParserSeq;
-    const lpStartedAt = Date.now();
-    const lpInput = terminalSentence(text);
-    const lpMemStart = process.memoryUsage();
-    console.log('[link-parser-start]', {
-      id: lpId,
-      len: lpInput.length,
-      text: lpInput.slice(0, 160),
-      rssMB: Math.round(lpMemStart.rss / 1024 / 1024),
-      heapUsedMB: Math.round(lpMemStart.heapUsed / 1024 / 1024)
-    });
+// v119: link-parser高速化。
+// 旧版は1文ごとに `link-parser` をspawnしていたため、辞書/ライブラリ初期化が毎回0.7〜1.0秒乗っていた。
+// 既定は常駐プロセス1本をstdin/stdoutで使い回す。挙動確認や切り戻し用に LINK_PARSER_MODE=oneshot で旧方式へ戻せる。
+const LINK_PARSER_MODE = String(process.env.LINK_PARSER_MODE || 'persistent').toLowerCase();
+const LINK_PARSER_IDLE_MS = Math.max(20, Number(process.env.LINK_PARSER_IDLE_MS || 80));
+const LINK_PARSER_FALLBACK_IDLE_MS = Math.max(300, Number(process.env.LINK_PARSER_FALLBACK_IDLE_MS || 1500));
+const LINK_PARSER_TIMEOUT_MS = Math.max(3000, Number(process.env.LINK_PARSER_TIMEOUT_MS || 15000));
+const LINK_PARSER_CACHE_MAX = Math.max(0, Number(process.env.LINK_PARSER_CACHE_MAX || 1000));
+const LINK_PARSER_ARGS = ['en', '-batch', '-verbosity=0', '-graphics=0', '-null=0', '-islands-ok=0', '-spell=0'];
+const linkParserCache = new Map();
 
+function cloneLinkParserResult(x) {
+  return x ? { ...x, cacheHit: !!x.cacheHit } : x;
+}
+function parseLinkParserResult(out, err, code = 0) {
+  const hardError = /\+\+\+\+\+ error/i.test(out) || /No complete linkages found/i.test(out) || code !== 0;
+  const m = out.match(/Found\s+(\d+)\s+linkages/i);
+  const linkages = m ? Number(m[1]) : (hardError ? 0 : 1);
+  const ok = !hardError && linkages > 0;
+  return {
+    ok,
+    fullParse: ok,
+    strictLinkGrammar: ok,
+    linkages,
+    nullCount: 0,
+    stdout: String(out || '').slice(0, 1800),
+    stderr: String(err || '').slice(0, 1000),
+    code
+  };
+}
+function linkParserOutputLooksComplete(out, err) {
+  const s = String(out || '') + '\n' + String(err || '');
+  return /Found\s+\d+\s+linkages/i.test(s) || /No complete linkages found/i.test(s) || /\+\+\+\+\+ error/i.test(s);
+}
+function rememberLinkParserCache(key, value) {
+  if (!LINK_PARSER_CACHE_MAX) return;
+  if (linkParserCache.has(key)) linkParserCache.delete(key);
+  linkParserCache.set(key, { ...value, cacheHit:false });
+  while (linkParserCache.size > LINK_PARSER_CACHE_MAX) linkParserCache.delete(linkParserCache.keys().next().value);
+}
+
+function runLinkParserOneShot(lpInput, lpId, lpStartedAt) {
+  return new Promise((resolve) => {
     const beforeSpawnAt = Date.now();
-    const p = spawn('link-parser', args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    const p = spawn('link-parser', LINK_PARSER_ARGS, { stdio: ['pipe', 'pipe', 'pipe'] });
     const spawnReturnMs = Date.now() - beforeSpawnAt;
     const pid = p.pid || null;
-
     let out = '';
     let err = '';
     let firstStdoutMs = null;
@@ -1183,61 +1210,193 @@ function runLinkParser(text) {
     p.on('error', e => {
       const lpMemEnd = process.memoryUsage();
       console.log('[link-parser-end]', {
-        id: lpId,
-        pid,
-        ms: Date.now() - lpStartedAt,
-        spawnReturnMs,
-        wroteMs,
-        endedMs,
-        firstStdoutMs,
-        firstStderrMs,
-        ok: false,
-        code: -1,
-        error: String(e.message || e).slice(0, 300),
-        rssMB: Math.round(lpMemEnd.rss / 1024 / 1024),
-        heapUsedMB: Math.round(lpMemEnd.heapUsed / 1024 / 1024)
+        id: lpId, pid, mode:'oneshot', ms: Date.now() - lpStartedAt, spawnReturnMs, wroteMs, endedMs,
+        firstStdoutMs, firstStderrMs, ok: false, code: -1, error: String(e.message || e).slice(0, 300),
+        rssMB: Math.round(lpMemEnd.rss / 1024 / 1024), heapUsedMB: Math.round(lpMemEnd.heapUsed / 1024 / 1024)
       });
       resolve({ ok:false, fullParse:false, strictLinkGrammar:false, linkages:0, nullCount:0, stdout:'', stderr:String(e.message || e), code:-1 });
     });
     p.on('close', code => {
-      const hardError = /\+\+\+\+\+ error/i.test(out) || /No complete linkages found/i.test(out) || code !== 0;
-      const m = out.match(/Found\s+(\d+)\s+linkages/i);
-      const linkages = m ? Number(m[1]) : (hardError ? 0 : 1);
-      const ok = !hardError && linkages > 0;
+      const parsed = parseLinkParserResult(out, err, code);
       const lpMemEnd = process.memoryUsage();
       console.log('[link-parser-end]', {
-        id: lpId,
-        pid,
-        ms: Date.now() - lpStartedAt,
-        spawnReturnMs,
-        wroteMs,
-        endedMs,
-        firstStdoutMs,
-        firstStderrMs,
-        ok,
-        code,
-        linkages,
-        stdoutBytes: out.length,
-        stderrBytes: err.length,
-        rssMB: Math.round(lpMemEnd.rss / 1024 / 1024),
-        heapUsedMB: Math.round(lpMemEnd.heapUsed / 1024 / 1024)
+        id: lpId, pid, mode:'oneshot', ms: Date.now() - lpStartedAt, spawnReturnMs, wroteMs, endedMs,
+        firstStdoutMs, firstStderrMs, ok: parsed.ok, code, linkages: parsed.linkages, stdoutBytes: out.length, stderrBytes: err.length,
+        rssMB: Math.round(lpMemEnd.rss / 1024 / 1024), heapUsedMB: Math.round(lpMemEnd.heapUsed / 1024 / 1024)
       });
-      resolve({
-        ok,
-        fullParse: ok,
-        strictLinkGrammar: ok,
-        linkages,
-        nullCount: 0,
-        stdout: out.slice(0, 1800),
-        stderr: err.slice(0, 1000),
-        code
-      });
+      resolve(parsed);
     });
     p.stdin.write(lpInput + '\n');
     wroteMs = Date.now() - lpStartedAt;
     p.stdin.end();
     endedMs = Date.now() - lpStartedAt;
   });
+}
+
+const persistentLinkParser = {
+  proc: null,
+  startingAt: 0,
+  queue: [],
+  active: null,
+  bootOut: '',
+  bootErr: ''
+};
+function stopPersistentLinkParser(reason = '') {
+  const p = persistentLinkParser.proc;
+  persistentLinkParser.proc = null;
+  persistentLinkParser.bootOut = '';
+  persistentLinkParser.bootErr = '';
+  try { if (p && !p.killed) p.kill('SIGKILL'); } catch {}
+  if (persistentLinkParser.active) {
+    const a = persistentLinkParser.active;
+    persistentLinkParser.active = null;
+    try { clearTimeout(a.idleTimer); clearTimeout(a.timeoutTimer); } catch {}
+    a.resolve({ ok:false, fullParse:false, strictLinkGrammar:false, linkages:0, nullCount:0, stdout:'', stderr:'persistent link-parser stopped: '+reason, code:-1 });
+  }
+}
+function ensurePersistentLinkParser() {
+  if (persistentLinkParser.proc && !persistentLinkParser.proc.killed) return persistentLinkParser.proc;
+  persistentLinkParser.startingAt = Date.now();
+  const p = spawn('link-parser', LINK_PARSER_ARGS, { stdio: ['pipe', 'pipe', 'pipe'] });
+  persistentLinkParser.proc = p;
+  persistentLinkParser.bootOut = '';
+  persistentLinkParser.bootErr = '';
+  p.stdout.on('data', d => onPersistentLinkParserData('stdout', d));
+  p.stderr.on('data', d => onPersistentLinkParserData('stderr', d));
+  p.on('error', e => {
+    console.warn('[link-parser-persistent-error]', String(e.message || e));
+    stopPersistentLinkParser(String(e.message || e));
+  });
+  p.on('close', code => {
+    console.warn('[link-parser-persistent-close]', { code });
+    stopPersistentLinkParser('closed code '+code);
+    setTimeout(drainPersistentLinkParserQueue, 10);
+  });
+  return p;
+}
+function onPersistentLinkParserData(stream, d) {
+  const s = d.toString();
+  const a = persistentLinkParser.active;
+  if (!a) {
+    if (stream === 'stdout') persistentLinkParser.bootOut += s;
+    else persistentLinkParser.bootErr += s;
+    return;
+  }
+  const now = Date.now();
+  if (stream === 'stdout') {
+    if (a.firstStdoutMs === null) a.firstStdoutMs = now - a.startedAt;
+    a.out += s;
+  } else {
+    if (a.firstStderrMs === null) a.firstStderrMs = now - a.startedAt;
+    a.err += s;
+  }
+  schedulePersistentSettle(a);
+}
+function schedulePersistentSettle(a) {
+  try { clearTimeout(a.idleTimer); } catch {}
+  const complete = linkParserOutputLooksComplete(a.out, a.err);
+  const wait = complete ? LINK_PARSER_IDLE_MS : LINK_PARSER_FALLBACK_IDLE_MS;
+  a.idleTimer = setTimeout(() => finishPersistentItem(0, complete ? 'marker-idle' : 'fallback-idle'), wait);
+}
+function finishPersistentItem(code = 0, reason = 'done') {
+  const a = persistentLinkParser.active;
+  if (!a) return;
+  persistentLinkParser.active = null;
+  try { clearTimeout(a.idleTimer); clearTimeout(a.timeoutTimer); } catch {}
+  const parsed = parseLinkParserResult(a.out, a.err, code);
+  const lpMemEnd = process.memoryUsage();
+  console.log('[link-parser-end]', {
+    id: a.lpId,
+    pid: persistentLinkParser.proc?.pid || null,
+    mode:'persistent',
+    finishReason: reason,
+    queueLeft: persistentLinkParser.queue.length,
+    ms: Date.now() - a.startedAt,
+    spawnReturnMs: a.spawnReturnMs,
+    wroteMs: a.wroteMs,
+    endedMs: a.endedMs,
+    firstStdoutMs: a.firstStdoutMs,
+    firstStderrMs: a.firstStderrMs,
+    ok: parsed.ok,
+    code,
+    linkages: parsed.linkages,
+    stdoutBytes: a.out.length,
+    stderrBytes: a.err.length,
+    rssMB: Math.round(lpMemEnd.rss / 1024 / 1024),
+    heapUsedMB: Math.round(lpMemEnd.heapUsed / 1024 / 1024)
+  });
+  a.resolve(parsed);
+  setImmediate(drainPersistentLinkParserQueue);
+}
+function drainPersistentLinkParserQueue() {
+  if (persistentLinkParser.active || !persistentLinkParser.queue.length) return;
+  const item = persistentLinkParser.queue.shift();
+  const p = ensurePersistentLinkParser();
+  if (!p || !p.stdin || p.killed || p.stdin.destroyed) {
+    item.resolve({ ok:false, fullParse:false, strictLinkGrammar:false, linkages:0, nullCount:0, stdout:'', stderr:'persistent link-parser unavailable', code:-1 });
+    setImmediate(drainPersistentLinkParserQueue);
+    return;
+  }
+  const now = Date.now();
+  const spawnReturnMs = p.pid ? Math.max(0, now - (persistentLinkParser.startingAt || now)) : null;
+  persistentLinkParser.active = {
+    ...item,
+    out:'', err:'', firstStdoutMs:null, firstStderrMs:null, spawnReturnMs,
+    wroteMs:null, endedMs:null, idleTimer:null, timeoutTimer:null
+  };
+  const a = persistentLinkParser.active;
+  a.timeoutTimer = setTimeout(() => {
+    console.warn('[link-parser-persistent-timeout]', { id:a.lpId, timeoutMs:LINK_PARSER_TIMEOUT_MS });
+    stopPersistentLinkParser('timeout');
+    setImmediate(drainPersistentLinkParserQueue);
+  }, LINK_PARSER_TIMEOUT_MS);
+  try {
+    p.stdin.write(item.lpInput + '\n');
+    a.wroteMs = Date.now() - item.startedAt;
+    a.endedMs = a.wroteMs;
+  } catch (e) {
+    finishPersistentItem(-1, 'write-error:'+String(e.message || e).slice(0, 120));
+  }
+}
+function runLinkParserPersistent(lpInput, lpId, lpStartedAt) {
+  return new Promise((resolve) => {
+    persistentLinkParser.queue.push({ lpInput, lpId, startedAt:lpStartedAt, resolve });
+    drainPersistentLinkParserQueue();
+  });
+}
+
+async function runLinkParser(text) {
+  const lpId = ++__linkParserSeq;
+  const lpStartedAt = Date.now();
+  const lpInput = terminalSentence(text);
+  const cacheKey = lpInput.toLowerCase();
+  const cached = linkParserCache.get(cacheKey);
+  if (cached) {
+    const lpMem = process.memoryUsage();
+    console.log('[link-parser-cache-hit]', {
+      id: lpId,
+      len: lpInput.length,
+      text: lpInput.slice(0, 160),
+      rssMB: Math.round(lpMem.rss / 1024 / 1024),
+      heapUsedMB: Math.round(lpMem.heapUsed / 1024 / 1024)
+    });
+    return { ...cloneLinkParserResult(cached), cacheHit:true };
+  }
+  const lpMemStart = process.memoryUsage();
+  console.log('[link-parser-start]', {
+    id: lpId,
+    len: lpInput.length,
+    text: lpInput.slice(0, 160),
+    mode: LINK_PARSER_MODE === 'oneshot' ? 'oneshot' : 'persistent',
+    queue: persistentLinkParser.queue.length + (persistentLinkParser.active ? 1 : 0),
+    rssMB: Math.round(lpMemStart.rss / 1024 / 1024),
+    heapUsedMB: Math.round(lpMemStart.heapUsed / 1024 / 1024)
+  });
+  let parsed;
+  if (LINK_PARSER_MODE === 'oneshot') parsed = await runLinkParserOneShot(lpInput, lpId, lpStartedAt);
+  else parsed = await runLinkParserPersistent(lpInput, lpId, lpStartedAt);
+  if (parsed && parsed.code !== -1) rememberLinkParserCache(cacheKey, parsed);
+  return parsed;
 }
 
 function tryExtractJson(s) {
@@ -2553,7 +2712,10 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-plus-languagetool-error-gate-v74-no-local-grammar-hardcode',
+        mode:'link-grammar-plus-languagetool-error-gate-v119-persistent-link-parser',
+        linkParserMode: LINK_PARSER_MODE,
+        linkParserQueue: persistentLinkParser.queue.length + (persistentLinkParser.active ? 1 : 0),
+        linkParserCacheSize: linkParserCache.size,
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
@@ -2872,4 +3034,4 @@ server.on('upgrade', (req, socket) => {
   try { socket.destroy(); } catch {}
 });
 
-server.listen(PORT, () => console.log(`Strict Link Grammar + LanguageTool v111 API + English room WebSocket listening on ${PORT}`));
+server.listen(PORT, () => console.log(`Strict Link Grammar + LanguageTool v119 persistent link-parser API listening on ${PORT}`));
