@@ -1148,10 +1148,15 @@ let __linkParserSeq = 0;
 // v119: link-parser高速化。
 // 旧版は1文ごとに `link-parser` をspawnしていたため、辞書/ライブラリ初期化が毎回0.7〜1.0秒乗っていた。
 // 既定は常駐プロセス1本をstdin/stdoutで使い回す。挙動確認や切り戻し用に LINK_PARSER_MODE=oneshot で旧方式へ戻せる。
-const LINK_PARSER_MODE = String(process.env.LINK_PARSER_MODE || 'persistent').toLowerCase();
+// v120: persistent常駐はRender/Linux環境でstdoutがEOFまで返らず固まる可能性があるため、既定は安定版oneshotへ戻す。
+// v121: 高速化はpersistentではなく、/check-and-translate-batch内で複数文を1回spawnへまとめて渡すoneshot-batch方式にする。
+//       parserは処理後に終了するため、v119のようなstdout待ち停止を避ける。
+const LINK_PARSER_MODE = String(process.env.LINK_PARSER_MODE || 'oneshot').toLowerCase();
 const LINK_PARSER_IDLE_MS = Math.max(20, Number(process.env.LINK_PARSER_IDLE_MS || 80));
 const LINK_PARSER_FALLBACK_IDLE_MS = Math.max(300, Number(process.env.LINK_PARSER_FALLBACK_IDLE_MS || 1500));
 const LINK_PARSER_TIMEOUT_MS = Math.max(3000, Number(process.env.LINK_PARSER_TIMEOUT_MS || 15000));
+const LINK_PARSER_BATCH_MODE = String(process.env.LINK_PARSER_BATCH_MODE || 'oneshot-batch').toLowerCase();
+const LINK_PARSER_BATCH_MAX = Math.max(1, Number(process.env.LINK_PARSER_BATCH_MAX || 256));
 const LINK_PARSER_CACHE_MAX = Math.max(0, Number(process.env.LINK_PARSER_CACHE_MAX || 1000));
 const LINK_PARSER_ARGS = ['en', '-batch', '-verbosity=0', '-graphics=0', '-null=0', '-islands-ok=0', '-spell=0'];
 const linkParserCache = new Map();
@@ -1397,6 +1402,134 @@ async function runLinkParser(text) {
   else parsed = await runLinkParserPersistent(lpInput, lpId, lpStartedAt);
   if (parsed && parsed.code !== -1) rememberLinkParserCache(cacheKey, parsed);
   return parsed;
+}
+
+
+function parseLinkParserBatchResult(out, err, code = 0, count = 0) {
+  const src = String(out || '') + '\n' + String(err || '');
+  const markers = [];
+  const re = /(Found\s+\d+\s+linkages|No complete linkages found|\+\+\+\+\+ error[^\n]*)/ig;
+  let m;
+  while ((m = re.exec(src)) !== null) markers.push({ index:m.index, text:m[0] });
+  if (markers.length !== count) return null;
+  const results = [];
+  for (let i = 0; i < count; i++) {
+    const start = i === 0 ? 0 : markers[i - 1].index;
+    const end = i + 1 < markers.length ? markers[i + 1].index : src.length;
+    const block = src.slice(start, end);
+    results.push(parseLinkParserResult(block, '', code));
+  }
+  return results;
+}
+
+function runLinkParserOneShotBatchRaw(lpInputs, batchId, startedAt) {
+  return new Promise((resolve) => {
+    const beforeSpawnAt = Date.now();
+    const p = spawn('link-parser', LINK_PARSER_ARGS, { stdio: ['pipe', 'pipe', 'pipe'] });
+    const spawnReturnMs = Date.now() - beforeSpawnAt;
+    const pid = p.pid || null;
+    let out = '';
+    let err = '';
+    let firstStdoutMs = null;
+    let firstStderrMs = null;
+    let wroteMs = null;
+    let endedMs = null;
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { if (p && !p.killed) p.kill('SIGKILL'); } catch {}
+      resolve({ ok:false, error:'link-parser batch timeout', out, err, code:-1, pid, spawnReturnMs, wroteMs, endedMs, firstStdoutMs, firstStderrMs });
+    }, LINK_PARSER_TIMEOUT_MS);
+    p.stdout.on('data', d => {
+      if (firstStdoutMs === null) firstStdoutMs = Date.now() - startedAt;
+      out += d.toString();
+    });
+    p.stderr.on('data', d => {
+      if (firstStderrMs === null) firstStderrMs = Date.now() - startedAt;
+      err += d.toString();
+    });
+    p.on('error', e => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ ok:false, error:String(e.message || e), out, err, code:-1, pid, spawnReturnMs, wroteMs, endedMs, firstStdoutMs, firstStderrMs });
+    });
+    p.on('close', code => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ ok:true, out, err, code, pid, spawnReturnMs, wroteMs, endedMs, firstStdoutMs, firstStderrMs });
+    });
+    p.stdin.write(lpInputs.join('\n') + '\n');
+    wroteMs = Date.now() - startedAt;
+    p.stdin.end();
+    endedMs = Date.now() - startedAt;
+  });
+}
+
+async function runLinkParserBatch(texts) {
+  const inputs = texts.map(t => terminalSentence(t));
+  const results = new Array(inputs.length);
+  const missing = [];
+  for (let i = 0; i < inputs.length; i++) {
+    const key = inputs[i].toLowerCase();
+    const cached = linkParserCache.get(key);
+    if (cached) results[i] = { ...cloneLinkParserResult(cached), cacheHit:true };
+    else missing.push(i);
+  }
+  if (!missing.length) return results;
+  if (LINK_PARSER_BATCH_MODE === 'off' || missing.length === 1) {
+    for (const i of missing) results[i] = await runLinkParser(inputs[i]);
+    return results;
+  }
+
+  for (let pos = 0; pos < missing.length; pos += LINK_PARSER_BATCH_MAX) {
+    const idxs = missing.slice(pos, pos + LINK_PARSER_BATCH_MAX);
+    const batchInputs = idxs.map(i => inputs[i]);
+    const batchId = ++__linkParserSeq;
+    const startedAt = Date.now();
+    const memStart = process.memoryUsage();
+    console.log('[link-parser-batch-start]', {
+      id: batchId,
+      count: batchInputs.length,
+      mode:'oneshot-batch',
+      rssMB: Math.round(memStart.rss / 1024 / 1024),
+      heapUsedMB: Math.round(memStart.heapUsed / 1024 / 1024)
+    });
+    const raw = await runLinkParserOneShotBatchRaw(batchInputs, batchId, startedAt);
+    let parsedMany = raw.ok ? parseLinkParserBatchResult(raw.out, raw.err, raw.code, batchInputs.length) : null;
+    const memEnd = process.memoryUsage();
+    console.log('[link-parser-batch-end]', {
+      id: batchId,
+      count: batchInputs.length,
+      ms: Date.now() - startedAt,
+      pid: raw.pid || null,
+      parseOk: !!parsedMany,
+      code: raw.code,
+      error: raw.error || '',
+      spawnReturnMs: raw.spawnReturnMs,
+      wroteMs: raw.wroteMs,
+      endedMs: raw.endedMs,
+      firstStdoutMs: raw.firstStdoutMs,
+      firstStderrMs: raw.firstStderrMs,
+      stdoutBytes: String(raw.out || '').length,
+      stderrBytes: String(raw.err || '').length,
+      rssMB: Math.round(memEnd.rss / 1024 / 1024),
+      heapUsedMB: Math.round(memEnd.heapUsed / 1024 / 1024)
+    });
+    if (!parsedMany) {
+      // link-parserのbatch出力フォーマットが想定と違う環境では、安全に旧oneshotへフォールバック。
+      for (const i of idxs) results[i] = await runLinkParser(inputs[i]);
+      continue;
+    }
+    for (let j = 0; j < idxs.length; j++) {
+      const i = idxs[j];
+      results[i] = parsedMany[j];
+      if (results[i] && results[i].code !== -1) rememberLinkParserCache(inputs[i].toLowerCase(), results[i]);
+    }
+  }
+  return results;
 }
 
 function tryExtractJson(s) {
@@ -2377,6 +2510,63 @@ async function checkSentence(text, withTranslate = false, reasonMeta = {}) {
   };
 }
 
+
+async function evaluateGameTextExactWithParsed(text, parsed, options = {}) {
+  const src = normalizeText(text);
+  let ltGate = null;
+  if (strictLinkGrammarGameOk(parsed)) ltGate = await languageToolErrorGate(src);
+  let acceptability = applyGameSemanticGate(src, localAcceptabilityFromLinkParserAndLt(src, parsed, ltGate), options);
+  let hfGate = null;
+  if (ACCEPTABILITY_HF_GAME_GATE_ENABLED && acceptability.ok && acceptability.gameOk !== false && acceptability.type === 'complete_sentence') {
+    hfGate = await hfAcceptabilityGate(src);
+    acceptability = applyHfAcceptabilityToLocalAcceptability(acceptability, hfGate);
+  }
+  return { text:src, parsed, languageTool:ltGate, hfAcceptability:hfGate, acceptability, ok:!!acceptability.ok, gameOk:!!(acceptability.ok && acceptability.gameOk !== false && acceptability.type === 'complete_sentence') };
+}
+
+async function checkSentenceWithParsed(text, parsed, withTranslate = false, reasonMeta = {}) {
+  const originalText = normalizeText(text);
+  const proof = noAutocorrectProof(originalText);
+  const checkedText = originalText;
+  const ev = await evaluateGameTextExactWithParsed(checkedText, parsed, { strictGameGate: reasonMeta.strictGameGate === true, acceptabilityModelGate: reasonMeta.acceptabilityModelGate === true, wordMeta: reasonMeta.wordMeta });
+  const acceptability = ev.acceptability;
+  const ok = !!acceptability.ok;
+  const type = acceptability.type || (ok ? 'complete_sentence' : 'invalid');
+  const gameOk = !!(ok && acceptability.gameOk !== false && type === 'complete_sentence');
+  let translation = null;
+  let reasonExplain = null;
+  let reasonJob = null;
+  if (gameOk && acceptability.jaHint) translation = { ok:true, ja:acceptability.jaHint, source:'contextual-short-answer' };
+  else if (gameOk && withTranslate) translation = await translateToJapanese(checkedText);
+  const reasonDisabled = !!(reasonMeta.reasonDisabled || reasonMeta.disableReasonJob || reasonMeta.reasonMode === 'none');
+  if (!gameOk && !reasonDisabled) {
+    reasonJob = enqueueReasonJob(checkedText, {
+      judgeSource: acceptability.gate || 'strict-link-grammar-plus-languagetool',
+      linkGrammarOk: strictLinkGrammarGameOk(parsed),
+      linkages: parsed.linkages,
+      languageTool: ev.languageTool,
+      languageToolBlocking: !!acceptability.languageToolBlocking,
+      blockingRuleId: acceptability.blockingRuleId || '',
+      blockingMessage: acceptability.blockingMessage || '',
+      ...reasonMeta
+    });
+    if (reasonJob?.status === 'success') reasonExplain = reasonJob.result;
+  }
+  return {
+    originalText, text: checkedText, normalized: proof.normalized, appliedCorrections: proof.appliedCorrections || [],
+    ok, gameOk, type, kind: (ACCEPTABILITY_HF_GAME_GATE_ENABLED || reasonMeta.strictGameGate === true || reasonMeta.acceptabilityModelGate === true) ? 'Strict Link Grammar + LanguageTool + external acceptability API gate v103' : 'Strict Link Grammar + LanguageTool Gate v103' ,
+    sentenceType: gameOk ? (acceptability.sentenceType || 'complete_sentence') : (acceptability.sentenceType || type),
+    reason: gameOk ? '' : (acceptability.noteJa || acceptability.reason || reasonExplain?.explanationJa || reasonExplain?.explanationEn || ''),
+    reasonSource: gameOk ? '' : (reasonDisabled ? 'reason-job-disabled-for-bulk-scan' : (acceptability.languageToolBlocking ? 'languagetool-error-gate' : (acceptability.hfUsed ? 'hf-grammar-classifier-gate' : (reasonExplain?.ok ? reasonExplain.method : 'reason-job-pending')))),
+    reasonStatus: gameOk ? 'none' : (reasonDisabled ? 'none' : (reasonJob?.status || 'pending')),
+    reasonJobId: gameOk ? '' : (reasonDisabled ? '' : (reasonJob?.id || '')),
+    reasonExplain, proof,
+    fullParse: parsed.fullParse, strictLinkGrammar: parsed.strictLinkGrammar,
+    linkages: parsed.linkages, nullCount: parsed.nullCount, stdout: parsed.stdout, stderr: parsed.stderr, code: parsed.code,
+    acceptability, languageTool: ev.languageTool, hfAcceptability: ev.hfAcceptability, ja: translation?.ja || '', translation
+  };
+}
+
 function normalizeCandidateItem(item, i = 0) {
   if (typeof item === 'string') {
     const text = normalizeText(item);
@@ -2411,15 +2601,20 @@ async function checkSentenceBatch(req) {
     unique: items.length,
     concurrency,
     env: process.env.BATCH_CONCURRENCY || null,
+    linkParserBatchMode: LINK_PARSER_BATCH_MODE,
     rssMB: Math.round(memStart.rss / 1024 / 1024),
     heapUsedMB: Math.round(memStart.heapUsed / 1024 / 1024)
   });
+  // v121: Link Grammarだけ先にoneshot-batchでまとめて処理する。
+  // 常駐は使わず、1回spawn→複数文投入→stdin終了→stdout確定、なので停止リスクを避ける。
+  const preParsed = await runLinkParserBatch(items.map(x => x.text));
   let next = 0;
   async function worker() {
     while (next < items.length) {
-      const item = items[next++];
+      const ix = next++;
+      const item = items[ix];
       try {
-        const checked = await checkSentence(item.text, j.translate !== false && j.withTranslate !== false, { reasonPriorityEpoch: j.reasonPriorityEpoch || j.reasonEpoch || Date.now(), reasonPrioritySeq: Number(item.id || 0), words:item.words, wordMeta:item.wordMeta, reasonBoardCandidates:j.reasonBoardCandidates || j.boardCandidates || [], reasonHandCandidates:j.reasonHandCandidates || j.handCandidates || [], reasonDeckCandidates:j.reasonDeckCandidates || j.reasonCandidates || j.deckCandidates || [], strictGameGate: j.strictGameGate === true || j.acceptabilityModelGate === true, acceptabilityModelGate: j.acceptabilityModelGate === true, reasonDisabled: j.reasonDisabled===true || j.disableReasonJob===true || j.reasonMode==='none' });
+        const checked = await checkSentenceWithParsed(item.text, preParsed[ix], j.translate !== false && j.withTranslate !== false, { reasonPriorityEpoch: j.reasonPriorityEpoch || j.reasonEpoch || Date.now(), reasonPrioritySeq: Number(item.id || 0), words:item.words, wordMeta:item.wordMeta, reasonBoardCandidates:j.reasonBoardCandidates || j.boardCandidates || [], reasonHandCandidates:j.reasonHandCandidates || j.handCandidates || [], reasonDeckCandidates:j.reasonDeckCandidates || j.reasonCandidates || j.deckCandidates || [], strictGameGate: j.strictGameGate === true || j.acceptabilityModelGate === true, acceptabilityModelGate: j.acceptabilityModelGate === true, reasonDisabled: j.reasonDisabled===true || j.disableReasonJob===true || j.reasonMode==='none' });
         const accept = checked.acceptability || {};
         const type = accept.type || (checked.gameOk ? 'complete_sentence' : (checked.fullParse ? 'fragment' : 'invalid'));
         const gameOk = !!(checked.ok && checked.gameOk && (accept.gameOk !== false) && type === 'complete_sentence');
@@ -2712,7 +2907,7 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-plus-languagetool-error-gate-v119-persistent-link-parser',
+        mode:'link-grammar-plus-languagetool-error-gate-v120-oneshot-rollback',
         linkParserMode: LINK_PARSER_MODE,
         linkParserQueue: persistentLinkParser.queue.length + (persistentLinkParser.active ? 1 : 0),
         linkParserCacheSize: linkParserCache.size,
@@ -3034,4 +3229,4 @@ server.on('upgrade', (req, socket) => {
   try { socket.destroy(); } catch {}
 });
 
-server.listen(PORT, () => console.log(`Strict Link Grammar + LanguageTool v119 persistent link-parser API listening on ${PORT}`));
+server.listen(PORT, () => console.log(`Strict Link Grammar + LanguageTool v120 oneshot rollback API listening on ${PORT}`));
