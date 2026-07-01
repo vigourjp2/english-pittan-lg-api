@@ -2907,10 +2907,12 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-plus-languagetool-error-gate-v120-oneshot-rollback',
+        mode:'link-grammar-plus-languagetool-error-gate-v122-oneshot-batch-prefix-rescue',
         linkParserMode: LINK_PARSER_MODE,
         linkParserQueue: persistentLinkParser.queue.length + (persistentLinkParser.active ? 1 : 0),
         linkParserCacheSize: linkParserCache.size,
+        linkParserBatchMode: LINK_PARSER_BATCH_MODE,
+        linkParserBatchMax: LINK_PARSER_BATCH_MAX,
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
