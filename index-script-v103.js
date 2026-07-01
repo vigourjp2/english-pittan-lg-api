@@ -1117,7 +1117,7 @@ async function scanFromCell(placeIndex){
   }
   found.sort((a,b)=>(b.cells.length-a.cells.length)||(b.pts-a.pts));
   const seen=new Set();
-  return found.filter(f=>{const k=f.cells.join(',')+'|'+norm(f.text.split(' ')); if(seen.has(k)) return false; seen.add(k); return true;}).slice(0,24);
+  return found.filter(f=>{const k=f.cells.join(',')+'|'+norm(f.text.split(' ')); if(seen.has(k)) return false; seen.add(k); return true;});
 }
 function selectScoringMatches(matches){
   // v94: 「一回使ったカードを同じターンの別成立経路で使えない」ように見える原因を撤去。
