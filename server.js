@@ -1411,9 +1411,11 @@ async function runLinkParser(text) {
 function parseLinkParserBatchResult(out, err, code = 0, count = 0) {
   const src = String(out || '') + '\n' + String(err || '');
   const markers = [];
-  // v124: Link Grammar は1件成立時に "Found 1 linkage"（単数）を出す。
-  // v123は "linkages"（複数）だけをmarker扱いしたため、正常なbatch出力でも parseOk:false になり、
-  // 単体fallback OFF と組み合わさって全候補NGになっていた。
+  // v125: batch結果は marker 1個 = 入力1文の判定として扱う。
+  // v124 は block の切り出し開始位置が1つ前のmarkerになっていたため、
+  // 前のNG文（No complete linkages found）を次の候補にも混ぜてしまい、
+  // 「I am happy」のような成立文までNG化することがあった。
+  // 判定自体は marker 行だけで十分なので、前後の出力を混ぜない。
   const re = /(Found\s+\d+\s+linkages?|No complete linkages found|\+\+\+\+\+ error[^\n]*)/ig;
   let m;
   while ((m = re.exec(src)) !== null) markers.push({ index:m.index, text:m[0] });
@@ -1421,14 +1423,17 @@ function parseLinkParserBatchResult(out, err, code = 0, count = 0) {
     console.warn('[link-parser-batch-parse-marker-mismatch]', { count, markers: markers.length, sample: src.slice(0, 500) });
     return null;
   }
-  const results = [];
-  for (let i = 0; i < count; i++) {
-    const start = i === 0 ? 0 : markers[i - 1].index;
-    const end = i + 1 < markers.length ? markers[i + 1].index : src.length;
-    const block = src.slice(start, end);
-    results.push(parseLinkParserResult(block, '', code));
-  }
-  return results;
+  return markers.map((marker, i) => {
+    const next = i + 1 < markers.length ? markers[i + 1].index : src.length;
+    const segment = src.slice(marker.index, next);
+    const parsed = parseLinkParserResult(marker.text, '', code);
+    return {
+      ...parsed,
+      stdout: segment.slice(0, 1800),
+      stderr: String(err || '').slice(0, 1000),
+      batchMarker: marker.text
+    };
+  });
 }
 
 function runLinkParserOneShotBatchRaw(lpInputs, batchId, startedAt) {
