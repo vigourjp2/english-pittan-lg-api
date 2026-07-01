@@ -1156,7 +1156,10 @@ const LINK_PARSER_IDLE_MS = Math.max(20, Number(process.env.LINK_PARSER_IDLE_MS 
 const LINK_PARSER_FALLBACK_IDLE_MS = Math.max(300, Number(process.env.LINK_PARSER_FALLBACK_IDLE_MS || 1500));
 const LINK_PARSER_TIMEOUT_MS = Math.max(3000, Number(process.env.LINK_PARSER_TIMEOUT_MS || 15000));
 const LINK_PARSER_BATCH_MODE = String(process.env.LINK_PARSER_BATCH_MODE || 'oneshot-batch').toLowerCase();
-const LINK_PARSER_BATCH_MAX = Math.max(1, Number(process.env.LINK_PARSER_BATCH_MAX || 256));
+// v123: 256だと最大盤面で19spawn。既定1024にして最大盤面でも約5spawnに減らす。
+const LINK_PARSER_BATCH_MAX = Math.max(1, Number(process.env.LINK_PARSER_BATCH_MAX || 1024));
+// v123: batch parse失敗時の単体fallbackは旧遅延を再発させるため既定OFF。
+const LINK_PARSER_BATCH_SINGLE_FALLBACK = String(process.env.LINK_PARSER_BATCH_SINGLE_FALLBACK || 'off').toLowerCase() === 'on';
 const LINK_PARSER_CACHE_MAX = Math.max(0, Number(process.env.LINK_PARSER_CACHE_MAX || 1000));
 const LINK_PARSER_ARGS = ['en', '-batch', '-verbosity=0', '-graphics=0', '-null=0', '-islands-ok=0', '-spell=0'];
 const linkParserCache = new Map();
@@ -1479,7 +1482,7 @@ async function runLinkParserBatch(texts) {
     else missing.push(i);
   }
   if (!missing.length) return results;
-  if (LINK_PARSER_BATCH_MODE === 'off' || missing.length === 1) {
+  if (LINK_PARSER_BATCH_MODE === 'off') {
     for (const i of missing) results[i] = await runLinkParser(inputs[i]);
     return results;
   }
@@ -1519,8 +1522,17 @@ async function runLinkParserBatch(texts) {
       heapUsedMB: Math.round(memEnd.heapUsed / 1024 / 1024)
     });
     if (!parsedMany) {
-      // link-parserのbatch出力フォーマットが想定と違う環境では、安全に旧oneshotへフォールバック。
-      for (const i of idxs) results[i] = await runLinkParser(inputs[i]);
+      // v123: ここで全件runLinkParser()へ戻すと、Renderログに[link-parser-start]が連発し高速化が消える。
+      // 既定では単体fallbackしない。必要な場合だけ LINK_PARSER_BATCH_SINGLE_FALLBACK=on で旧挙動へ戻す。
+      if (LINK_PARSER_BATCH_SINGLE_FALLBACK) {
+        console.warn('[link-parser-batch-fallback-single-enabled]', { id:batchId, count:idxs.length });
+        for (const i of idxs) results[i] = await runLinkParser(inputs[i]);
+      } else {
+        console.warn('[link-parser-batch-no-single-fallback]', { id:batchId, count:idxs.length, reason:'parseOk false' });
+        for (const i of idxs) {
+          results[i] = { ok:false, fullParse:false, strictLinkGrammar:false, linkages:0, nullCount:0, stdout:String(raw.out||'').slice(0,1800), stderr:String(raw.err||raw.error||'batch parse failed'), code:raw.code ?? -1, batchParseFailed:true };
+        }
+      }
       continue;
     }
     for (let j = 0; j < idxs.length; j++) {
@@ -2912,7 +2924,7 @@ const server = http.createServer(async (req, res) => {
         linkParserQueue: persistentLinkParser.queue.length + (persistentLinkParser.active ? 1 : 0),
         linkParserCacheSize: linkParserCache.size,
         linkParserBatchMode: LINK_PARSER_BATCH_MODE,
-        linkParserBatchMax: LINK_PARSER_BATCH_MAX,
+        linkParserBatchMax: LINK_PARSER_BATCH_MAX, linkParserBatchSingleFallback: LINK_PARSER_BATCH_SINGLE_FALLBACK,
         hfChatModel: HF_CHAT_MODEL,
         hfChatUrl: HF_CHAT_URL,
         hfTokenPresent: !!HF_TOKEN,
