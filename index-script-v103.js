@@ -17,9 +17,9 @@ try{
 }catch(e){ console.error('early start bind failed', e); }
 try{
 
-const APP_VERSION='v111-server-authoritative-seats';
+const APP_VERSION='v120-board-5x5-from-v111';
 const $ = id => document.getElementById(id);
-const N = 7;
+const N = 5;
 const COLORS = ['#38bdf8','#f472b6','#a3e635','#facc15'];
 const __crypto = (typeof globalThis!=='undefined' && globalThis.crypto) ? globalThis.crypto : null;
 let clientId = '';
@@ -495,6 +495,26 @@ function showToast(text,cls='info'){
 function setMsg(text,cls='info',opts={}){const val=String(text||'');const klass=cls||'info';const el=$('msg');if(el){el.textContent=val;el.className='msg '+klass;} if(state){state.statusText=val;state.statusClass=klass;if(opts.judge){state.lastJudgeMsg=val;state.lastJudgeClass=klass;}} if(opts.judge){lastJudgeMsg=val;lastJudgeClass=klass;} if(klass==='bad'||/ちょっと待って|自分のターン|置けません|ONLINE|接続|待機|同期|P1|P2/.test(val))showToast(val,klass);}
 function addLog(text,good=true){state.log.unshift({t:Date.now(),text,good});state.log=state.log.slice(0,40);}
 function idx(x,y){return y*N+x}
+function normalizeBoardSizeForCurrentGame(s){
+  if(!s || !Array.isArray(s.board)) return s;
+  const target=N*N;
+  if(s.board.length===target) return s;
+  const oldLen=s.board.length;
+  const oldN=Math.sqrt(oldLen);
+  const next=Array.from({length:target},()=>null);
+  if(Number.isInteger(oldN) && oldN>0){
+    for(let y=0;y<Math.min(N,oldN);y++){
+      for(let x=0;x<Math.min(N,oldN);x++){
+        next[idx(x,y)] = s.board[y*oldN+x] || null;
+      }
+    }
+  }else{
+    for(let i=0;i<Math.min(target,oldLen);i++) next[i]=s.board[i] || null;
+  }
+  s.board=next;
+  s.boardSize=N;
+  return s;
+}
 function xy(i){return {x:i%N,y:Math.floor(i/N)}}
 function currentPlayer(){return state.players[state.turn%state.playerCount]}
 function playerTag(i){ return 'P'+(Number(i)+1); }
@@ -2107,6 +2127,7 @@ function shouldAcceptIncomingRoom(s){
 }
 function applyState(s,why='同期'){
   if(!s||!Array.isArray(s.board)||!Array.isArray(s.players))return false;
+  s=normalizeBoardSizeForCurrentGame(s);
   roomStateReceived=true;onlineEstablished=true;
   if(serverAuthoritative && serverSeatIndex>=0){
     s.playerCount = Math.max(2, Math.min(4, Number(s.playerCount||s.players.length||2)));
