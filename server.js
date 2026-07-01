@@ -1411,10 +1411,16 @@ async function runLinkParser(text) {
 function parseLinkParserBatchResult(out, err, code = 0, count = 0) {
   const src = String(out || '') + '\n' + String(err || '');
   const markers = [];
-  const re = /(Found\s+\d+\s+linkages|No complete linkages found|\+\+\+\+\+ error[^\n]*)/ig;
+  // v124: Link Grammar は1件成立時に "Found 1 linkage"（単数）を出す。
+  // v123は "linkages"（複数）だけをmarker扱いしたため、正常なbatch出力でも parseOk:false になり、
+  // 単体fallback OFF と組み合わさって全候補NGになっていた。
+  const re = /(Found\s+\d+\s+linkages?|No complete linkages found|\+\+\+\+\+ error[^\n]*)/ig;
   let m;
   while ((m = re.exec(src)) !== null) markers.push({ index:m.index, text:m[0] });
-  if (markers.length !== count) return null;
+  if (markers.length !== count) {
+    console.warn('[link-parser-batch-parse-marker-mismatch]', { count, markers: markers.length, sample: src.slice(0, 500) });
+    return null;
+  }
   const results = [];
   for (let i = 0; i < count; i++) {
     const start = i === 0 ? 0 : markers[i - 1].index;
@@ -2919,7 +2925,7 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         ok:true,
         service:'link-grammar-api',
-        mode:'link-grammar-plus-languagetool-error-gate-v122-oneshot-batch-prefix-rescue',
+        mode:'link-grammar-plus-languagetool-error-gate-v124-batch-singular-linkage-fix',
         linkParserMode: LINK_PARSER_MODE,
         linkParserQueue: persistentLinkParser.queue.length + (persistentLinkParser.active ? 1 : 0),
         linkParserCacheSize: linkParserCache.size,
@@ -3243,4 +3249,4 @@ server.on('upgrade', (req, socket) => {
   try { socket.destroy(); } catch {}
 });
 
-server.listen(PORT, () => console.log(`Strict Link Grammar + LanguageTool v120 oneshot rollback API listening on ${PORT}`));
+server.listen(PORT, () => console.log(`Strict Link Grammar + LanguageTool v124 batch singular linkage fix API listening on ${PORT}`));
